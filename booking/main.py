@@ -1,11 +1,21 @@
 """Starts the Booking service. Run with:  python main.py"""
+from contextlib import asynccontextmanager
+
 import uvicorn
 from fastapi import FastAPI
 
 import config
+import db
 from api import router
 
-app = FastAPI(title="Booking")
+
+@asynccontextmanager
+async def lifespan(app):
+    db.init_schema()   # create the seats table if it doesn't exist yet
+    yield
+
+
+app = FastAPI(title="Booking", lifespan=lifespan)
 app.include_router(router)
 
 if __name__ == "__main__":
