@@ -1,9 +1,5 @@
 # One-command startup: `docker compose up --build`
 #
-# Advaya owns this file. So far it contains the broker, the broker topology,
-# MailHog and the Ticketing service (Emmett). Add each service below
-# `ticketing` in the same style: its own Postgres, a health check, and
-# `depends_on: topology-init: condition: service_completed_successfully`.
 
 name: citytickets
 
@@ -74,5 +70,36 @@ services:
       # Deliberately not depending on mailhog: Ticketing must start and keep
       # issuing tickets while the mail server is down.
 
+  catalogue-db:
+    image: postgres:16-alpine
+    environment:
+      # Local development credentials only.
+      POSTGRES_USER: catalogue
+      POSTGRES_PASSWORD: catalogue
+      POSTGRES_DB: catalogue
+    volumes:
+      - catalogue-db:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U catalogue -d catalogue"]
+      interval: 3s
+      timeout: 3s
+      retries: 30
+
+  catalogue:
+    build:
+      context: .
+      dockerfile: catalogue/Dockerfile
+    environment:
+      DATABASE_URL: postgresql://catalogue:catalogue@catalogue-db:5432/catalogue
+      DATABASE_TIMEOUT_SECONDS: "2"
+    ports:
+      - "8001:8000"
+    depends_on:
+      catalogue-db:
+        condition: service_healthy
+      topology-init:
+        condition: service_completed_successfully
+
 volumes:
   ticketing-db:
+  catalogue-db:
