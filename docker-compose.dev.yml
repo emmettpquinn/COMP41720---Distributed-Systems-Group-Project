@@ -1,0 +1,32 @@
+# Optional development overlay: these three services are health-only shells.
+# Use together with docker-compose.yml; replace each shell with its real service
+# configuration when that implementation is ready for integration.
+
+x-bootstrap-service: &bootstrap-service
+  build:
+    context: .
+    dockerfile: infra/bootstrap/Dockerfile
+  labels:
+    com.citytickets.mode: bootstrap
+
+services:
+  booking:
+    <<: *bootstrap-service
+    environment:
+      SERVICE_NAME: booking
+    ports:
+      - "8002:8000"
+
+  discovery:
+    <<: *bootstrap-service
+    environment:
+      SERVICE_NAME: discovery
+    ports:
+      - "8003:8000"
+
+  payment:
+    <<: *bootstrap-service
+    environment:
+      SERVICE_NAME: payment
+    ports:
+      - "8004:8000"

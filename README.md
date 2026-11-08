@@ -2,16 +2,22 @@
 
 COMP41720 Distributed Systems group project.
 
-## Current implementation
+## Docker setup on this branch
 
-Docker starts two application services: Ticketing and Notification, and
-the Event Catalogue startup shell. Each has its own PostgreSQL database.
-RabbitMQ, a topology initialization job and MailHog support them.
+This README describes local startup on `feature/catalogue-integration`. Services
+are developed across separate branches, so the containers included here describe
+this branch's integration setup rather than the team's overall progress.
 
-Catalogue currently provides health and database-readiness checks only. Event
-APIs, event tables and messaging are later checkpoints. Booking, Discovery,
-Payment, the provider simulator, Ollama, gateway/UI, seed data and
-Prometheus/Grafana are not integrated into this Compose stack yet.
+The base Compose file starts two application services: Ticketing and Notification,
+and the Event Catalogue startup shell. Each has its own PostgreSQL database.
+RabbitMQ, a topology initialization job and MailHog support them. An optional
+development overlay adds health-only shells for Booking, Discovery and Payment.
+
+Catalogue in this branch exposes health and database-readiness endpoints. The
+Booking, Discovery and Payment entries in the development overlay provide startup
+checks while service configurations are brought together from their development
+branches. The provider simulator, Ollama, gateway/UI, seed data and monitoring
+can be connected as part of the shared integration work.
 
 The Ticketing service and shared messaging baseline come from commit
 `bb17236`. Catalogue and shared startup additions are developed on
@@ -38,6 +44,51 @@ docker compose -p catalogue-dev up -d --build --wait --wait-timeout 180
 ```
 
 Use one project at a time: two stacks would compete for the same host ports.
+
+## Five-service development startup
+
+To start all five application containers, explicitly include the development
+overlay with the base file:
+
+```sh
+docker compose -f docker-compose.yml -f docker-compose.dev.yml up -d --build --wait --wait-timeout 180
+```
+
+If you already use a named project, include that same `-p` option to extend its
+existing stack. This overlay preserves Catalogue, Ticketing and their databases;
+it adds Booking on port 8002, Discovery on 8003 and Payment on 8004. All containers
+share the default Compose network.
+
+The three added containers use the shared development image recipe under
+`infra/bootstrap/`. They expose only `GET /health`, with an explicit identity:
+
+```json
+{"service": "booking", "mode": "bootstrap", "status": "ok"}
+```
+
+These responses are container startup checks. In this overlay, `/health` is the
+only endpoint; `/ready` and business endpoints return 404. The temporary shells
+have no database or messaging connections. Booking, search and payment behaviour
+comes from each service's own implementation when its container configuration is
+integrated, along with its database and messaging requirements.
+
+Use the same file options when inspecting or stopping the development stack:
+
+```sh
+docker compose -f docker-compose.yml -f docker-compose.dev.yml ps -a
+curl -fsS http://localhost:8002/health
+curl -fsS http://localhost:8003/health
+curl -fsS http://localhost:8004/health
+docker compose -f docker-compose.yml -f docker-compose.dev.yml logs --tail 50 booking discovery payment
+docker compose -f docker-compose.yml -f docker-compose.dev.yml stop
+```
+
+The shells also carry the Docker label `com.citytickets.mode=bootstrap` and identify
+themselves in startup logs. To use a service implementation from its development
+branch, update the corresponding overlay entry with that service's Dockerfile,
+configuration, readiness check and database requirements. Keep the shared bootstrap
+application focused on startup checks. The overlay does not modify service
+application files.
 
 ## Check the services
 
