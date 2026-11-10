@@ -1,0 +1,78 @@
+# One-command startup: `docker compose up --build`
+#
+# Advaya owns this file. So far it contains the broker, the broker topology,
+# MailHog and the Ticketing service (Emmett). Add each service below
+# `ticketing` in the same style: its own Postgres, a health check, and
+# `depends_on: topology-init: condition: service_completed_successfully`.
+
+name: citytickets
+
+services:
+  rabbitmq:
+    image: rabbitmq:3.13-management
+    ports:
+      - "5672:5672"     # AMQP
+      - "15672:15672"   # management UI (guest / guest)
+      - "15692:15692"   # Prometheus metrics
+    volumes:
+      - ./infra/rabbitmq/enabled_plugins:/etc/rabbitmq/enabled_plugins:ro
+    healthcheck:
+      test: ["CMD", "rabbitmq-diagnostics", "-q", "check_port_connectivity"]
+      interval: 5s
+      timeout: 5s
+      retries: 30
+
+  # Declares every exchange, queue, retry queue and DLQ, then exits.
+  topology-init:
+    build:
+      context: .
+      dockerfile: shared/Dockerfile
+    environment:
+      AMQP_URL: amqp://guest:guest@rabbitmq:5672/
+    depends_on:
+      rabbitmq:
+        condition: service_healthy
+    restart: "no"
+
+  mailhog:
+    image: mailhog/mailhog:v1.0.1
+    ports:
+      - "1025:1025"     # SMTP
+      - "8025:8025"     # inbox in the browser: http://localhost:8025
+
+  ticketing-db:
+    image: postgres:16-alpine
+    environment:
+      POSTGRES_USER: ticketing
+      POSTGRES_PASSWORD: ticketing
+      POSTGRES_DB: ticketing
+    volumes:
+      - ticketing-db:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U ticketing"]
+      interval: 3s
+      timeout: 3s
+      retries: 30
+
+  ticketing:
+    build:
+      context: .
+      dockerfile: notification/Dockerfile
+    environment:
+      DATABASE_URL: postgresql+asyncpg://ticketing:ticketing@ticketing-db:5432/ticketing
+      AMQP_URL: amqp://guest:guest@rabbitmq:5672/
+      SMTP_HOST: mailhog
+      SMTP_PORT: "1025"
+      MAILHOG_API: http://mailhog:8025
+    ports:
+      - "8005:8000"     # GET /tickets/{booking_id}, /metrics
+    depends_on:
+      ticketing-db:
+        condition: service_healthy
+      topology-init:
+        condition: service_completed_successfully
+      # Deliberately not depending on mailhog: Ticketing must start and keep
+      # issuing tickets while the mail server is down.
+
+volumes:
+  ticketing-db:
