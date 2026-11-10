@@ -1,0 +1,10 @@
+.git
+.venv
+**/__pycache__
+**/*.pyc
+**/*.db
+**/*.db-journal
+**/*.db-wal
+**/*.db-shm
+**/data
+.idea

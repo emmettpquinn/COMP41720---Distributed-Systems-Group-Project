@@ -1,9 +1,7 @@
 # One-command startup: `docker compose up --build`
 #
-# Advaya owns this file. So far it contains the broker, the broker topology,
-# MailHog and the Ticketing service (Emmett). Add each service below
-# `ticketing` in the same style: its own Postgres, a health check, and
-# `depends_on: topology-init: condition: service_completed_successfully`.
+# Shared broker and Ticketing, plus Payment and its monitoring dashboard.
+# Each service owns its own PostgreSQL database.
 
 name: citytickets
 
@@ -15,6 +13,7 @@ services:
       - "15672:15672"   # management UI (guest / guest)
       - "15692:15692"   # Prometheus metrics
     volumes:
+      - rabbitmq-data:/var/lib/rabbitmq
       - ./infra/rabbitmq/enabled_plugins:/etc/rabbitmq/enabled_plugins:ro
     healthcheck:
       test: ["CMD", "rabbitmq-diagnostics", "-q", "check_port_connectivity"]
@@ -74,5 +73,65 @@ services:
       # Deliberately not depending on mailhog: Ticketing must start and keep
       # issuing tickets while the mail server is down.
 
+  payment-db:
+    image: postgres:16-alpine
+    environment:
+      POSTGRES_USER: payment
+      POSTGRES_PASSWORD: payment
+      POSTGRES_DB: payment
+    ports:
+      - "127.0.0.1:5434:5432"
+    volumes:
+      - payment-db:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U payment"]
+      interval: 3s
+      timeout: 3s
+      retries: 30
+
+  payment:
+    build:
+      context: .
+      dockerfile: payment/Dockerfile
+    environment:
+      DATABASE_URL: postgresql://payment:payment@payment-db:5432/payment
+      AMQP_URL: amqp://guest:guest@rabbitmq:5672/
+      PAYMENT_MODE: ${PAYMENT_MODE:-ok}
+      PAYMENT_DELAY: ${PAYMENT_DELAY:-0}
+      PAYMENT_ERROR_RATE: ${PAYMENT_ERROR_RATE:-0}
+    ports:
+      - "8004:8000"
+    depends_on:
+      payment-db:
+        condition: service_healthy
+      topology-init:
+        condition: service_completed_successfully
+
+  prometheus:
+    image: prom/prometheus:v3.2.1
+    ports:
+      - "9090:9090"
+    volumes:
+      - ./infra/prometheus/prometheus.yml:/etc/prometheus/prometheus.yml:ro
+      - prometheus-data:/prometheus
+
+  grafana:
+    image: grafana/grafana:11.6.0
+    ports:
+      - "3000:3000"
+    environment:
+      GF_SECURITY_ADMIN_USER: admin
+      GF_SECURITY_ADMIN_PASSWORD: ${GRAFANA_PASSWORD:-stagedoor-demo}
+    volumes:
+      - grafana-data:/var/lib/grafana
+      - ./infra/grafana/provisioning:/etc/grafana/provisioning:ro
+      - ./infra/grafana/dashboards:/var/lib/grafana/dashboards:ro
+    depends_on:
+      - prometheus
+
 volumes:
   ticketing-db:
+  payment-db:
+  rabbitmq-data:
+  prometheus-data:
+  grafana-data:
