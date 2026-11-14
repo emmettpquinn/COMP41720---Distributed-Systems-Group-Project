@@ -4,6 +4,8 @@ COMP41720 Distributed Systems group project.
 
 See [project continuity and checkpoints](docs/PROJECT_CONTINUITY.md) for the
 recovered plan, verified milestones, integration dependencies and next step.
+The [proposed Catalogue contracts](docs/contracts/catalogue.md) provide HTTP/event
+examples for consumer review; they do not add endpoints or establish team agreement.
 
 ## Docker setup on this branch
 

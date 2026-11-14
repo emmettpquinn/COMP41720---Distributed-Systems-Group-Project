@@ -1,0 +1,38 @@
+{
+  "message_id": "00000000-0000-4000-8000-000000000103",
+  "type": "event.changed",
+  "occurred_at": "2026-11-14T12:02:00+00:00",
+  "version": 1,
+  "producer": "catalogue",
+  "payload": {
+    "change": "cancelled",
+    "event_id": "event-demo-001",
+    "event_version": 3,
+    "status": "cancelled",
+    "venue": {
+      "venue_id": "venue-demo-001",
+      "name": "Demo Venue",
+      "city": "Dublin"
+    },
+    "title": "Evening Performance - revised",
+    "description": "A fictional evening event for local integration checks.",
+    "starts_at": "2026-11-27T19:30:00+00:00",
+    "timezone": "Europe/Dublin",
+    "tags": [
+      "music",
+      "evening"
+    ],
+    "seats": [
+      {
+        "seat_id": "A1",
+        "section": "A",
+        "label": "A1"
+      },
+      {
+        "seat_id": "A2",
+        "section": "A",
+        "label": "A2"
+      }
+    ]
+  }
+}

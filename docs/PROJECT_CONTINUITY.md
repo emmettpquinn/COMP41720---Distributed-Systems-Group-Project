@@ -102,6 +102,9 @@ and a DLQ. Envelope: `message_id`, `type`, `occurred_at`, `version`, `producer`,
   `seat.availability-changed` on `catalogue.seat-availability`.
 - Catalogue event payloads, availability payloads, bootstrap/replay rules, unknown
   events, cancellation and seat-map mutation rules remain unagreed in fetched code.
+  A draft is now prepared in [Catalogue contracts](contracts/catalogue.md), with
+  synthetic JSON examples under `catalogue/examples/contracts/`; it is not accepted
+  and still requires consumer agreement.
 - Decide snapshot versus delta and sequence reset/scope before implementing
   stale-message rejection. Skipping old deltas can lose changes; full snapshots
   have different semantics. A snapshot design remains a proposal, not a recovered agreement.
@@ -120,6 +123,10 @@ and a DLQ. Envelope: `message_id`, `type`, `occurred_at`, `version`, `producer`,
 Statuses apply to this branch unless otherwise stated. Estimates are implementation
 sessions, usually 30-90 minutes; split a task further if it grows beyond one session.
 
+Progress: 32 tracked checkpoints, comprising 6 fully complete, 1 completed draft
+awaiting contract agreement, and 25 pending. This tracks this branch's personal
+backlog, not project-wide completion. Checkpoints vary in effort.
+
 | Checkpoint | Original objective | Current status | Evidence | Next action |
 |---|---|---|---|---|
 | INF01 | Reuse Docker baseline safely | Complete | Inherited `bb17236`; README/build ignore in `be21a88` | Preserve baseline ownership/boundaries. |
@@ -127,7 +134,7 @@ sessions, usually 30-90 minutes; split a task further if it grows beyond one ses
 | INF03 | Five-container development startup | Complete, development scope only | `ed6b9f9`; labelled shells under `infra/bootstrap/` | Replace shells with reviewed owner implementations. |
 | INF04 | Wire monitoring containers/datasource | Complete, wiring scope only | `852ce2d`; config/API/scrape/persistence checks | Full panels remain C12/I07. |
 | INF05 | Verify/document development baseline | Complete, development scope only | `852ce2d` source archive starts successfully; initially empty isolated volumes and later container recreation checked | Full business startup remains V04. |
-| C01 | Propose Catalogue API/event contracts | Pending, 30-60 min | No Catalogue payload contract in fetched code | Draft examples and unresolved decisions with consumer input. |
+| C01 | Propose Catalogue API/event contracts | Draft complete; consumer agreement pending | `docs/contracts/catalogue.md` and 6 validated synthetic examples | Review fields/semantics with consumers before implementing dependent contracts. |
 | C03 | Persist venues/events/seat maps | Pending, 60-90 min | Catalogue has no domain tables/migrations | Implement constraints after C01 agreement. |
 | C04 | Event list/detail APIs | Pending, 60-90 min | Only health/readiness exist | Build PostgreSQL-backed reads and missing-record tests. |
 | C05 | Event creation plus atomic outbox | Pending, 60-90 min | No write API or Catalogue outbox | Save event/map/message in one transaction. |
@@ -173,6 +180,11 @@ Checks on 2026-11-14:
   only the verification project's containers, retaining its named volumes. All five
   app checks, three scrape targets and Grafana health passed. No untracked files
   were needed. This is development-baseline evidence, not a full-system V04 result.
+- C01 draft: all six JSON examples pass ID/timestamp/version/seat-map/count checks;
+  five message examples round-trip through the current Envelope and match existing
+  queue bindings. No draft messages were published. Consumer acceptance and actual
+  Catalogue endpoints remain pending; completion of the draft is not acceptance
+  of the proposed contract.
 
 Verification uses Docker project `catalogue-resume-check`, leaving unrelated
 containers and prior project volumes untouched. Alternate local ports are 18201-18205
@@ -183,10 +195,11 @@ other projects already occupy them. Never stop unrelated containers to free a po
 
 ## Exact next step and remaining effort
 
-C01: add a proposed Catalogue contract document and JSON examples for event changes
-and availability, explicitly separating
-known fields from decisions requiring consumer agreement. Do not build domain tables
-or message handlers on invented contracts. Inspect new remote work before proceeding.
+C01 draft and validation are complete. Review the proposed fields and snapshot
+semantics with Booking/Discovery. Resolve consumer decisions before C03 domain
+persistence and C05/C08-C10 messaging-dependent work. INT02 Payment contract review
+can proceed alongside this discussion. Do not build handlers on invented contracts.
+Inspect new remote work before proceeding; obtain permission for further commits.
 
 Current estimate, based on the absent Catalogue business layer and fetched interfaces:
 Catalogue backend/contracts/metrics 12-18 focused hours; real-service integration,
