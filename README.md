@@ -2,6 +2,9 @@
 
 COMP41720 Distributed Systems group project.
 
+See [project continuity and checkpoints](docs/PROJECT_CONTINUITY.md) for the
+recovered plan, verified milestones, integration dependencies and next step.
+
 ## Docker setup on this branch
 
 This README describes local startup on `feature/catalogue-integration`. Services
