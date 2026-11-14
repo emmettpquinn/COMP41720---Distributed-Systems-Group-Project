@@ -85,6 +85,21 @@ services:
       timeout: 3s
       retries: 30
 
+  catalogue-migrate:
+    build:
+      context: .
+      dockerfile: catalogue/Dockerfile
+    command: ["python", "-m", "app.db"]
+    environment:
+      DATABASE_URL: postgresql://catalogue:catalogue@catalogue-db:5432/catalogue
+      DATABASE_TIMEOUT_SECONDS: "2"
+    depends_on:
+      catalogue-db:
+        condition: service_healthy
+    healthcheck:
+      disable: true
+    restart: "no"
+
   catalogue:
     build:
       context: .
@@ -97,6 +112,8 @@ services:
     depends_on:
       catalogue-db:
         condition: service_healthy
+      catalogue-migrate:
+        condition: service_completed_successfully
       topology-init:
         condition: service_completed_successfully
 

@@ -38,8 +38,9 @@ critical evaluation; this document records implementation evidence, not ADR argu
 - RabbitMQ delivery is at least once. Producers that save state then publish need
   transactional outboxes; consumers record message IDs atomically and ignore stale
   aggregate versions/sequences. Retry/DLQ handling is shared.
-- Python/FastAPI is confirmed. Catalogue uses asyncpg for its current readiness
-  check; its domain persistence/migration approach has not been chosen yet.
+- Python/FastAPI is confirmed. Catalogue uses asyncpg and versioned SQL migrations,
+  with a one-shot migration job before application startup. It has its own PostgreSQL
+  container/volume; the current schema stores venues, events and seat-map definitions.
 - Preserve small checkpoints. C02 was absorbed into INF02; I01 was absorbed into
   the infrastructure wiring checkpoints. INF03 was explicitly limited to health-only
   development shells; their databases and business behaviour accompany real integration.
@@ -123,8 +124,8 @@ and a DLQ. Envelope: `message_id`, `type`, `occurred_at`, `version`, `producer`,
 Statuses apply to this branch unless otherwise stated. Estimates are implementation
 sessions, usually 30-90 minutes; split a task further if it grows beyond one session.
 
-Progress: 32 tracked checkpoints, comprising 6 fully complete, 1 completed draft
-awaiting contract agreement, and 25 pending. This tracks this branch's personal
+Progress: 32 tracked checkpoints, comprising 7 implemented/verified,
+1 completed draft awaiting contract agreement, and 24 pending. This tracks this branch's personal
 backlog, not project-wide completion. Checkpoints vary in effort.
 
 | Checkpoint | Original objective | Current status | Evidence | Next action |
@@ -135,7 +136,7 @@ backlog, not project-wide completion. Checkpoints vary in effort.
 | INF04 | Wire monitoring containers/datasource | Complete, wiring scope only | `852ce2d`; config/API/scrape/persistence checks | Full panels remain C12/I07. |
 | INF05 | Verify/document development baseline | Complete, development scope only | `852ce2d` source archive starts successfully; initially empty isolated volumes and later container recreation checked | Full business startup remains V04. |
 | C01 | Propose Catalogue API/event contracts | Draft complete; consumer agreement pending | `docs/contracts/catalogue.md` and 6 validated synthetic examples | Review fields/semantics with consumers before implementing dependent contracts. |
-| C03 | Persist venues/events/seat maps | Pending, 60-90 min | Catalogue has no domain tables/migrations | Implement constraints after C01 agreement. |
+| C03 | Persist venues/events/seat maps | Complete | `001_catalogue.sql`, migration runner/job, 17 passing tests and live restart/repeat checks | Continue to C04; API/message agreement remains separate. |
 | C04 | Event list/detail APIs | Pending, 60-90 min | Only health/readiness exist | Build PostgreSQL-backed reads and missing-record tests. |
 | C05 | Event creation plus atomic outbox | Pending, 60-90 min | No write API or Catalogue outbox | Save event/map/message in one transaction. |
 | C06 | Versioned event updates | Pending, 60-90 min | No update API | Agree conflict/seat-map rules; test atomic versions. |
@@ -166,7 +167,8 @@ backlog, not project-wide completion. Checkpoints vary in effort.
 
 Checks on 2026-11-14:
 
-- Catalogue: 5 tests passed in Python 3.12; Ticketing: 14 SQLite/fake-mail tests passed.
+- Catalogue: 17 tests passed in Python 3.12 after C03 (5 health tests and 12 real
+  PostgreSQL checks). Ticketing: 14 SQLite/fake-mail tests passed earlier this session.
 - Payment snapshot: 25 discovered tests, 24 passed, 1 optional live-broker test
   skipped; isolated PostgreSQL test schemas. No Payment application files integrated.
 - Merged Compose validates and preserves original application service definitions.
@@ -185,6 +187,12 @@ Checks on 2026-11-14:
   queue bindings. No draft messages were published. Consumer acceptance and actual
   Catalogue endpoints remain pending; completion of the draft is not acceptance
   of the proposed contract.
+- C03: a fresh Catalogue-owned database was initialized by the migration job before
+  the app started. Tests cover references/constraints, repeatability, rollback of
+  pending migrations, concurrent runners and reconnect persistence. A live database
+  restart preserved venue/event/seat-map records; rerunning migrations preserved
+  those records and one ledger entry. Temporary rows/schemas were removed. No other
+  application's database was used.
 
 Verification uses Docker project `catalogue-resume-check`, leaving unrelated
 containers and prior project volumes untouched. Alternate local ports are 18201-18205
@@ -193,16 +201,23 @@ broker management UI. A temporary port override and build logs remain outside Gi
 Normal README commands use the standard ports and may need local overrides when
 other projects already occupy them. Never stop unrelated containers to free a port.
 
+C03 uses a separate `catalogue-schema-check` project with its own Catalogue database
+and volume. Its API preview is on port 8001; its test broker and database publish no
+host ports. The earlier monitoring verification project remains separate.
+
 ## Exact next step and remaining effort
 
-C01 draft and validation are complete. Review the proposed fields and snapshot
-semantics with Booking/Discovery. Resolve consumer decisions before C03 domain
-persistence and C05/C08-C10 messaging-dependent work. INT02 Payment contract review
-can proceed alongside this discussion. Do not build handlers on invented contracts.
-Inspect new remote work before proceeding; obtain permission for further commits.
+C03 storage is implemented and validated, using the proposed metadata fields for
+Catalogue's internal database without changing any shared payload. The next
+checkpoint is C04: PostgreSQL-backed event listing
+and detail, with missing/unknown availability represented explicitly. Keep C01
+consumer review open before C05/C08-C10 messaging-dependent work. INT02 Payment
+contract review can proceed alongside this discussion. Do not claim the proposed
+payload is agreed. Inspect new remote work before proceeding; commit only on
+explicit instruction.
 
 Current estimate, based on the absent Catalogue business layer and fetched interfaces:
-Catalogue backend/contracts/metrics 12-18 focused hours; real-service integration,
+Catalogue backend/contracts/metrics 11-17 focused hours; real-service integration,
 gateway/UI/seeds 6-10; verification/submission work 8-12; debugging contingency 4-6.
-Total approximately 30-46 focused hours, excluding team response time. No actual
+Total approximately 29-45 focused hours, excluding team response time. No actual
 focused time was supplied. Re-estimate after C01 and real Payment integration.

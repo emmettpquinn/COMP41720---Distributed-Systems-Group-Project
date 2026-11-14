@@ -14,13 +14,14 @@ are developed across separate branches, so the containers included here describe
 this branch's integration setup rather than the team's overall progress.
 
 The base Compose file starts two application services: Ticketing and Notification,
-and the Event Catalogue startup shell. Each has its own PostgreSQL database.
+and Event Catalogue. Each has its own PostgreSQL database.
 RabbitMQ, a topology initialization job and MailHog support them. An optional
 development overlay adds health-only shells for Booking, Discovery and Payment.
 
-Catalogue in this branch exposes health and database-readiness endpoints. The
-Booking, Discovery and Payment entries in the development overlay provide startup
-checks while service configurations are brought together from their development
+Catalogue in this branch exposes health and database-readiness endpoints, with
+versioned storage for venues, events and event seat maps. Business endpoints are
+the next checkpoint. Booking, Discovery and Payment entries in the development
+overlay provide startup checks while service configurations are brought together from their development
 branches. The provider simulator, Ollama, gateway/UI and seed data can be connected
 as part of the shared integration work. An optional monitoring overlay connects
 Prometheus and Grafana to the exporters currently available in this branch.
@@ -155,9 +156,9 @@ curl -fsS http://localhost:8005/ready
 - RabbitMQ management: http://localhost:15672 (local login: `guest` / `guest`)
 - RabbitMQ metrics: http://localhost:15692/metrics
 
-`topology-init` should exit with code 0; it is a one-time job, not a long-running
-service. Catalogue `/health` checks the application process. `/ready` executes
-`SELECT 1` against Catalogue's database within a bounded timeout; it returns 503
+`topology-init` and `catalogue-migrate` should exit with code 0; they are one-time
+jobs, not long-running services. Catalogue `/health` checks the application process.
+`/ready` executes `SELECT 1` against Catalogue's database within a bounded timeout; it returns 503
 when the database is unavailable. It does not claim messaging or business readiness.
 The current shell does not connect to RabbitMQ, although Compose waits for topology
 initialization so future consumer startup can use the same ordering.
@@ -168,6 +169,34 @@ the Docker network and has a dedicated `catalogue-db` named volume; Ticketing ke
 its existing database and volume. Named database volumes survive container restarts
 and ordinary Compose shutdown. RabbitMQ message persistence across container
 recreation is not established by this configuration.
+
+## Catalogue database and migrations
+
+Catalogue has its own `catalogue-db` PostgreSQL container and named volume. It
+stores `venues`, `events` and `event_seats`, plus a `schema_migrations` ledger.
+Seat-map rows define seat IDs, sections and labels; Booking still owns holds,
+free/held/booked inventory and bookings in its own database.
+
+`catalogue-migrate` runs the SQL files from `catalogue/migrations/` after PostgreSQL
+is healthy and before the Catalogue application starts. Applied filenames are
+recorded, so repeated startup preserves existing rows. The runner serializes
+concurrent migrations with a database advisory lock and commits all pending SQL
+and ledger entries together; failure rolls that transaction back. Applied SQL
+files are immutable: add the next numbered migration rather than editing history.
+
+To apply migrations separately to an already configured Catalogue database:
+
+```sh
+docker compose run --rm catalogue-migrate
+docker compose exec -T catalogue-db psql -U catalogue -d catalogue -c '\dt'
+```
+
+Use the same project/file options as startup. No host database port is published.
+The schema enforces venue/event references, unique seat IDs per event, nonblank
+required text, positive event versions and allowed event states. `TIMESTAMPTZ`
+stores event instants; HTTP offset/IANA-timezone validation, version increments
+and nonempty seat-map creation will be implemented with their API checkpoints.
+An outbox and availability projection are separate later migrations.
 
 ## Logs and shutdown
 
@@ -193,6 +222,25 @@ python -m pip install -r requirements-dev.txt
 python -m pytest -q
 ```
 
-The tests use a fake pool to check liveness independence, readiness, acquisition/query
-timeouts and safe error responses. Live PostgreSQL startup, outage/recovery and
-volume checks are separate Docker integration checks.
+The health tests use a fake pool to check liveness independence, readiness,
+acquisition/query timeouts and safe error responses. Database tests use a real
+PostgreSQL URL from `CATALOGUE_TEST_DB`; without it those tests are explicitly
+skipped. Each database test creates and removes a uniquely named schema, leaving
+existing Catalogue rows alone. The database role needs permission to create schemas.
+
+To run the full suite in Python 3.12 against the private Catalogue database, first
+start/migrate the stack, then run from the repository root:
+
+```sh
+docker compose run --rm --no-deps \
+  -e CATALOGUE_TEST_DB=postgresql://catalogue:catalogue@catalogue-db:5432/catalogue \
+  -v "$PWD/catalogue/tests:/srv/tests:ro" \
+  -v "$PWD/catalogue/pytest.ini:/srv/pytest.ini:ro" \
+  -v "$PWD/catalogue/requirements-dev.txt:/srv/requirements-dev.txt:ro" \
+  catalogue-migrate sh -c 'python -m pip install -r requirements-dev.txt && python -m pytest -q -p no:cacheprovider'
+```
+
+Again, include the startup project's `-p`/`-f` options when applicable. The suite
+checks migration repeatability, rollback, concurrent runners, references, field
+constraints and persistence across connections. Container restart/persistence is
+also verified separately as a live Docker check.

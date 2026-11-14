@@ -7,6 +7,7 @@ COPY catalogue/requirements.txt .
 RUN pip install --no-cache-dir -r requirements.txt
 
 COPY catalogue/app ./app
+COPY catalogue/migrations ./migrations
 
 EXPOSE 8000
 HEALTHCHECK --interval=5s --timeout=3s --retries=20 \
