@@ -3,9 +3,10 @@
 Status: proposed for Booking and Discovery review; not an agreed shared contract.
 Checkpoint: C01. Last updated: 2026-11-14.
 
-Only `/health` and `/ready` are currently implemented by Catalogue. The HTTP
-routes and payload fields below are candidates for the next checkpoints. No
-consumer, shared envelope, routing key or application behaviour is changed here.
+Catalogue now implements the candidate HTTP surface and an opt-in RabbitMQ
+adapter described below. Messaging is disabled by default while consumer
+agreement is pending. The shared envelope, routing keys and peer service code
+are unchanged. See the [runbook](../catalogue-operations.md) for operational limits.
 
 ## Confirmed integration boundaries
 
@@ -41,7 +42,7 @@ The initial draft uses caller-supplied stable IDs for repeatable synthetic seeds
 IDs are nonblank, trimmed strings of at most 64 characters. An event/seat pair
 identifies a seat, matching Booking's composite key. IDs are immutable and are not
 reused for a different event. Creation with an existing ID returns 409; seeds must
-read/compare existing records rather than reset live inventory.
+skip existing IDs and preserve edits rather than reset records or live inventory.
 
 Proposed venue creation body:
 
@@ -81,7 +82,7 @@ a stale expected version still returns 409.
 Missing records/referenced venues return 404; duplicate IDs, version conflicts or
 disallowed lifecycle changes return 409; invalid fields return 422; unavailable
 database access returns 503. Follow the existing FastAPI `detail` error convention.
-Exact validation limits and error details need agreement before implementation.
+Validation is implemented locally; shared limits and error semantics still need agreement.
 
 ## Proposed event.changed payload
 
@@ -143,7 +144,7 @@ timestamps with comparable clocks. A long time since the last inventory change
 alone does not prove stale data; use consumer/backlog health alongside timestamps.
 Browsing freshness does not guarantee that a subsequent hold will succeed.
 
-## Decisions required before dependent implementation
+## Decisions required before shared integration
 
 1. Booking/Discovery: approve HTTP paths, IDs, event fields, summaries and snapshots.
 2. Booking: approve full availability snapshots versus deltas, durable sequence/reset
@@ -163,5 +164,6 @@ Examples are hand-authored synthetic fixtures for review, not seeds or published
 messages. Validate JSON, IDs/timestamps, envelope round-tripping, event versions,
 seat-map consistency and snapshot counts/sequences. Such checks do not establish
 consumer compatibility: the Catalogue-specific payload consumers are not yet
-implemented in fetched code. Endpoint and real-broker contract tests follow the
-accepted contract in C03-C10.
+implemented in fetched code. Local endpoint and isolated real-broker probes now
+exercise these candidate shapes; accepted cross-service contract tests remain
+pending. Synthetic seed records are maintained separately in `catalogue/seed-data.json`.

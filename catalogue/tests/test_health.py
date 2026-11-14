@@ -84,3 +84,14 @@ def test_unavailable_database_returns_503_but_liveness_stays_ok(make_client, out
         assert response.json() == {"detail": "Catalogue database is unavailable"}
         assert client.get("/health").status_code == 200
     assert pool.closed
+
+
+def test_metrics_stay_observable_during_database_failure(make_client):
+    client, pool = make_client("down")
+    with client:
+        response = client.get("/metrics")
+        assert response.status_code == 200
+        assert "catalogue_database_up 0.0" in response.text
+        assert "catalogue_outbox_pending NaN" in response.text
+        assert "sensitive connection details" not in response.text
+        assert client.get("/health").status_code == 200

@@ -40,7 +40,7 @@ critical evaluation; this document records implementation evidence, not ADR argu
   aggregate versions/sequences. Retry/DLQ handling is shared.
 - Python/FastAPI is confirmed. Catalogue uses asyncpg and versioned SQL migrations,
   with a one-shot migration job before application startup. It has its own PostgreSQL
-  container/volume; the current schema stores venues, events and seat-map definitions.
+  container/volume; migrations now store metadata, outbox, availability and inbox IDs.
 - Preserve small checkpoints. C02 was absorbed into INF02; I01 was absorbed into
   the infrastructure wiring checkpoints. INF03 was explicitly limited to health-only
   development shells; their databases and business behaviour accompany real integration.
@@ -88,9 +88,9 @@ data volume is also not silently applied to existing broker data.
 
 Monitoring integration in `852ce2d` uses the upstream pinned images and copies
 the Grafana datasource exactly. The optional overlay preserves application
-definitions. Prometheus scrapes itself, Ticketing and RabbitMQ; the Payment target
-and Payment dashboard remain with the real Payment integration. Catalogue metrics,
-the full group dashboard and AI-cost panels are not complete.
+definitions. This batch adds Catalogue as a fourth scrape target and a dedicated
+eight-panel Catalogue dashboard. The Payment target/dashboard remain with real
+Payment integration; full group monitoring and AI-cost panels are pending.
 
 ## Important contracts and unresolved questions
 
@@ -106,8 +106,8 @@ and a DLQ. Envelope: `message_id`, `type`, `occurred_at`, `version`, `producer`,
   A draft is now prepared in [Catalogue contracts](contracts/catalogue.md), with
   synthetic JSON examples under `catalogue/examples/contracts/`; it is not accepted
   and still requires consumer agreement.
-- Decide snapshot versus delta and sequence reset/scope before implementing
-  stale-message rejection. Skipping old deltas can lose changes; full snapshots
+- Agree snapshot versus delta and sequence reset/scope before shared integration.
+  The local candidate implements full snapshots and monotonic per-event sequences. Skipping old deltas can lose changes; full snapshots
   have different semantics. A snapshot design remains a proposal, not a recovered agreement.
 - Distinguish envelope/schema version, Catalogue event version and Booking's
   per-event availability sequence. The shared envelope alone does not define these.
@@ -124,39 +124,41 @@ and a DLQ. Envelope: `message_id`, `type`, `occurred_at`, `version`, `producer`,
 Statuses apply to this branch unless otherwise stated. Estimates are implementation
 sessions, usually 30-90 minutes; split a task further if it grows beyond one session.
 
-Progress: 32 tracked checkpoints, comprising 7 implemented/verified,
-1 completed draft awaiting contract agreement, and 24 pending. This tracks this branch's personal
-backlog, not project-wide completion. Checkpoints vary in effort.
+Progress: 32 tracked checkpoints: 17 have local implementations with verification,
+1 is a contract draft awaiting agreement, and 14 remain open (some have preliminary
+evidence). Ten implementations below are included in the current batch. C08-C10 and I02
+still need accepted consumer integration. These counts describe this branch's
+backlog, not project-wide completion; checkpoints vary in effort.
 
 | Checkpoint | Original objective | Current status | Evidence | Next action |
 |---|---|---|---|---|
 | INF01 | Reuse Docker baseline safely | Complete | Inherited `bb17236`; README/build ignore in `be21a88` | Preserve baseline ownership/boundaries. |
 | INF02 | Catalogue shell and own database | Complete | `be21a88`; 5 tests and historical live outage/recovery checks | Extend through Catalogue checkpoints. |
 | INF03 | Five-container development startup | Complete, development scope only | `ed6b9f9`; labelled shells under `infra/bootstrap/` | Replace shells with reviewed owner implementations. |
-| INF04 | Wire monitoring containers/datasource | Complete, wiring scope only | `852ce2d`; config/API/scrape/persistence checks | Full panels remain C12/I07. |
+| INF04 | Wire monitoring containers/datasource | Complete, wiring scope only | `852ce2d`; Catalogue target/panels added in current batch | Full group monitoring remains I07. |
 | INF05 | Verify/document development baseline | Complete, development scope only | `852ce2d` source archive starts successfully; initially empty isolated volumes and later container recreation checked | Full business startup remains V04. |
-| C01 | Propose Catalogue API/event contracts | Draft complete; consumer agreement pending | `docs/contracts/catalogue.md` and 6 validated synthetic examples | Review fields/semantics with consumers before implementing dependent contracts. |
-| C03 | Persist venues/events/seat maps | Complete | `001_catalogue.sql`, migration runner/job, 17 passing tests and live restart/repeat checks | Continue to C04; API/message agreement remains separate. |
-| C04 | Event list/detail APIs | Pending, 60-90 min | Only health/readiness exist | Build PostgreSQL-backed reads and missing-record tests. |
-| C05 | Event creation plus atomic outbox | Pending, 60-90 min | No write API or Catalogue outbox | Save event/map/message in one transaction. |
-| C06 | Versioned event updates | Pending, 60-90 min | No update API | Agree conflict/seat-map rules; test atomic versions. |
-| C07 | Event cancellation intent | Pending, 30-60 min | Lifecycle propagation not implemented | Coordinate Booking cancellation behaviour. |
-| C08 | Reliable Catalogue outbox dispatcher | Pending, 60-90 min | Shared publisher envelope available; dispatcher absent | Persistent confirmed publish; retain IDs on retry. |
-| C09 | Ordered/idempotent availability projection | Pending, 60-90 min | No inbox/projection schema | Agree semantics; test PostgreSQL races/reordering. |
-| C10 | Availability consumer wiring | Pending, 60-90 min | Queue exists; Catalogue consumer absent | Use shared retry/DLQ after transaction commit. |
-| C11 | Busy-page cache and freshness | Pending, 45-75 min | No browse/cache layer | Bound/invalidate cache; expose honest freshness. |
-| C12 | Catalogue metrics and panel | Pending, 60-90 min | No Catalogue /metrics | Export HTTP/lag/outbox metrics; extend shared dashboard. |
-| I02 | Repeatable synthetic seeds | Pending, 45-75 min | No Catalogue business seed flow | Seed through owned writes/outbox, never other DB tables. |
+| C01 | Propose Catalogue API/event contracts | Draft complete; consumer agreement pending | Candidate contracts, examples and gated implementation | Obtain consumer acceptance before enabling on shared broker. |
+| C03 | Persist venues/events/seat maps | Complete | `1c109a1`; immutable migration 001; live persistence/repeat checks | Preserve migration history. |
+| C04 | Event list/detail APIs | Implemented | PostgreSQL reads, consistent detail snapshot, 404 and unknown-availability checks | Review candidate response shapes. |
+| C05 | Event creation plus atomic outbox | Implemented | Venue/event APIs, seat map and immutable message in one transaction; rollback tests | Review candidate create fields. |
+| C06 | Versioned event updates | Implemented | Row lock, expected-version conflict, no-op and concurrent-update tests | Keep ID/venue/seat-map changes excluded. |
+| C07 | Event cancellation intent | Implemented | Cancelled snapshot, no reactivation, repeat/no-op tests | Booking lifecycle propagation awaits integration. |
+| C08 | Reliable Catalogue outbox dispatcher | Implemented; gated | Confirmed mandatory publishing, SKIP LOCKED, stable-ID retries, live marker-failure/outage probes | Accept contract; process-kill crash proof remains V01. |
+| C09 | Ordered/idempotent availability projection | Implemented; candidate | Atomic inbox/projection, full snapshots, duplicate/reordering/concurrency tests | Agree durable sequence/reset and backfill rules. |
+| C10 | Availability consumer wiring | Implemented; disabled by default | Shared retries/DLQ, isolated broker duplicate/invalid-message checks | Test actual Booking producer after agreement. |
+| C11 | Busy-page cache and freshness | Implemented | Bounded TTL/deep-copy cache, commit invalidation and in-flight generation guard | Evaluate measured lag with real workload. |
+| C12 | Catalogue metrics and panel | Implemented | HTTP/lag/outbox/cache/health metrics, four UP scrape targets, eight-panel dashboard | Alert notifications and group/AI panels remain open. |
+| I02 | Repeatable synthetic seeds | Implemented; peer bootstrap pending | One venue/two events/four seats, own write/outbox path, atomic repeat-safe seed job | Verify real Booking/Discovery consume seeds. |
 | I03 | Gateway routes and timeouts | Pending, 45-75 min | No gateway | Wire agreed service APIs. |
 | I04 | Browsing UI and freshness labels | Pending, 60-90 min | No UI | Consume Catalogue contract. |
 | I05 | Refused-hold refresh UI | Pending, 60-90 min | Booking 409 lacks refreshed free seats | Agree response with Booking; no Catalogue-to-Booking call. |
 | I06 | Checkout/status UI | Pending, 60-90 min | Booking checkout/status absent on fetched branch | Follow saga contract once available. |
 | I07 | Complete real-service startup | Pending, 60-90 min slices | Three temporary shells; Payment elsewhere | Integrate real images, owner databases, provider/Ollama and complete monitoring. |
-| V01 | Prove event-outbox crash recovery | Pending, 60-90 min | Catalogue outbox absent | Inject before/after publish crashes; label probes. |
-| V02 | Prove 60-second outage/reordering recovery | Pending, 60-90 min | Projection/producer path absent | Real queue/DB recovery and newest-sequence evidence. |
+| V01 | Prove event-outbox crash recovery | Partial evidence; open | Live post-confirm marker failure redelivers stable ID; broker outage retains rows | Add process-kill windows and actual idempotent consumers. |
+| V02 | Prove 60-second outage/reordering recovery | Partial evidence; open | Isolated broker stop/start, duplicate and newer-sequence recovery | Run timed 60-second outage with real producer/consumers. |
 | V03 | Measure lag under 500 buyers | Pending, 60-90 min | No complete inventory/projection workload | Measure <=2 s p95; capture workload/hardware. |
 | V04 | Verify full-system clean startup/runbook | Pending, 60-90 min | Development startup is not full booking flow | Clean clone, real seeds and end-to-end purchase/failure demo. |
-| D01 | ADR-002 evidence | Pending, 45-75 min | No Catalogue failure/lag evidence yet | Student-owned reasoning with measured constraints. |
+| D01 | ADR-002 evidence | Pending, 45-75 min | Preliminary Catalogue fault evidence now available | Student-owned reasoning; complete measured constraints. |
 | D02 | Requirements/contribution/AI disclosure | Pending, 45-75 min | Submission sources not in fetched tree | Record actual assistance/contributions without transcripts. |
 | D03 | Final report consistency and viva rehearsal | Pending, 90-120 min split | Group sections/evidence still needed | Check page limit, code/diagram alignment and demo timing. |
 | INT01 | Align with accepted master history | Complete | `352e117` merges `be6954d`; no source changes | Retain normal merge ancestry; do not rebase published work. |
@@ -167,12 +169,15 @@ backlog, not project-wide completion. Checkpoints vary in effort.
 
 Checks on 2026-11-14:
 
-- Catalogue: 17 tests passed in Python 3.12 after C03 (5 health tests and 12 real
-  PostgreSQL checks). Ticketing: 14 SQLite/fake-mail tests passed earlier this session.
+- Catalogue: 54 tests passed in Python 3.12 against isolated PostgreSQL schemas,
+  with no skips and one dependency deprecation warning. Coverage includes API
+  validation, atomic writes, conflicts/cancellation, outbox retry/concurrency,
+  duplicate/reordered snapshots, cache races and repeat-safe/atomic seeds.
+  Ticketing: 14 SQLite/fake-mail tests passed earlier; its application is unchanged.
 - Payment snapshot: 25 discovered tests, 24 passed, 1 optional live-broker test
   skipped; isolated PostgreSQL test schemas. No Payment application files integrated.
 - Merged Compose validates and preserves original application service definitions.
-  `promtool check config` passes; all three expected exporters are UP.
+  `promtool check config` passes; the batch stack has all four expected exporters UP.
 - Grafana datasource provisioning, health and proxy queries work. Ticketing request
   metrics appear in Prometheus. Historical samples and Grafana preferences survive
   monitoring-container restart; preferences were restored after testing.
@@ -184,9 +189,9 @@ Checks on 2026-11-14:
   were needed. This is development-baseline evidence, not a full-system V04 result.
 - C01 draft: all six JSON examples pass ID/timestamp/version/seat-map/count checks;
   five message examples round-trip through the current Envelope and match existing
-  queue bindings. No draft messages were published. Consumer acceptance and actual
-  Catalogue endpoints remain pending; completion of the draft is not acceptance
-  of the proposed contract.
+  queue bindings. Candidate messages were subsequently published only in an
+  isolated test stack, with queue probes in place of Booking/Discovery consumers.
+  Local endpoint implementation does not establish consumer acceptance.
 - C03: a fresh Catalogue-owned database was initialized by the migration job before
   the app started. Tests cover references/constraints, repeatability, rollback of
   pending migrations, concurrent runners and reconnect persistence. A live database
@@ -205,19 +210,59 @@ C03 uses a separate `catalogue-schema-check` project with its own Catalogue data
 and volume. Its API preview is on port 8001; its test broker and database publish no
 host ports. The earlier monitoring verification project remains separate.
 
+## Ten-increment batch
+
+The requested batch implements C04-C12 and I02. The user authorized one commit:
+`feat(catalogue): add event APIs and reliable availability pipeline`. No push or
+teammate-branch edits are authorized. Changes share supporting modules; the
+following breakdown records checkpoint scope, not ten separate commits.
+
+1. C04: `feat(catalogue): add event list and detail APIs`
+2. C05: `feat(catalogue): create events with transactional outbox`
+3. C06: `feat(catalogue): add optimistic metadata updates`
+4. C07: `feat(catalogue): publish versioned cancellation intent`
+5. C08: `feat(catalogue): dispatch durable events with publisher confirms`
+6. C09: `feat(catalogue): persist idempotent availability snapshots`
+7. C10: `feat(catalogue): wire opt-in availability consumer`
+8. C11: `perf(catalogue): cache event detail with bounded freshness`
+9. C12: `feat(observability): add Catalogue metrics and dashboard`
+10. I02: `feat(integration): seed synthetic Catalogue events safely`
+
+Additional live evidence from isolated project `catalogue-batch-check`:
+
+- Creation envelopes reached both Booking/Discovery queues with matching IDs;
+  no real peer service consumed these candidate payloads.
+- 100 deliveries of one availability ID produced one applied update and 99
+  duplicate outcomes. Older sequence 9 could not overwrite sequence 10; a newer
+  release at 11 increased the free count. Rebuilt worker then applied sequence 20.
+- Unknown-event and unknown-seat probes exhausted shared retries and reached two
+  DLQ entries. These synthetic probes remain only in the test project's queue.
+- A temporary database trigger rejected the sent marker after confirmation;
+  redelivery reused the exact message ID, then drained after the trigger/function
+  were removed. This simulates the marker-failure window, not a process-kill test.
+- Stopping only this project's broker left event writes/read APIs working and
+  outbox rows pending. Restart drained those rows. Outage was not timed at 60 s.
+- Seed reruns preserved an edited event and did not add duplicate messages.
+- Four Prometheus targets were UP; Grafana exposed all eight Catalogue panels
+  and returned real consumer metrics through its datasource proxy.
+
+This stack uses app ports 28201-28205, broker 35672/35673/35692, Prometheus 29090,
+Grafana 23000 and MailHog 28025. Temporary overrides, scripts/results and logs are
+outside Git. Its data is synthetic. The normal `catalogue-schema-check` preview
+at port 8001 also runs the new migrations/seeds/API, with messaging verified OFF.
+No unrelated broker or other service database was stopped or used.
+
 ## Exact next step and remaining effort
 
-C03 storage is implemented and validated, using the proposed metadata fields for
-Catalogue's internal database without changing any shared payload. The next
-checkpoint is C04: PostgreSQL-backed event listing
-and detail, with missing/unknown availability represented explicitly. Keep C01
-consumer review open before C05/C08-C10 messaging-dependent work. INT02 Payment
-contract review can proceed alongside this discussion. Do not claim the proposed
-payload is agreed. Inspect new remote work before proceeding; commit only on
-explicit instruction.
+Review the candidate fields and cancellation,
+sequence/reset/backfill rules. Obtain Booking/Discovery agreement before enabling
+messaging on a shared stack. Continue INT02/INT03 real Payment review/integration
+and I03/I04 gateway/browse UI; connect hold/checkout only when Booking's contract
+exists. Fetch remote updates before integrating them. Commit only on explicit
+instruction and keep all personal names out of authored file contents.
 
-Current estimate, based on the absent Catalogue business layer and fetched interfaces:
-Catalogue backend/contracts/metrics 11-17 focused hours; real-service integration,
-gateway/UI/seeds 6-10; verification/submission work 8-12; debugging contingency 4-6.
-Total approximately 29-45 focused hours, excluding team response time. No actual
-focused time was supplied. Re-estimate after C01 and real Payment integration.
+Approximate remaining focused effort: backend contract hardening 2-4 hours;
+real-service integration and gateway/UI 5-9; verification/submission 8-12;
+debugging contingency 3-5. Total 18-30 hours, excluding team response time and
+unavailable peer functionality. This is a revised estimate, not time recorded or
+a guarantee. The 17/32 local implementation count is not a group completion rate.

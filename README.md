@@ -5,7 +5,9 @@ COMP41720 Distributed Systems group project.
 See [project continuity and checkpoints](docs/PROJECT_CONTINUITY.md) for the
 recovered plan, verified milestones, integration dependencies and next step.
 The [proposed Catalogue contracts](docs/contracts/catalogue.md) provide HTTP/event
-examples for consumer review; they do not add endpoints or establish team agreement.
+examples for consumer review. The local implementation follows these candidate
+shapes; team agreement is still pending. See the [Catalogue runbook](docs/catalogue-operations.md)
+for writes, messaging, caching, seeds and verification limits.
 
 ## Docker setup on this branch
 
@@ -18,11 +20,12 @@ and Event Catalogue. Each has its own PostgreSQL database.
 RabbitMQ, a topology initialization job and MailHog support them. An optional
 development overlay adds health-only shells for Booking, Discovery and Payment.
 
-Catalogue in this branch exposes health and database-readiness endpoints, with
-versioned storage for venues, events and event seat maps. Business endpoints are
-the next checkpoint. Booking, Discovery and Payment entries in the development
+Catalogue exposes venue/event read and write APIs, versioned event/seat-map storage,
+a transactional outbox, an availability projection, a bounded detail cache and metrics.
+Synthetic Catalogue seeds load automatically. The candidate RabbitMQ adapter stays
+disabled by default until contracts are agreed. Booking, Discovery and Payment entries in the development
 overlay provide startup checks while service configurations are brought together from their development
-branches. The provider simulator, Ollama, gateway/UI and seed data can be connected
+branches. The provider simulator, Ollama and gateway/UI can be connected
 as part of the shared integration work. An optional monitoring overlay connects
 Prometheus and Grafana to the exporters currently available in this branch.
 
@@ -121,13 +124,13 @@ is `admin` / `stagedoor-demo`; set `GRAFANA_PASSWORD` before the first startup t
 use a different password. Existing Grafana volumes retain their original login.
 
 Grafana's default `Prometheus` datasource is provisioned automatically. Prometheus
-scrapes itself, Ticketing and RabbitMQ every five seconds. Use Grafana Explore or
-the Prometheus query page to inspect `up` and Ticketing's `http_requests_total`.
-Catalogue and the three bootstrap shells do not export metrics yet, so they are
-not configured as scrape targets. The Payment scrape target and its dashboard
-remain with the Payment implementation until that service is integrated; they
-are not replaced with fabricated metrics from the shell. A complete group
-dashboard, Catalogue metrics and AI token-cost panels remain later checkpoints.
+scrapes itself, Catalogue, Ticketing and RabbitMQ every five seconds. The
+provisioned Catalogue operations dashboard has eight panels for HTTP, availability
+lag, delivery outcomes, outbox backlog and messaging state. Use Grafana Explore or
+the Prometheus query page to inspect `up`. The three bootstrap shells have no
+metrics. The Payment target/dashboard remain with the Payment implementation
+until it is integrated. Full group monitoring and AI token-cost panels remain
+later checkpoints.
 
 Prometheus and Grafana each have a named data volume. Restarting their containers
 preserves stored settings and time-series data. Check their health with:
@@ -151,17 +154,20 @@ curl -fsS http://localhost:8005/ready
 ```
 
 - Catalogue: http://localhost:8001/docs
+- Catalogue metrics: http://localhost:8001/metrics
 - Ticketing API: http://localhost:8005/docs
 - MailHog inbox: http://localhost:8025
 - RabbitMQ management: http://localhost:15672 (local login: `guest` / `guest`)
 - RabbitMQ metrics: http://localhost:15692/metrics
 
-`topology-init` and `catalogue-migrate` should exit with code 0; they are one-time
+`topology-init`, `catalogue-migrate` and `catalogue-seed` should exit with code 0; they are one-time
 jobs, not long-running services. Catalogue `/health` checks the application process.
 `/ready` executes `SELECT 1` against Catalogue's database within a bounded timeout; it returns 503
 when the database is unavailable. It does not claim messaging or business readiness.
-The current shell does not connect to RabbitMQ, although Compose waits for topology
-initialization so future consumer startup can use the same ordering.
+Catalogue messaging defaults to off. Writes still save outbox rows. Enable
+`CATALOGUE_MESSAGING_ENABLED=true` only against an isolated broker or after candidate
+contracts are agreed; this starts the confirmed publisher and availability consumer.
+See the [runbook](docs/catalogue-operations.md) before enabling it.
 
 Catalogue settings are `DATABASE_URL` and `DATABASE_TIMEOUT_SECONDS` (default 2).
 The app uses a small asyncpg connection pool. Its database is reachable only inside
@@ -173,7 +179,8 @@ recreation is not established by this configuration.
 ## Catalogue database and migrations
 
 Catalogue has its own `catalogue-db` PostgreSQL container and named volume. It
-stores `venues`, `events` and `event_seats`, plus a `schema_migrations` ledger.
+stores `venues`, `events`, `event_seats`, `outbox`, `availability` and
+`processed_messages`, plus a `schema_migrations` ledger.
 Seat-map rows define seat IDs, sections and labels; Booking still owns holds,
 free/held/booked inventory and bookings in its own database.
 
@@ -194,9 +201,10 @@ docker compose exec -T catalogue-db psql -U catalogue -d catalogue -c '\dt'
 Use the same project/file options as startup. No host database port is published.
 The schema enforces venue/event references, unique seat IDs per event, nonblank
 required text, positive event versions and allowed event states. `TIMESTAMPTZ`
-stores event instants; HTTP offset/IANA-timezone validation, version increments
-and nonempty seat-map creation will be implemented with their API checkpoints.
-An outbox and availability projection are separate later migrations.
+stores event instants; the API validates offsets, IANA timezones and nonempty
+unique seat maps. Migration `002_outbox.sql` adds immutable event messages;
+`003_availability.sql` adds the idempotent, ordered projection. See the runbook
+for optimistic updates, cancellation and synthetic seed behaviour.
 
 ## Logs and shutdown
 
@@ -241,6 +249,9 @@ docker compose run --rm --no-deps \
 ```
 
 Again, include the startup project's `-p`/`-f` options when applicable. The suite
-checks migration repeatability, rollback, concurrent runners, references, field
-constraints and persistence across connections. Container restart/persistence is
-also verified separately as a live Docker check.
+checks migrations, persistence, HTTP validation, atomic event/outbox writes,
+optimistic updates, cancellation, duplicate/reordered snapshots, dispatcher
+retry/concurrency, bounded cache behaviour and seed repeatability. Live isolated
+broker checks cover retry/DLQ, stable-ID redelivery and outage recovery. These
+checks do not establish accepted peer contracts, a full purchase flow or the
+500-buyer performance target.

@@ -8,6 +8,8 @@ RUN pip install --no-cache-dir -r requirements.txt
 
 COPY catalogue/app ./app
 COPY catalogue/migrations ./migrations
+COPY shared/messaging ./messaging
+COPY catalogue/seed-data.json .
 
 EXPOSE 8000
 HEALTHCHECK --interval=5s --timeout=3s --retries=20 \

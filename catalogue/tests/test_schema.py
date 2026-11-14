@@ -1,76 +1,21 @@
 """PostgreSQL integration checks; every test owns a temporary schema."""
 
 import asyncio
-import os
-import uuid
-from contextlib import asynccontextmanager
-from datetime import datetime, timezone
 
 import asyncpg
 import pytest
 
 from app.db import MIGRATIONS_DIR, apply_migrations
+from .helpers import connect, seed_event
 
+ALL_MIGRATIONS = ["001_catalogue.sql", "002_outbox.sql", "003_availability.sql"]
 
-@pytest.fixture
-def database_schema():
-    url = os.getenv("CATALOGUE_TEST_DB")
-    if not url:
-        pytest.skip("Set CATALOGUE_TEST_DB to run the PostgreSQL integration checks")
-    # The identifier is generated here, never read from a request or environment.
-    schema = "catalogue_test_" + uuid.uuid4().hex
-
-    async def create():
-        connection = await asyncpg.connect(url, timeout=5)
-        try:
-            await connection.execute(f'CREATE SCHEMA "{schema}"')
-        finally:
-            await connection.close()
-
-    async def cleanup():
-        connection = await asyncpg.connect(url, timeout=5)
-        try:
-            await connection.execute(f'DROP SCHEMA "{schema}" CASCADE')
-        finally:
-            await connection.close()
-
-    asyncio.run(create())
-    try:
-        yield url, schema
-    finally:
-        asyncio.run(cleanup())
-
-
-@asynccontextmanager
-async def connect(database_schema):
-    url, schema = database_schema
-    connection = await asyncpg.connect(
-        url, server_settings={"search_path": schema}, timeout=5, command_timeout=5
-    )
-    try:
-        yield connection
-    finally:
-        await connection.close()
-
-
-async def seed_event(connection, event_id="event-1"):
-    await connection.execute(
-        "INSERT INTO venues (venue_id, name, city) VALUES ('venue-1', 'Demo Venue', 'Dublin') "
-        "ON CONFLICT (venue_id) DO NOTHING"
-    )
-    await connection.execute(
-        """INSERT INTO events (event_id, venue_id, title, starts_at, timezone, tags)
-           VALUES ($1, 'venue-1', 'Demo Event', $2, 'Europe/Dublin', $3)""",
-        event_id,
-        datetime(2026, 11, 27, 19, 30, tzinfo=timezone.utc),
-        ["music", "evening"],
-    )
 
 
 def test_initialization_and_repeat_preserve_records(database_schema):
     async def scenario():
         async with connect(database_schema) as connection:
-            assert await apply_migrations(connection) == ["001_catalogue.sql"]
+            assert await apply_migrations(connection) == ALL_MIGRATIONS
             await seed_event(connection)
             await connection.execute("UPDATE events SET title = 'Updated Event' WHERE event_id = 'event-1'")
             assert await apply_migrations(connection) == []
@@ -79,7 +24,7 @@ def test_initialization_and_repeat_preserve_records(database_schema):
             assert row["event_version"] == 1 and row["status"] == "scheduled"
             assert row["tags"] == ["music", "evening"]
             assert row["starts_at"].utcoffset().total_seconds() == 0
-            assert await connection.fetchval("SELECT count(*) FROM schema_migrations") == 1
+            assert await connection.fetchval("SELECT count(*) FROM schema_migrations") == len(ALL_MIGRATIONS)
 
     asyncio.run(scenario())
 
@@ -178,7 +123,7 @@ def test_failed_migration_rolls_back_all_pending_changes(database_schema, tmp_pa
                 "SELECT tablename FROM pg_tables WHERE schemaname = current_schema()"
             )
             assert tables == []
-            assert await apply_migrations(connection) == ["001_catalogue.sql"]
+            assert await apply_migrations(connection) == ALL_MIGRATIONS
 
     asyncio.run(scenario())
 
@@ -190,6 +135,6 @@ def test_concurrent_migration_runners_apply_once(database_schema):
 
     async def scenario():
         results = await asyncio.gather(run(), run())
-        assert sorted(results, key=len) == [[], ["001_catalogue.sql"]]
+        assert sorted(results, key=len) == [[], ALL_MIGRATIONS]
 
     asyncio.run(scenario())

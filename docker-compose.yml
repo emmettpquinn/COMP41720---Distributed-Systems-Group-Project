@@ -100,6 +100,20 @@ services:
       disable: true
     restart: "no"
 
+  catalogue-seed:
+    build:
+      context: .
+      dockerfile: catalogue/Dockerfile
+    command: ["python", "-m", "app.seed"]
+    environment:
+      DATABASE_URL: postgresql://catalogue:catalogue@catalogue-db:5432/catalogue
+    depends_on:
+      catalogue-migrate:
+        condition: service_completed_successfully
+    healthcheck:
+      disable: true
+    restart: "no"
+
   catalogue:
     build:
       context: .
@@ -107,12 +121,16 @@ services:
     environment:
       DATABASE_URL: postgresql://catalogue:catalogue@catalogue-db:5432/catalogue
       DATABASE_TIMEOUT_SECONDS: "2"
+      AMQP_URL: amqp://guest:guest@rabbitmq:5672/
+      CATALOGUE_MESSAGING_ENABLED: ${CATALOGUE_MESSAGING_ENABLED:-false}
     ports:
       - "8001:8000"
     depends_on:
       catalogue-db:
         condition: service_healthy
       catalogue-migrate:
+        condition: service_completed_successfully
+      catalogue-seed:
         condition: service_completed_successfully
       topology-init:
         condition: service_completed_successfully
