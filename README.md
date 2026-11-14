@@ -16,8 +16,9 @@ development overlay adds health-only shells for Booking, Discovery and Payment.
 Catalogue in this branch exposes health and database-readiness endpoints. The
 Booking, Discovery and Payment entries in the development overlay provide startup
 checks while service configurations are brought together from their development
-branches. The provider simulator, Ollama, gateway/UI, seed data and monitoring
-can be connected as part of the shared integration work.
+branches. The provider simulator, Ollama, gateway/UI and seed data can be connected
+as part of the shared integration work. An optional monitoring overlay connects
+Prometheus and Grafana to the exporters currently available in this branch.
 
 The Ticketing service and shared messaging baseline come from commit
 `bb17236`. Catalogue and shared startup additions are developed on
@@ -89,6 +90,50 @@ branch, update the corresponding overlay entry with that service's Dockerfile,
 configuration, readiness check and database requirements. Keep the shared bootstrap
 application focused on startup checks. The overlay does not modify service
 application files.
+
+## Monitoring startup
+
+The monitoring overlay reuses the pinned images and Grafana datasource from
+commit `63b8b0e`, with an adjusted scrape configuration for this branch. Start it
+with the base stack:
+
+```sh
+docker compose -f docker-compose.yml -f docker-compose.monitoring.yml up -d --build --wait --wait-timeout 180
+```
+
+To include the five application containers as well:
+
+```sh
+docker compose -f docker-compose.yml -f docker-compose.dev.yml -f docker-compose.monitoring.yml up -d --build --wait --wait-timeout 180
+```
+
+Keep the same project name and file options for subsequent Compose commands.
+Prometheus is available at http://localhost:9090 and Grafana at
+http://localhost:3000. These two ports bind to the local machine only. Override
+`PROMETHEUS_PORT` or `GRAFANA_PORT` if they are occupied. The local Grafana login
+is `admin` / `stagedoor-demo`; set `GRAFANA_PASSWORD` before the first startup to
+use a different password. Existing Grafana volumes retain their original login.
+
+Grafana's default `Prometheus` datasource is provisioned automatically. Prometheus
+scrapes itself, Ticketing and RabbitMQ every five seconds. Use Grafana Explore or
+the Prometheus query page to inspect `up` and Ticketing's `http_requests_total`.
+Catalogue and the three bootstrap shells do not export metrics yet, so they are
+not configured as scrape targets. The Payment scrape target and its dashboard
+remain with the Payment implementation until that service is integrated; they
+are not replaced with fabricated metrics from the shell. A complete group
+dashboard, Catalogue metrics and AI token-cost panels remain later checkpoints.
+
+Prometheus and Grafana each have a named data volume. Restarting their containers
+preserves stored settings and time-series data. Check their health with:
+
+```sh
+curl -fsS http://localhost:9090/-/ready
+curl -fsS http://localhost:3000/api/health
+curl -fsS 'http://localhost:9090/api/v1/targets?state=active'
+```
+
+The ports above assume no overrides. These checks confirm the monitoring wiring;
+they do not establish the full application resilience or performance targets.
 
 ## Check the services
 
