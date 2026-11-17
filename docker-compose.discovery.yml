@@ -1,0 +1,93 @@
+# Use with the existing root compose file; do not replace teammates' services.
+# docker compose -f docker-compose.yml -f docker-compose.discovery.yml up --build
+services:
+  discovery-db:
+    image: pgvector/pgvector:pg16
+    environment:
+      POSTGRES_USER: discovery
+      POSTGRES_PASSWORD: discovery
+      POSTGRES_DB: discovery
+    volumes:
+      - discovery-db:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U discovery"]
+      interval: 3s
+      timeout: 3s
+      retries: 30
+
+  ollama:
+    image: ollama/ollama:latest
+    volumes:
+      - discovery-models:/root/.ollama
+
+  ollama-init:
+    image: ollama/ollama:latest
+    environment:
+      OLLAMA_HOST: http://ollama:11434
+    entrypoint: ["/bin/sh", "-c"]
+    command:
+      - "until ollama list >/dev/null 2>&1; do sleep 2; done; ollama show nomic-embed-text:latest >/dev/null 2>&1 || ollama pull nomic-embed-text:latest"
+    volumes:
+      - discovery-models:/root/.ollama
+    depends_on:
+      - ollama
+
+  discovery:
+    build:
+      context: .
+      dockerfile: discovery/Dockerfile
+    environment:
+      DATABASE_URL: postgresql+asyncpg://discovery:discovery@discovery-db:5432/discovery
+      AMQP_URL: amqp://guest:guest@rabbitmq:5672/
+      OLLAMA_URL: http://ollama:11434
+      EMBEDDING_MODEL: nomic-embed-text:latest
+      EMBEDDING_DIMENSIONS: "768"
+      MODEL_VERSION: ${DISCOVERY_MODEL_VERSION:-unverified-local-tag}
+      NOTIONAL_PRICE_PER_TOKEN: "0.000001"
+      DISCOVERY_ADMIN_TOKEN: ${DISCOVERY_ADMIN_TOKEN:-local-learning-only}
+    ports:
+      - "127.0.0.1:8003:8000"
+    depends_on:
+      discovery-db:
+        condition: service_healthy
+      topology-init:
+        condition: service_completed_successfully
+    healthcheck:
+      test: ["CMD", "python", "-c", "import urllib.request; urllib.request.urlopen('http://localhost:8000/health')"]
+      interval: 5s
+      timeout: 3s
+      retries: 30
+
+  discovery-seed:
+    profiles: ['demo-data']
+    build:
+      context: .
+      dockerfile: discovery/Dockerfile
+    command: ["python", "-m", "discovery.scripts.publish_events"]
+    environment:
+      AMQP_URL: amqp://guest:guest@rabbitmq:5672/
+    depends_on:
+      discovery:
+        condition: service_healthy
+
+  discovery-prometheus:
+    image: prom/prometheus:v3.2.1
+    volumes:
+      - ./discovery/monitoring/prometheus.yml:/etc/prometheus/prometheus.yml:ro
+    ports:
+      - "127.0.0.1:9093:9090"
+
+  discovery-grafana:
+    image: grafana/grafana:11.6.0
+    environment:
+      GF_AUTH_ANONYMOUS_ENABLED: "true"
+      GF_AUTH_ANONYMOUS_ORG_ROLE: Viewer
+    volumes:
+      - ./discovery/monitoring/provisioning:/etc/grafana/provisioning:ro
+      - ./discovery/monitoring/dashboards:/var/lib/grafana/dashboards:ro
+    ports:
+      - "127.0.0.1:3003:3000"
+
+volumes:
+  discovery-db:
+  discovery-models:

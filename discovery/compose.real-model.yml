@@ -1,0 +1,25 @@
+# Optional override for the independent stack: replace the model simulator with Ollama.
+# docker compose -f discovery/compose.standalone.yml -f discovery/compose.real-model.yml up --build
+services:
+  model:
+    image: ollama/ollama:latest
+    build: !reset null
+    command: ["serve"]
+    healthcheck:
+      test: ["CMD", "ollama", "list"]
+    volumes:
+      - model-data:/root/.ollama
+  model-init:
+    image: ollama/ollama:latest
+    environment:
+      OLLAMA_HOST: http://model:11434
+    entrypoint: ["/bin/sh", "-c"]
+    command: ["ollama show nomic-embed-text:latest >/dev/null 2>&1 || ollama pull nomic-embed-text:latest"]
+    depends_on:
+      model:
+        condition: service_healthy
+  discovery:
+    environment:
+      EMBEDDING_PROVIDER: ollama
+volumes:
+  model-data:

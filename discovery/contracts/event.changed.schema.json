@@ -1,0 +1,167 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "title": "PROPOSED event.changed v1 for Discovery",
+  "description": "Discovery consumer contract: accepts Catalogue C01 change and legacy demo action. Runtime validation also rejects conflicting change/action and status, and requires timezone-aware dates. Shared limits remain subject to team agreement.",
+  "type": "object",
+  "required": [
+    "message_id",
+    "type",
+    "occurred_at",
+    "version",
+    "producer",
+    "payload"
+  ],
+  "properties": {
+    "message_id": {
+      "type": "string",
+      "minLength": 1,
+      "maxLength": 200
+    },
+    "type": {
+      "const": "event.changed"
+    },
+    "occurred_at": {
+      "type": "string",
+      "format": "date-time"
+    },
+    "version": {
+      "const": 1
+    },
+    "producer": {
+      "type": "string"
+    },
+    "payload": {
+      "properties": {
+        "event_id": {
+          "maxLength": 200,
+          "minLength": 1,
+          "title": "Event Id",
+          "type": "string"
+        },
+        "event_version": {
+          "minimum": 1,
+          "title": "Event Version",
+          "type": "integer"
+        },
+        "action": {
+          "enum": [
+            "created",
+            "updated",
+            "cancelled"
+          ],
+          "title": "Action",
+          "type": "string"
+        },
+        "title": {
+          "default": "",
+          "maxLength": 500,
+          "title": "Title",
+          "type": "string"
+        },
+        "description": {
+          "default": "",
+          "maxLength": 8000,
+          "title": "Description",
+          "type": "string"
+        },
+        "tags": {
+          "items": {
+            "type": "string"
+          },
+          "maxItems": 50,
+          "title": "Tags",
+          "type": "array"
+        },
+        "starts_at": {
+          "anyOf": [
+            {
+              "format": "date-time",
+              "type": "string"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "title": "Starts At"
+        },
+        "change": {
+          "enum": [
+            "created",
+            "updated",
+            "cancelled"
+          ],
+          "title": "Change",
+          "type": "string"
+        }
+      },
+      "required": [
+        "event_id",
+        "event_version"
+      ],
+      "title": "EventChange",
+      "type": "object",
+      "allOf": [
+        {
+          "if": {
+            "anyOf": [
+              {
+                "required": [
+                  "change"
+                ],
+                "properties": {
+                  "change": {
+                    "enum": [
+                      "created",
+                      "updated"
+                    ]
+                  }
+                }
+              },
+              {
+                "required": [
+                  "action"
+                ],
+                "properties": {
+                  "action": {
+                    "enum": [
+                      "created",
+                      "updated"
+                    ]
+                  }
+                }
+              }
+            ]
+          },
+          "then": {
+            "required": [
+              "title",
+              "starts_at"
+            ],
+            "properties": {
+              "title": {
+                "minLength": 1
+              },
+              "starts_at": {
+                "type": "string",
+                "format": "date-time"
+              }
+            }
+          }
+        }
+      ],
+      "anyOf": [
+        {
+          "required": [
+            "change"
+          ]
+        },
+        {
+          "required": [
+            "action"
+          ]
+        }
+      ]
+    }
+  }
+}
