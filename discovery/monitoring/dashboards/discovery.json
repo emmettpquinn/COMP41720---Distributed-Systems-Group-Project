@@ -1,0 +1,364 @@
+{
+  "uid": "discovery",
+  "title": "Discovery",
+  "schemaVersion": 39,
+  "version": 1,
+  "refresh": "5s",
+  "time": {
+    "from": "now-15m",
+    "to": "now"
+  },
+  "panels": [
+    {
+      "id": 1,
+      "title": "HTTP request rate",
+      "type": "timeseries",
+      "datasource": {
+        "type": "prometheus",
+        "uid": "discovery-prometheus"
+      },
+      "gridPos": {
+        "x": 0,
+        "y": 0,
+        "w": 12,
+        "h": 8
+      },
+      "targets": [
+        {
+          "refId": "A",
+          "expr": "sum(rate(discovery_http_requests_total[5m]))",
+          "legendFormat": "{{purpose}}{{outcome}}{{version}}"
+        }
+      ],
+      "fieldConfig": {
+        "defaults": {
+          "unit": "reqps"
+        },
+        "overrides": []
+      },
+      "options": {}
+    },
+    {
+      "id": 2,
+      "title": "HTTP errors per second",
+      "type": "timeseries",
+      "datasource": {
+        "type": "prometheus",
+        "uid": "discovery-prometheus"
+      },
+      "gridPos": {
+        "x": 12,
+        "y": 0,
+        "w": 12,
+        "h": 8
+      },
+      "targets": [
+        {
+          "refId": "A",
+          "expr": "sum(rate(discovery_http_requests_total{status=~\"5..\"}[5m]))",
+          "legendFormat": "{{purpose}}{{outcome}}{{version}}"
+        }
+      ],
+      "fieldConfig": {
+        "defaults": {
+          "unit": "reqps"
+        },
+        "overrides": []
+      },
+      "options": {}
+    },
+    {
+      "id": 3,
+      "title": "HTTP p95 latency",
+      "type": "timeseries",
+      "datasource": {
+        "type": "prometheus",
+        "uid": "discovery-prometheus"
+      },
+      "gridPos": {
+        "x": 0,
+        "y": 8,
+        "w": 12,
+        "h": 8
+      },
+      "targets": [
+        {
+          "refId": "A",
+          "expr": "histogram_quantile(0.95, sum by (le) (rate(discovery_http_seconds_bucket[5m])))",
+          "legendFormat": "{{purpose}}{{outcome}}{{version}}"
+        }
+      ],
+      "fieldConfig": {
+        "defaults": {
+          "unit": "s"
+        },
+        "overrides": []
+      },
+      "options": {}
+    },
+    {
+      "id": 4,
+      "title": "Search fallback share",
+      "type": "timeseries",
+      "datasource": {
+        "type": "prometheus",
+        "uid": "discovery-prometheus"
+      },
+      "gridPos": {
+        "x": 12,
+        "y": 8,
+        "w": 12,
+        "h": 8
+      },
+      "targets": [
+        {
+          "refId": "A",
+          "expr": "sum(rate(discovery_searches_total{mode=\"keyword_fallback\"}[5m])) / sum(rate(discovery_searches_total[5m]))",
+          "legendFormat": "{{purpose}}{{outcome}}{{version}}"
+        }
+      ],
+      "fieldConfig": {
+        "defaults": {
+          "unit": "percentunit"
+        },
+        "overrides": []
+      },
+      "options": {}
+    },
+    {
+      "id": 5,
+      "title": "Ollama breaker open",
+      "type": "timeseries",
+      "datasource": {
+        "type": "prometheus",
+        "uid": "discovery-prometheus"
+      },
+      "gridPos": {
+        "x": 0,
+        "y": 16,
+        "w": 12,
+        "h": 8
+      },
+      "targets": [
+        {
+          "refId": "A",
+          "expr": "discovery_breaker_open",
+          "legendFormat": "{{purpose}}{{outcome}}{{version}}"
+        }
+      ],
+      "fieldConfig": {
+        "defaults": {
+          "unit": "short"
+        },
+        "overrides": []
+      },
+      "options": {}
+    },
+    {
+      "id": 6,
+      "title": "Ollama calls in flight",
+      "type": "timeseries",
+      "datasource": {
+        "type": "prometheus",
+        "uid": "discovery-prometheus"
+      },
+      "gridPos": {
+        "x": 12,
+        "y": 16,
+        "w": 12,
+        "h": 8
+      },
+      "targets": [
+        {
+          "refId": "A",
+          "expr": "discovery_ollama_inflight",
+          "legendFormat": "{{purpose}}{{outcome}}{{version}}"
+        }
+      ],
+      "fieldConfig": {
+        "defaults": {
+          "unit": "short"
+        },
+        "overrides": []
+      },
+      "options": {}
+    },
+    {
+      "id": 7,
+      "title": "Input tokens per second",
+      "type": "timeseries",
+      "datasource": {
+        "type": "prometheus",
+        "uid": "discovery-prometheus"
+      },
+      "gridPos": {
+        "x": 0,
+        "y": 24,
+        "w": 12,
+        "h": 8
+      },
+      "targets": [
+        {
+          "refId": "A",
+          "expr": "sum by (purpose) (rate(discovery_embedding_tokens_total[5m]))",
+          "legendFormat": "{{purpose}}{{outcome}}{{version}}"
+        }
+      ],
+      "fieldConfig": {
+        "defaults": {
+          "unit": "short"
+        },
+        "overrides": []
+      },
+      "options": {}
+    },
+    {
+      "id": 8,
+      "title": "Notional cost per 1000 searches",
+      "type": "timeseries",
+      "datasource": {
+        "type": "prometheus",
+        "uid": "discovery-prometheus"
+      },
+      "gridPos": {
+        "x": 12,
+        "y": 24,
+        "w": 12,
+        "h": 8
+      },
+      "targets": [
+        {
+          "refId": "A",
+          "expr": "1000 * sum(rate(discovery_notional_cost_total[5m])) / sum(rate(discovery_searches_total[5m]))",
+          "legendFormat": "{{purpose}}{{outcome}}{{version}}"
+        }
+      ],
+      "fieldConfig": {
+        "defaults": {
+          "unit": "short"
+        },
+        "overrides": []
+      },
+      "options": {}
+    },
+    {
+      "id": 9,
+      "title": "Completed embedding lag p95",
+      "type": "timeseries",
+      "datasource": {
+        "type": "prometheus",
+        "uid": "discovery-prometheus"
+      },
+      "gridPos": {
+        "x": 0,
+        "y": 32,
+        "w": 12,
+        "h": 8
+      },
+      "targets": [
+        {
+          "refId": "A",
+          "expr": "histogram_quantile(0.95, sum by (le) (rate(discovery_indexing_lag_seconds_bucket[5m])))",
+          "legendFormat": "{{purpose}}{{outcome}}{{version}}"
+        }
+      ],
+      "fieldConfig": {
+        "defaults": {
+          "unit": "s"
+        },
+        "overrides": []
+      },
+      "options": {}
+    },
+    {
+      "id": 10,
+      "title": "Pending embeddings",
+      "type": "timeseries",
+      "datasource": {
+        "type": "prometheus",
+        "uid": "discovery-prometheus"
+      },
+      "gridPos": {
+        "x": 12,
+        "y": 32,
+        "w": 12,
+        "h": 8
+      },
+      "targets": [
+        {
+          "refId": "A",
+          "expr": "discovery_pending_embeddings",
+          "legendFormat": "{{purpose}}{{outcome}}{{version}}"
+        }
+      ],
+      "fieldConfig": {
+        "defaults": {
+          "unit": "short"
+        },
+        "overrides": []
+      },
+      "options": {}
+    },
+    {
+      "id": 11,
+      "title": "Active index version",
+      "type": "timeseries",
+      "datasource": {
+        "type": "prometheus",
+        "uid": "discovery-prometheus"
+      },
+      "gridPos": {
+        "x": 0,
+        "y": 40,
+        "w": 12,
+        "h": 8
+      },
+      "targets": [
+        {
+          "refId": "A",
+          "expr": "discovery_active_index",
+          "legendFormat": "{{purpose}}{{outcome}}{{version}}"
+        }
+      ],
+      "fieldConfig": {
+        "defaults": {
+          "unit": "short"
+        },
+        "overrides": []
+      },
+      "options": {}
+    },
+    {
+      "id": 12,
+      "title": "Consumer outcomes per second",
+      "type": "timeseries",
+      "datasource": {
+        "type": "prometheus",
+        "uid": "discovery-prometheus"
+      },
+      "gridPos": {
+        "x": 12,
+        "y": 40,
+        "w": 12,
+        "h": 8
+      },
+      "targets": [
+        {
+          "refId": "A",
+          "expr": "sum by (outcome) (rate(discovery_messages_total[5m]))",
+          "legendFormat": "{{purpose}}{{outcome}}{{version}}"
+        }
+      ],
+      "fieldConfig": {
+        "defaults": {
+          "unit": "short"
+        },
+        "overrides": []
+      },
+      "options": {}
+    }
+  ],
+  "tags": [
+    "discovery"
+  ]
+}

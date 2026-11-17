@@ -37,7 +37,7 @@ def wait_for(probe, timeout=90):
     raise AssertionError(f"Probe timed out after {timeout}s ({last_error})")
 
 
-def http(origin, path, body=None, expected=200, basic=None):
+def http(origin, path, body=None, expected=200, basic=None, method=None):
     headers = {"Accept": "application/json"}
     if body is not None:
         headers["Content-Type"] = "application/json"
@@ -45,7 +45,7 @@ def http(origin, path, body=None, expected=200, basic=None):
         headers["Authorization"] = "Basic " + base64.b64encode(basic.encode()).decode()
     request = urllib.request.Request(
         origin + path, data=json.dumps(body).encode() if body is not None else None,
-        headers=headers,
+        headers=headers, method=method,
     )
     try:
         response = urllib.request.urlopen(request, timeout=10)

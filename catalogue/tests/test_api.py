@@ -142,3 +142,44 @@ def test_invalid_patch_is_rejected_without_version_change(client, database_schem
     assert client.patch("/events/event-api", json=body).status_code == 422
     assert client.get("/events/event-api").json()["event_version"] == 1
     assert len(rows(database_schema, "SELECT * FROM outbox")) == 1
+
+
+@pytest.mark.parametrize('invalid', [
+    {'title': 't' * 501}, {'description': 'd' * 8001},
+    {'tags': ['tag'] * 51}, {'tags': ['t' * 201]},
+])
+def test_discovery_limits_reject_before_event_or_outbox_write(client, database_schema, invalid):
+    venue(client)
+    assert client.post('/events', json=BODY | invalid).status_code == 422
+    assert rows(database_schema, 'SELECT * FROM events') == []
+    assert rows(database_schema, 'SELECT * FROM outbox') == []
+    assert client.post('/events', json=BODY).status_code == 201
+    assert client.patch('/events/event-api', json={'expected_version': 1} | invalid).status_code == 422
+    assert rows(database_schema, 'SELECT event_version FROM events')[0]['event_version'] == 1
+    assert len(rows(database_schema, 'SELECT * FROM outbox')) == 1
+
+
+def test_discovery_limit_boundaries_remain_accepted(client):
+    venue(client)
+    body = BODY | {'title': 't' * 500, 'description': 'd' * 8000, 'tags': ['t' * 200] * 50}
+    created = client.post('/events', json=body)
+    assert created.status_code == 201
+    assert len(created.json()['tags']) == 50
+    result = client.patch('/events/event-api', json={'expected_version': 1, 'tags': ['u' * 200] * 50})
+    assert result.status_code == 200 and result.json()['event_version'] == 2
+
+
+def test_partial_patch_of_legacy_oversized_text_cannot_queue_invalid_snapshot(client, database_schema):
+    venue(client)
+    assert client.post('/events', json=BODY).status_code == 201
+    async def legacy_data():
+        async with connect(database_schema) as connection:
+            await connection.execute("UPDATE events SET title=$1 WHERE event_id='event-api'", 'x' * 501)
+    asyncio.run(legacy_data())
+    response = client.patch('/events/event-api', json={'expected_version': 1, 'description': 'A safe new description'})
+    assert response.status_code == 409
+    saved = rows(database_schema, 'SELECT event_version, description FROM events')[0]
+    assert saved['event_version'] == 1 and saved['description'] == ''
+    assert len(rows(database_schema, 'SELECT * FROM outbox')) == 1
+    repaired = client.patch('/events/event-api', json={'expected_version': 1, 'title': 'Repaired event title'})
+    assert repaired.status_code == 200 and repaired.json()['event_version'] == 2

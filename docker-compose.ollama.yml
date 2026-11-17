@@ -1,0 +1,32 @@
+# Optional real model for a fresh project: include the base file first.
+# Existing simulator-bound indexes require a new index version; do not reset data.
+services:
+  discovery-model:
+    image: ollama/ollama:latest
+    build: !reset null
+    command: ["serve"]
+    volumes:
+      - discovery-models:/root/.ollama
+    healthcheck:
+      test: ["CMD", "ollama", "list"]
+      interval: 3s
+      timeout: 3s
+      retries: 30
+
+  discovery-model-init:
+    image: ollama/ollama:latest
+    environment:
+      OLLAMA_HOST: http://discovery-model:11434
+    entrypoint: ["/bin/sh", "-c"]
+    command: ["ollama show nomic-embed-text:latest >/dev/null 2>&1 || ollama pull nomic-embed-text:latest"]
+    depends_on:
+      discovery-model:
+        condition: service_healthy
+    restart: "no"
+
+  discovery:
+    environment:
+      EMBEDDING_PROVIDER: ollama
+
+volumes:
+  discovery-models:

@@ -2,7 +2,10 @@ const $ = (selector) => document.querySelector(selector);
 const list = $('#event-list');
 const panel = $('#detail');
 const status = $('#list-status');
-let capabilities = {holds: false};
+let capabilities = {holds: false, search: false};
+let listing = false;
+let listGeneration = 0;
+let activeQuery = "";
 let current = null;
 let selectedSeat = null;
 let busy = false;
@@ -40,37 +43,92 @@ function dateParts(event) {
 
 function setBusy(value) {
   busy = value;
-  document.querySelectorAll('.event-card, #refresh, .seat').forEach(node => {
-    node.disabled = value || node.dataset.unavailable === 'true';
-  });
-  const hold = $('#hold');
-  if (hold) hold.disabled = value || !selectedSeat || !capabilities.holds || current.status === 'cancelled';
+  updateControls();
 }
 
-async function loadEvents() {
-  status.textContent = 'Loading events…';
-  $('#refresh').disabled = true;
+function updateControls() {
+  document.querySelectorAll('.event-card, #refresh, #search-submit, #browse-all, #search-query').forEach(node => {
+    node.disabled = busy || listing;
+  });
+  document.querySelectorAll('.seat').forEach(node => {
+    node.disabled = busy || listing || node.dataset.unavailable === 'true';
+  });
+  const hold = $('#hold');
+  if (hold) hold.disabled = busy || listing || !selectedSeat || !capabilities.holds || current.status === 'cancelled';
+}
+
+function renderCards(events) {
+  list.replaceChildren();
+  for (const event of events) {
+    const date = dateParts(event);
+    const card = element('button', undefined, 'event-card');
+    card.type = 'button'; card.dataset.event = event.event_id;
+    card.setAttribute('aria-pressed', String(current?.event_id === event.event_id));
+    const calendar = element('span', undefined, 'event-date');
+    calendar.append(element('strong', date.day), element('span', date.month.toUpperCase()));
+    const text = element('span');
+    text.append(element('h3', event.title), element('p', `${event.venue.name} · ${event.venue.city}`), element('p', date.full), element('span', event.status === 'cancelled' ? 'Cancelled' : 'Live performance', 'category'));
+    card.append(calendar, text, element('span', '↗', 'arrow'));
+    card.onclick = () => selectEvent(event.event_id);
+    list.append(card);
+  }
+}
+
+function showSearchMetadata(result) {
+  const note = $('#search-status');
+  const simulated = result.embedding_provider !== 'ollama';
+  note.textContent = `${result.label}${simulated ? ' · Simulated model' : ''}`;
+  note.dataset.mode = result.mode;
+  note.dataset.provider = result.embedding_provider;
+  note.dataset.fallbackReason = result.fallback_reason || '';
+  const filter = result.filter;
+  const options = {day: 'numeric', month: 'short', hour: '2-digit', minute: '2-digit', timeZone: filter.timezone};
+  const from = new Date(filter.from).toLocaleString('en-IE', options);
+  let text = `From ${from}`;
+  if (filter.until) text += ` until ${new Date(filter.until).toLocaleString('en-IE', options)}`;
+  if (filter.after_local_minute !== null) {
+    const hour = Math.floor(filter.after_local_minute / 60).toString().padStart(2, '0');
+    const minute = (filter.after_local_minute % 60).toString().padStart(2, '0');
+    text += ` · after ${hour}:${minute}`;
+  }
+  if (filter.evening_from) text += ` · evenings from ${filter.evening_from}`;
+  $('#search-filter').textContent = `${text} (${filter.timezone}). Search results can lag event changes.`;
+}
+
+async function loadEvents(query = '') {
+  if (busy) return;
+  const request = ++listGeneration;
+  ++generation;
+  panel.removeAttribute('aria-busy');
+  listing = true;
+  updateControls();
+  status.textContent = query ? 'Searching events…' : 'Loading events…';
+  $('#search-status').textContent = '';
+  $('#search-filter').textContent = '';
   try {
-    const events = await api('/api/catalogue/events');
-    list.replaceChildren();
-    status.textContent = events.length ? `${events.length} events · Times shown in each venue's timezone` : 'No events are listed yet.';
-    for (const event of events) {
-      const date = dateParts(event);
-      const card = element('button', undefined, 'event-card');
-      card.type = 'button'; card.dataset.event = event.event_id;
-      card.setAttribute('aria-pressed', String(current?.event_id === event.event_id));
-      const calendar = element('span', undefined, 'event-date');
-      calendar.append(element('strong', date.day), element('span', date.month.toUpperCase()));
-      const text = element('span');
-      text.append(element('h3', event.title), element('p', `${event.venue.name} · ${event.venue.city}`), element('p', date.full), element('span', event.status === 'cancelled' ? 'Cancelled' : 'Live performance', 'category'));
-      card.append(calendar, text, element('span', '↗', 'arrow'));
-      card.onclick = () => selectEvent(event.event_id);
-      list.append(card);
+    const tasks = [api('/api/catalogue/events')];
+    if (query) tasks.push(api(`/api/discovery/search?q=${encodeURIComponent(query)}&limit=50`));
+    const [catalogue, result] = await Promise.all(tasks);
+    if (request !== listGeneration) return;
+    let events = catalogue;
+    if (query) {
+      if (!Array.isArray(result.results) || !['semantic', 'keyword_fallback'].includes(result.mode) || !['ollama', 'simulated', 'simulated_http'].includes(result.embedding_provider)) throw {status: 502};
+      const byId = new Map(catalogue.map(event => [event.event_id, event]));
+      // Discovery provides ordering; current Catalogue metadata provides venue/status.
+      events = result.results.map(hit => byId.get(hit.event_id)).filter(event => event && event.status !== 'cancelled');
+      showSearchMetadata(result);
     }
+    renderCards(events);
+    status.textContent = query ? `${events.length} matching events currently available` : events.length ? `${events.length} events · Times shown in each venue's timezone` : 'No events are listed yet.';
     if (current) await selectEvent(current.event_id);
-  } catch {
-    status.textContent = 'Events could not be loaded. Please try Refresh.';
-  } finally { setBusy(false); }
+  } catch (error) {
+    if (request !== listGeneration) return;
+    list.replaceChildren();
+    const detail = error.data?.detail;
+    status.textContent = query && error.status === 422 && typeof detail === 'string' ? detail : query ? 'Search could not be loaded. Try again or browse all events.' : 'Events could not be loaded. Please try Refresh.';
+  } finally {
+    if (request === listGeneration) { listing = false; updateControls(); }
+  }
 }
 
 async function selectEvent(id) {
@@ -164,8 +222,19 @@ async function reserve() {
   } finally { setBusy(false); }
 }
 
-$('#refresh').onclick = loadEvents;
+$('#refresh').onclick = () => loadEvents(activeQuery);
+$('#search-form').onsubmit = (event) => {
+  event.preventDefault();
+  activeQuery = $('#search-query').value.trim();
+  loadEvents(activeQuery);
+};
+$('#browse-all').onclick = () => {
+  activeQuery = '';
+  $('#search-query').value = '';
+  loadEvents();
+};
 (async () => {
   try { capabilities = await api('/api/capabilities'); } catch {}
+  $('#search-form').hidden = !capabilities.search;
   await loadEvents();
 })();

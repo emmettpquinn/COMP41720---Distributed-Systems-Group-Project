@@ -90,3 +90,42 @@ class GatewayTests(unittest.TestCase):
             with self.assertRaises(ValueError): Settings(timeout_seconds=value)
         for value in ['file:///tmp', 'http://user:secret@host','http://host/private']:
             with self.assertRaises(ValueError): Settings(catalogue_url=value)
+
+
+class DiscoveryGatewayTests(unittest.TestCase):
+    client = GatewayTests.client
+
+    def test_search_query_and_fallback_metadata_survive_proxy(self):
+        seen = []
+        body = {'mode':'keyword_fallback', 'label':'Showing keyword results',
+                'fallback_reason':'circuit_open', 'embedding_provider':'simulated_http', 'results':[]}
+        def handler(request):
+            seen.append(request)
+            return httpx.Response(200,json=body)
+        client = self.client(handler, search_enabled=True)
+        response = client.get('/api/discovery/search',params={'q':'music Friday after 7pm','limit':5})
+        self.assertEqual(response.json(),body)
+        self.assertEqual(seen[0].url.host,'discovery')
+        self.assertEqual(seen[0].url.params['q'],'music Friday after 7pm')
+        self.assertTrue(client.get('/api/capabilities').json()['search'])
+
+    def test_similar_route_and_disabled_search(self):
+        seen = []
+        def handler(request):
+            seen.append(request)
+            return httpx.Response(200,json={'results':[]})
+        client=self.client(handler,search_enabled=True)
+        self.assertEqual(client.get('/api/discovery/events/event-demo-001/similar').status_code,200)
+        self.assertEqual(seen[0].url.path,'/events/event-demo-001/similar')
+        self.assertEqual(client.get('/api/discovery/admin/indexes').status_code,404)
+        blocked=self.client(handler)
+        self.assertEqual(blocked.get('/api/discovery/search?q=music').status_code,503)
+        self.assertEqual(len(seen),1)
+
+
+    def test_read_only_search_timeout_has_no_reservation_outcome(self):
+        def handler(request):
+            raise httpx.ReadTimeout('synthetic timeout',request=request)
+        response=self.client(handler,search_enabled=True).get('/api/discovery/search?q=music')
+        self.assertEqual(response.status_code,504)
+        self.assertNotIn('reservation',response.json()['detail'])

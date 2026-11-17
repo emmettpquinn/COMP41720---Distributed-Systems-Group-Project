@@ -4,6 +4,9 @@ global:
   scrape_interval: 5s
 
 scrape_configs:
+  - job_name: discovery
+    static_configs:
+      - targets: ["discovery:8000"]
   - job_name: payment
     static_configs:
       - targets: ["payment:8000"]

@@ -4,7 +4,9 @@ import json
 import uuid
 from datetime import datetime, timezone
 
-from .schemas import EventCreate, EventPatch, VenueCreate
+from pydantic import ValidationError
+
+from .schemas import EventCreate, EventPatch, IndexableText, VenueCreate
 
 
 class NotFound(ValueError):
@@ -78,6 +80,10 @@ async def event_detail(connection, event_id):
 
 async def append_event(connection, event_id, change):
     snapshot = await event_snapshot(connection, event_id)
+    try:
+        IndexableText.model_validate({key: snapshot[key] for key in ('title', 'description', 'tags')})
+    except ValidationError as error:
+        raise Conflict("Stored event text exceeds search limits; update the affected fields together") from error
     occurred_at = datetime.now(timezone.utc)
     message_id = uuid.uuid4()
     envelope = {

@@ -11,6 +11,10 @@ from pydantic import (
 
 Identifier = Annotated[str, StringConstraints(strip_whitespace=True, min_length=1, max_length=64)]
 NonBlank = Annotated[str, StringConstraints(strip_whitespace=True, min_length=1)]
+EventTitle = Annotated[str, StringConstraints(strip_whitespace=True, min_length=1, max_length=500)]
+Description = Annotated[str, StringConstraints(max_length=8000)]
+Tag = Annotated[str, StringConstraints(strip_whitespace=True, min_length=1, max_length=200)]
+Tags = Annotated[list[Tag], Field(max_length=50)]
 PositiveInt = Annotated[int, Field(strict=True, gt=0, le=9223372036854775807)]
 
 
@@ -24,6 +28,12 @@ def valid_timezone(value: str) -> str:
 
 class InputModel(BaseModel):
     model_config = ConfigDict(extra="forbid")
+
+
+class IndexableText(InputModel):
+    title: EventTitle
+    description: Description
+    tags: Tags
 
 
 class VenueCreate(InputModel):
@@ -41,11 +51,11 @@ class Seat(InputModel):
 class EventCreate(InputModel):
     event_id: Identifier
     venue_id: Identifier
-    title: NonBlank
-    description: str = ""
+    title: EventTitle
+    description: Description = ""
     starts_at: AwareDatetime
     timezone: NonBlank
-    tags: list[NonBlank] = Field(default_factory=list)
+    tags: Tags = Field(default_factory=list)
     seats: list[Seat] = Field(min_length=1)
 
     _timezone = field_validator("timezone")(valid_timezone)
@@ -59,11 +69,11 @@ class EventCreate(InputModel):
 
 class EventPatch(InputModel):
     expected_version: PositiveInt
-    title: NonBlank | None = None
-    description: str | None = None
+    title: EventTitle | None = None
+    description: Description | None = None
     starts_at: AwareDatetime | None = None
     timezone: NonBlank | None = None
-    tags: list[NonBlank] | None = None
+    tags: Tags | None = None
     status: Literal["cancelled"] | None = None
 
     @model_validator(mode="before")

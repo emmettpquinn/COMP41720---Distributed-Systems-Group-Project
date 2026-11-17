@@ -1,4 +1,4 @@
-# Development integration: real Booking hold API plus Discovery startup shell.
+# Development integration: add Booking holds to the four base business services.
 # Booking demo inventory is synthetic and never resets existing held/booked seats.
 services:
   booking-db:
@@ -32,16 +32,6 @@ services:
     environment:
       BOOKING_HOLDS_ENABLED: "true"
 
-  discovery:
-    build:
-      context: .
-      dockerfile: infra/bootstrap/Dockerfile
-    labels:
-      com.citytickets.mode: bootstrap
-    environment:
-      SERVICE_NAME: discovery
-    ports:
-      - "8003:8000"
 
 volumes:
   booking-db:

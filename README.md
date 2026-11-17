@@ -1,5 +1,7 @@
 # Ticket Booking Platform
 
+New to the project? Start with the [plain-language guide](getting-started/README.md).
+
 COMP41720 Distributed Systems group project. This README describes integration
 on `feature/catalogue-integration`; services are also developed on separate
 branches. See the [checkpoint tracker](docs/PROJECT_CONTINUITY.md),
@@ -8,22 +10,24 @@ branches. See the [checkpoint tracker](docs/PROJECT_CONTINUITY.md),
 
 ## What runs here
 
-The base stack starts Catalogue, Ticketing/Notification and Payment, each with
-its own PostgreSQL database, plus RabbitMQ, MailHog and the gateway/browser UI.
-The development overlay adds Booking's real hold API and its private database,
-plus a clearly labelled Discovery health-only shell. The monitoring overlay adds
-Prometheus and Grafana. The gateway is an extra infrastructure component, not one
+The base stack starts Catalogue, Ticketing/Notification, Payment and Discovery,
+each with its own PostgreSQL database, plus RabbitMQ, MailHog, the gateway/browser
+UI and a private HTTP embedding simulator. Discovery uses pgvector. The development
+overlay adds Booking's real hold API and its private database; all five business
+containers now run service implementations. The monitoring overlay adds Prometheus
+and Grafana. The gateway is an extra infrastructure component, not one
 of the five business services.
 
 Catalogue provides versioned event/venue APIs, seat-map definitions, an atomic
 outbox, availability projection, bounded detail cache, synthetic seeds and metrics.
 Payment handles its simulated ledger/refunds/outbox; Ticketing handles tickets and
 emails. Booking currently provides holds only: no expiry, checkout/status API,
-saga, event consumer or availability publisher. Discovery's AI/search integration
-is pending on this branch. This stack does not yet perform a complete purchase.
+saga, event consumer or availability publisher. Discovery provides date-filtered
+search, similar events, versioned indexing and labelled keyword fallback. The
+default model is explicitly simulated; real Ollama is an optional overlay. This stack does not yet perform a complete purchase.
 
 Source credits: Ticketing/shared messaging `bb17236`, Payment `63b8b0e`, Booking
-hold source `7996674`. Integration changes are recorded in the runbook; teammate
+hold source `7996674`, Discovery source `eccabe5`. Integration changes are recorded in the runbook; teammate
 branches are untouched. Candidate Catalogue contracts still need consumer
 agreement, so `CATALOGUE_MESSAGING_ENABLED` defaults to false.
 
@@ -36,10 +40,11 @@ repository root, for the base stack:
 docker compose up -d --build --wait --wait-timeout 180
 ```
 
-For all five business containers, browser UI and monitoring:
+For all five business containers, live Catalogue-to-Discovery indexing, browser
+UI and monitoring (explicitly enables candidate Catalogue publication):
 
 ```sh
-docker compose -f docker-compose.yml -f docker-compose.dev.yml -f docker-compose.monitoring.yml up -d --build --wait --wait-timeout 180
+CATALOGUE_MESSAGING_ENABLED=true docker compose -f docker-compose.yml -f docker-compose.dev.yml -f docker-compose.monitoring.yml up -d --build --wait --wait-timeout 240
 ```
 
 Use the same `-p` project name and `-f` file options in every subsequent command.
@@ -53,13 +58,14 @@ Base URLs:
 - Browser UI: http://localhost:8080
 - Catalogue API: http://localhost:8001/docs and `/metrics`
 - Payment API: http://localhost:8004/docs and `/metrics`
+- Discovery API: http://localhost:8003/docs and `/metrics`
 - Ticketing API: http://localhost:8005/docs and `/metrics`
 - RabbitMQ management: http://localhost:15672 (`guest` / `guest`)
 - RabbitMQ metrics: http://localhost:15692/metrics
 - MailHog inbox: http://localhost:8025
 
-The development overlay adds Booking at http://localhost:8002/docs and Discovery's
-bootstrap `/health` at http://localhost:8003/health. Discovery has no business API.
+The development overlay adds Booking at http://localhost:8002/docs. Discovery
+provides `/health`, `/ready`, `/search` and `/events/{event_id}/similar`.
 The browser port binds to loopback; set `GATEWAY_PORT` to change it.
 
 The `topology-init`, `catalogue-migrate` and `catalogue-seed` jobs should exit 0.
@@ -76,8 +82,11 @@ Catalogue for browsing and Booking for the authoritative hold decision. Unknown
 availability is labelled unknown. A successful hold displays the actual reference;
 a refusal refetches the projection and marks that choice locally. A timeout can
 have an unknown outcome: retrying uses the same tab's synthetic customer ID.
-Checkout/search are unavailable until their service APIs are integrated. Current
-Booking holds do not expire; use synthetic data for this development flow.
+Search displays its effective date filter, semantic/keyword label and simulated
+provider label. Browse all clears the query. Catalogue supplies current card
+metadata while Discovery supplies ranking; search does not authorize a hold.
+Checkout is unavailable until the Booking saga/API is integrated. Current holds
+do not expire; use synthetic data for this development flow.
 
 The gateway uses FastAPI/httpx for fixed same-origin routes, request-size limits
 and bounded timeouts. It exposes no direct payment-creation route. See the
@@ -118,11 +127,11 @@ http://localhost:3000. Both ports bind to loopback. Set `PROMETHEUS_PORT`,
 `GRAFANA_PORT` and, before first startup, `GRAFANA_PASSWORD` as needed. Default local
 Grafana login is `admin` / `stagedoor-demo`; existing volumes retain their login.
 
-Five exporters are configured: Catalogue, Payment, Ticketing, RabbitMQ and
-Prometheus. The datasource and separate Catalogue/Payment dashboards are
-provisioned automatically. Booking's imported hold API and the Discovery shell
-have no metrics target. Catalogue lag panels have 2/10-second reference thresholds;
-notification alert rules and group AI-cost panels remain open.
+Six exporters are configured: Catalogue, Discovery, Payment, Ticketing, RabbitMQ
+and Prometheus. The datasource and separate Catalogue/Payment/Discovery dashboards
+are provisioned automatically. Booking's imported hold API has no metrics target. Catalogue lag panels have 2/10-second reference thresholds;
+notification alert rules remain open. Discovery reports input tokens and notional
+cost; simulator values are synthetic, not actual charges.
 
 ```sh
 curl -fsS http://localhost:9090/-/ready
@@ -162,17 +171,21 @@ docker compose run --rm --no-deps \
   catalogue-migrate sh -c 'python -m pip install -r requirements-dev.txt && python -m pytest -q -p no:cacheprovider'
 ```
 
-Catalogue: 54 tests at last verification. Payment: 25 including the optional live
-broker test enabled for the integration check. Gateway: 7 boundary tests. Booking:
-6 added integration tests including a 20-buyer race and non-resetting seeds.
+Catalogue: 60 tests. Discovery: 49 against a dedicated disposable pgvector test DB,
+with no skips. Gateway: 10 boundary tests and 6 DOM tests. Previous checks: Payment
+25 including the live-broker case; Booking 6 including a 20-buyer race; Ticketing 14.
+The unchanged service suites are not represented as newly rerun checks.
 Commands are in the integration runbook. Dependencies can emit a non-failing
 Starlette/httpx deprecation warning.
 
 The [failure harness](tools/verify_catalogue_failures.py) creates a fresh private
 Catalogue stack, injects process/broker/database failures and removes only its own
 synthetic project/volumes. Generated JSON/logs must stay outside Git. Queue probes
-are not actual Booking/Discovery consumers. Full-system purchase, 500-buyer lag,
-Discovery AI and final submission acceptance remain pending.
+are not actual Booking/Discovery consumers in that older harness. A separate
+[Discovery integration harness](tools/verify_discovery_integration.py) now exercises
+the actual Catalogue-to-Discovery consumer with separate databases, outage
+fallback, restart and shared monitoring. Full-system purchase, real 500-buyer
+lag, learned-model rehearsal and final submission acceptance remain pending.
 
 ## Independent verification and submission preparation
 
@@ -203,3 +216,31 @@ Catalogue-only evidence, not the full 500-buyer or purchase acceptance test.
 for student review. The [demo/viva checklist](docs/demo-viva-checklist.md) separates
 implemented paths from final group work. Exact module citations, student-owned
 judgments, ownership confirmation and signatures are still required.
+
+## Discovery integration and optional real model
+
+See [Discovery integration details](docs/contracts/discovery-integration.md) for
+source attribution, payload limits, legacy-data handling and model switching.
+Catalogue now rejects titles over 500 characters, descriptions over 8000, more
+than 50 tags or tags over 200 characters. No existing data or immutable historical
+outbox message is silently truncated or rewritten.
+
+The default HTTP simulator runs no learned model. For a fresh real-model project,
+add `-f docker-compose.ollama.yml` to the full startup command and choose a distinct
+`-p` project name/free ports. First startup downloads Ollama/model assets; offline
+use requires them cached. Keep simulator-bound and real-model indexes separate,
+or explicitly build/activate a new index version. The real overlay is configuration-
+validated; learned-model execution was not verified in this integration session.
+
+```sh
+python3 tools/verify_discovery_integration.py --output /tmp/discovery-integration.json
+npm --prefix gateway ci --ignore-scripts
+npm --prefix gateway run test:ui
+```
+
+Node is needed only for the jsdom development tests (supported versions are in
+`gateway/package.json`); production containers remain Python. Discovery's 49-test
+PostgreSQL check used a separate test database because its fixtures clear tables.
+Never set `DISCOVERY_TEST_DATABASE_URL` to an application database. Visual browser
+QA was blocked by Safari's locked authentication screen; the six passing DOM
+checks do not claim visual/device verification.

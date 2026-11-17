@@ -40,6 +40,11 @@ def main():
             source = Path(folder)
             result['source_head']=clean_archive(source)
             result['clean_committed_archive']=True
+            real_discovery=(source/'discovery/Dockerfile').exists()
+            applications=('catalogue','payment','booking','ticketing') + (('discovery',) if real_discovery else ())
+            target_count=6 if real_discovery else 5
+            dashboard_count=3 if real_discovery else 2
+            result['scope']='committed development stack: five business implementations and explicit model simulator; no full purchase' if real_discovery else result['scope']
             with Project('startup',output,source=source,full=True,messaging=False) as project:
                 result['project']=project.name
                 print('Building committed-source development stack '+project.name,flush=True)
@@ -49,11 +54,11 @@ def main():
                     return http(project.origin(service),path,**kwargs)
 
                 def assert_ready():
-                    for service in ('catalogue','payment','booking','ticketing'):
+                    for service in applications:
                         assert call(service,'/ready')['status']=='ready'
                     assert call('gateway','/health')['status']=='ok'
-                    discovery=call('discovery','/health')
-                    assert discovery['mode']=='bootstrap'
+                    if not real_discovery:
+                        assert call('discovery','/health')['mode']=='bootstrap'
                     return True
 
                 def emit(name,value):
@@ -62,10 +67,12 @@ def main():
 
                 def assert_monitoring():
                     data=http(project.origin('prometheus',9090),'/api/v1/targets?state=active')['data']['activeTargets']
-                    assert {target['labels']['job'] for target in data}=={'catalogue','payment','ticketing','rabbitmq','prometheus'}
+                    expected={'catalogue','payment','ticketing','rabbitmq','prometheus'} | ({'discovery'} if real_discovery else set())
+                    assert {target['labels']['job'] for target in data}==expected
                     assert all(target['health']=='up' for target in data)
                     items=http(project.origin('grafana',3000),'/api/search',basic='admin:stagedoor-demo')
-                    assert {'catalogue','stagedoor-payment'} <= {item['uid'] for item in items}
+                    expected_dashboards={'catalogue','stagedoor-payment'} | ({'discovery'} if real_discovery else set())
+                    assert expected_dashboards <= {item['uid'] for item in items}
                     return True
 
                 wait_for(assert_ready)
@@ -75,14 +82,14 @@ def main():
                 for job in ('catalogue-migrate','catalogue-seed','topology-init'):
                     match=next(item for item in jobs if item['Service']==job)
                     assert match['State']=='exited' and match['ExitCode']==0,match
-                emit('fresh_startup',{'applications_ready':4,'discovery_mode':'bootstrap','jobs_exit_zero':3,'scrape_targets_up':5,'dashboards_present':2})
+                emit('fresh_startup',{'applications_ready':len(applications),'discovery_mode':'real' if real_discovery else 'bootstrap','jobs_exit_zero':3,'scrape_targets_up':target_count,'dashboards_present':dashboard_count})
 
                 events=call('gateway','/api/catalogue/events')
                 assert {event['event_id'] for event in events}=={'event-demo-001','event-demo-002'}
                 detail=call('gateway','/api/catalogue/events/event-demo-001')
                 assert detail['availability'] is None
                 capabilities=call('gateway','/api/capabilities')
-                assert capabilities=={'holds':True,'checkout':False,'search':False}
+                assert capabilities=={'holds':True,'checkout':False,'search':real_discovery}
                 hold_body={'event_id':'event-demo-001','seat_id':'A1','customer_id':'synthetic-startup-buyer'}
                 hold=call('gateway','/api/booking/holds',body=hold_body,expected=201)
                 assert hold['status']=='held'
@@ -90,7 +97,7 @@ def main():
                 assert repeat['booking_ref']==hold['booking_ref']
                 refusal=call('gateway','/api/booking/holds',body=hold_body|{'customer_id':'synthetic-competing-buyer'},expected=409)
                 assert refusal['error']=='seat_taken'
-                emit('browse_hold_boundary',{'seeded_events':2,'unknown_availability_preserved':True,'stable_hold_retry':True,'competing_hold_409':True,'checkout_and_search_unavailable':True})
+                emit('browse_hold_boundary',{'seeded_events':2,'unknown_availability_preserved':True,'stable_hold_retry':True,'competing_hold_409':True,'checkout_unavailable':True,'search_enabled':real_discovery})
 
                 # Use Catalogue's public update API, then rerun owned seed code.
                 origin=project.origin('catalogue')
@@ -109,7 +116,7 @@ def main():
                 assert project.sql('catalogue-db','SELECT count(*) FROM event_seats')=='4'
                 emit('repeat_safe_seeds',{'edited_metadata_preserved':True,'held_inventory_preserved':True,'no_extra_outbox_rows':True})
 
-                services=('catalogue','booking','payment','ticketing','gateway')
+                services=applications+('gateway',)
                 project.cli('up','-d','--force-recreate','--no-deps','--wait','--wait-timeout','180',*services)
                 wait_for(assert_ready)
 
@@ -125,16 +132,16 @@ def main():
                 emit('application_recreation',{'catalogue_metadata':True,'booking_reference':True,'payment_idempotency':True,'default_catalogue_messaging_off':True,'monitoring_recovered':True})
 
                 # Restart owned database containers independently of the application processes.
-                databases=('catalogue-db','booking-db','payment-db','ticketing-db')
+                databases=tuple(service+'-db' for service in applications)
                 project.cli('stop',*databases)
-                for service in ('catalogue','booking','payment','ticketing'):
+                for service in applications:
                     assert call(service,'/health')['status']=='ok'
                     call(service,'/ready',expected=503)
                 project.cli('start',*databases)
                 wait_for(assert_ready)
                 assert_persisted()
                 wait_for(assert_monitoring)
-                emit('database_restarts',{'liveness_preserved':4,'readiness_503':4,'owned_state_recovered':True,'monitoring_recovered':True})
+                emit('database_restarts',{'liveness_preserved':len(applications),'readiness_503':len(applications),'owned_state_recovered':True,'monitoring_recovered':True})
                 result['passed']=True
     except Exception as error:
         result['passed']=False
