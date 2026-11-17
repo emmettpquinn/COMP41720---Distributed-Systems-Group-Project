@@ -1,0 +1,37 @@
+# Development integration: add Booking holds to the four base business services.
+# Booking demo inventory is synthetic and never resets existing held/booked seats.
+services:
+  booking-db:
+    image: postgres:16-alpine
+    environment:
+      POSTGRES_USER: booking
+      POSTGRES_PASSWORD: booking
+      POSTGRES_DB: booking
+    volumes:
+      - booking-db:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U booking -d booking"]
+      interval: 3s
+      timeout: 3s
+      retries: 30
+
+  booking:
+    build:
+      context: .
+      dockerfile: booking/Dockerfile
+    environment:
+      DATABASE_URL: postgresql://booking:booking@booking-db:5432/booking
+      BOOKING_DEMO_SEED: ${BOOKING_DEMO_SEED:-true}
+    ports:
+      - "8002:8000"
+    depends_on:
+      booking-db:
+        condition: service_healthy
+
+  gateway:
+    environment:
+      BOOKING_HOLDS_ENABLED: "true"
+
+
+volumes:
+  booking-db:

@@ -1,0 +1,24 @@
+# Based on commit 63b8b0e. Scrape only exporters connected on this branch.
+# Payment and Catalogue export real service metrics.
+global:
+  scrape_interval: 5s
+
+scrape_configs:
+  - job_name: discovery
+    static_configs:
+      - targets: ["discovery:8000"]
+  - job_name: payment
+    static_configs:
+      - targets: ["payment:8000"]
+  - job_name: catalogue
+    static_configs:
+      - targets: ["catalogue:8000"]
+  - job_name: prometheus
+    static_configs:
+      - targets: ["prometheus:9090"]
+  - job_name: ticketing
+    static_configs:
+      - targets: ["ticketing:8000"]
+  - job_name: rabbitmq
+    static_configs:
+      - targets: ["rabbitmq:15692"]

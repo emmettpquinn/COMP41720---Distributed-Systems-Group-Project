@@ -1,5 +1,21 @@
 .git
+**/.venv
+**/venv
 **/__pycache__
 **/.pytest_cache
+**/*.pyc
 **/*.db
-**/.venv
+**/.env
+**/.env.*
+!**/.env.example
+.DS_Store
+
+**/node_modules
+
+# Additional Payment development artifacts.
+.venv
+**/*.db-journal
+**/*.db-wal
+**/*.db-shm
+**/data
+.idea

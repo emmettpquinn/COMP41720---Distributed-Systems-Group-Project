@@ -1,0 +1,16 @@
+{
+  "message_id": "00000000-0000-4000-8000-000000000202",
+  "type": "seat.availability-changed",
+  "occurred_at": "2026-11-14T12:00:08+00:00",
+  "version": 1,
+  "producer": "booking",
+  "payload": {
+    "event_id": "event-demo-001",
+    "sequence": 8,
+    "seats_remaining": 2,
+    "available_seat_ids": [
+      "A1",
+      "A2"
+    ]
+  }
+}

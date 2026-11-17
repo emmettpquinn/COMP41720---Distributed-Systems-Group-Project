@@ -3,7 +3,7 @@ import os
 from pathlib import Path
 import sys
 
-# Shared messaging belongs to Emmett; use it without copying his code.
+# Reuse the shared messaging package maintained with Ticketing.
 sys.path.insert(0, str(Path(__file__).resolve().parents[1] / 'shared'))
 
 

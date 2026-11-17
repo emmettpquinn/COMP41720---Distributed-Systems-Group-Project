@@ -1,0 +1,12 @@
+{
+  "private": true,
+  "scripts": {
+    "test:ui": "node --test tests/browser.test.mjs"
+  },
+  "devDependencies": {
+    "jsdom": "31.0.1"
+  },
+  "engines": {
+    "node": "^22.22.2 || ^24.15.0 || >=26.0.0"
+  }
+}

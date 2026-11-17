@@ -1,1 +1,1 @@
-"""Eoin's Discovery service."""
+"""Discovery service."""

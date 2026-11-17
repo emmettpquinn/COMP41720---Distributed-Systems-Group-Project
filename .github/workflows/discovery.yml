@@ -1,9 +1,9 @@
 name: Discovery verification
 on:
   pull_request:
-    paths: ['discovery/**', 'shared/**', '.github/workflows/discovery.yml']
+    paths: ['discovery/**', 'catalogue/**', 'shared/**', '.github/workflows/discovery.yml']
   push:
-    branches: ['eoin/**', 'feature/discovery*']
+    branches: ['feature/discovery*', 'feature/catalogue-integration']
   workflow_dispatch:
 permissions:
   contents: read

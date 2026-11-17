@@ -1,0 +1,27 @@
+{
+  "venues": [
+    {"venue_id": "venue-demo-001", "name": "Demo Venue", "city": "Dublin"}
+  ],
+  "events": [
+    {
+      "event_id": "event-demo-001", "venue_id": "venue-demo-001",
+      "title": "Evening Performance", "description": "Fictional music event for local demos.",
+      "starts_at": "2026-11-27T19:30:00+00:00", "timezone": "Europe/Dublin",
+      "tags": ["music", "evening"],
+      "seats": [
+        {"seat_id": "A1", "section": "A", "label": "A1"},
+        {"seat_id": "A2", "section": "A", "label": "A2"}
+      ]
+    },
+    {
+      "event_id": "event-demo-002", "venue_id": "venue-demo-001",
+      "title": "Weekend Performance", "description": "Fictional weekend event for local demos.",
+      "starts_at": "2026-11-28T18:00:00+00:00", "timezone": "Europe/Dublin",
+      "tags": ["weekend"],
+      "seats": [
+        {"seat_id": "B1", "section": "B", "label": "B1"},
+        {"seat_id": "B2", "section": "B", "label": "B2"}
+      ]
+    }
+  ]
+}

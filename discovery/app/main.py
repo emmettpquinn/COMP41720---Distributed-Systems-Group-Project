@@ -10,6 +10,7 @@ from fastapi.responses import Response
 from prometheus_client import CONTENT_TYPE_LATEST, generate_latest
 from pydantic import BaseModel, Field
 from sqlalchemy import text
+from sqlalchemy.exc import SQLAlchemyError
 from messaging.consumer import run_consumer
 from messaging.topology import connect_with_retry, declare_topology
 from . import metrics
@@ -96,7 +97,7 @@ def create_app(store=None, provider=None, broker=None, seed=False):
             await provider.close()
             await store.close()
 
-    app = FastAPI(title='Discovery — Eoin', lifespan=lifespan,
+    app = FastAPI(title='Discovery', lifespan=lifespan,
                   swagger_ui_parameters={'defaultModelsExpandDepth': -1})
     app.state.service = service
 
@@ -114,9 +115,21 @@ def create_app(store=None, provider=None, broker=None, seed=False):
 
     @app.get('/health')
     async def health():
-        async with store.sessions() as session:
-            await session.execute(text('SELECT 1'))
         return {'status': 'ok', 'broker': 'connected' if broker_ready else ('reconnecting' if broker else 'disabled'),
+                'embedding_provider': provider_label}
+
+    @app.get('/ready')
+    async def ready():
+        try:
+            async with asyncio.timeout(2):
+                async with store.sessions() as session:
+                    await session.execute(text('SELECT 1'))
+        except (SQLAlchemyError, OSError, TimeoutError) as error:
+            raise HTTPException(503, 'Discovery database is unavailable') from error
+        if broker and not broker_ready:
+            raise HTTPException(503, 'Discovery broker is reconnecting')
+        # Model outages can serve labelled keyword results; they do not fail readiness.
+        return {'status': 'ready', 'broker': 'connected' if broker else 'disabled',
                 'embedding_provider': provider_label}
 
     @app.get('/search', response_model=SearchResponse)

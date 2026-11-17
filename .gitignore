@@ -3,3 +3,12 @@ __pycache__/
 .pytest_cache/
 .venv/
 *.db
+
+node_modules/
+
+# Additional Payment development artifacts.
+*.db-journal
+*.db-wal
+*.db-shm
+.env
+.idea/
