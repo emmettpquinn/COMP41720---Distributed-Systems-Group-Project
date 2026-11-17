@@ -17,8 +17,9 @@ Students must verify contributions and follow the brief's submission process.
   databases/volumes. Services never write one another's database.
 - Resilience: refer to the failure harness and Catalogue evidence notes. Retain
   raw generated results outside Git and reference their measured scope accurately.
-- Performance: p95 projection lag <=2 seconds under 500 buyers is a target, not
-  a measured result. Outage recovery tests do not establish normal-load latency.
+- Performance: p95 projection lag <=2 seconds under real 500-buyer activity remains
+  a target. Standalone 500-client browsing with synthetic snapshots now has
+  measured evidence in `docs/evidence/catalogue-load-startup.md`. Outage recovery tests do not establish normal-load latency.
 - AI: Discovery's local model, index versioning, fallback and token-cost metrics
   await its implementation. No paid API credentials are required by this branch.
 - Reproducibility: root README and integration runbook describe Compose, seeds,
@@ -57,3 +58,11 @@ readiness/timeouts, non-resetting demo inventory, browser routes/UI and evidence
 No actual focused hours were supplied. Do not infer hours from commits, chat
 length or timestamps. Record actual role contributions and hours separately, then
 prepare signatures outside these name-free repository files.
+
+## Independent preparation completed 2026-11-17
+
+The clean committed-source development stack passed start/seed/recreation/database
+restart checks. The standalone 500-client benchmark recorded all request and
+snapshot counts, hardware, timing basis and limitations. V03/V04/I07 remain open
+for real Booking/Discovery and end-to-end acceptance.
+

@@ -173,3 +173,33 @@ Catalogue stack, injects process/broker/database failures and removes only its o
 synthetic project/volumes. Generated JSON/logs must stay outside Git. Queue probes
 are not actual Booking/Discovery consumers. Full-system purchase, 500-buyer lag,
 Discovery AI and final submission acceptance remain pending.
+
+## Independent verification and submission preparation
+
+The following checks require Docker Desktop and Python 3.9+ on the host. They
+create fresh private projects and remove only their own synthetic containers and
+volumes. Keep result JSON and adjacent logs outside the repository:
+
+```sh
+python3 tools/benchmark_catalogue.py --output /tmp/catalogue-load-500.json
+python3 tools/verify_development_startup.py --output /tmp/catalogue-startup.json
+python3 -m unittest discover -s tools/tests -v
+```
+
+The default benchmark runs 500 concurrent browse clients for 30 seconds against
+Catalogue directly, alongside 10 synthetic full snapshots/second. Its separate
+load image uses httpx for requests, aio-pika for publication and asyncpg for
+measurement; it adds no production-service dependency. The clean-start check
+builds committed HEAD from an archive and checks seeds, holds, application
+recreation, database recovery and monitoring. Uncommitted runtime changes are
+excluded from that archive by design.
+
+On 2026-11-17, the standalone run completed 29,598 requests without HTTP errors;
+all 300 updates were observed with 22.455 ms p95 projection-write lag. See the
+[workload, hardware and limits](docs/evidence/catalogue-load-startup.md). This is
+Catalogue-only evidence, not the full 500-buyer or purchase acceptance test.
+
+[contribution](docs/submission/catalogue-contribution-draft.md) drafts are ready
+for student review. The [demo/viva checklist](docs/demo-viva-checklist.md) separates
+implemented paths from final group work. Exact module citations, student-owned
+judgments, ownership confirmation and signatures are still required.

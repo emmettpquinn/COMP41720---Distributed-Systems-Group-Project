@@ -120,3 +120,17 @@ and six added Booking integration tests passed. The unchanged Ticketing suite
 also passed all 14 tests. All five Prometheus targets are
 UP, and Catalogue/Payment dashboards are provisioned. The isolated Catalogue
 failure harness passed; see [ADR evidence](evidence/catalogue-reliability.md).
+
+## Independent checks added 2026-11-17
+
+A fresh clean archive of committed `970258f` passed startup and four-database/
+application restart checks, with repeat-safe seeds and real gateway/hold retries.
+A separate 500-client Catalogue-only run passed without HTTP errors and observed
+all 300 synthetic updates. See [measurement and startup evidence](evidence/catalogue-load-startup.md)
+for workload, hardware, counts and limitations. Reproduce using the root README
+commands; both new harnesses create and clean up private projects.
+
+The preview ports above describe the 2026-11-14 session, not a continuously
+running deployment. The 2026-11-17 independent stacks were cleaned up after their
+checks; no preview was left running. No production service code or Compose
+runtime configuration changed in this verification batch.
