@@ -5,3 +5,10 @@ __pycache__/
 *.db
 
 node_modules/
+
+# Additional Payment development artifacts.
+*.db-journal
+*.db-wal
+*.db-shm
+.env
+.idea/

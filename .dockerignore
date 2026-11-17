@@ -11,3 +11,11 @@
 .DS_Store
 
 **/node_modules
+
+# Additional Payment development artifacts.
+.venv
+**/*.db-journal
+**/*.db-wal
+**/*.db-shm
+**/data
+.idea
