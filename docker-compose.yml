@@ -70,6 +70,54 @@ services:
       # Deliberately not depending on mailhog: Ticketing must start and keep
       # issuing tickets while the mail server is down.
 
+  payment-db:
+    image: postgres:16-alpine
+    environment:
+      POSTGRES_USER: payment
+      POSTGRES_PASSWORD: payment
+      POSTGRES_DB: payment
+    volumes:
+      - payment-db:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U payment -d payment"]
+      interval: 3s
+      timeout: 3s
+      retries: 30
+
+  payment:
+    build:
+      context: .
+      dockerfile: payment/Dockerfile
+    environment:
+      DATABASE_URL: postgresql://payment:payment@payment-db:5432/payment
+      AMQP_URL: amqp://guest:guest@rabbitmq:5672/
+      PAYMENT_MODE: ${PAYMENT_MODE:-ok}
+      PAYMENT_DELAY: ${PAYMENT_DELAY:-0}
+      PAYMENT_ERROR_RATE: ${PAYMENT_ERROR_RATE:-0}
+    ports:
+      - "8004:8000"
+    depends_on:
+      payment-db:
+        condition: service_healthy
+      topology-init:
+        condition: service_completed_successfully
+
+  gateway:
+    build:
+      context: .
+      dockerfile: gateway/Dockerfile
+    environment:
+      CATALOGUE_URL: http://catalogue:8000
+      BOOKING_URL: http://booking:8000
+      TICKETING_URL: http://ticketing:8000
+      UPSTREAM_TIMEOUT_SECONDS: "3"
+      BOOKING_HOLDS_ENABLED: "false"
+    ports:
+      - "127.0.0.1:${GATEWAY_PORT:-8080}:8000"
+    depends_on:
+      catalogue:
+        condition: service_healthy
+
   catalogue-db:
     image: postgres:16-alpine
     environment:
@@ -137,4 +185,5 @@ services:
 
 volumes:
   ticketing-db:
+  payment-db:
   catalogue-db:

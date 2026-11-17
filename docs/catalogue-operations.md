@@ -4,7 +4,9 @@ This branch implements the candidate Catalogue API, transactional outbox,
 availability projection, cache, metrics and synthetic seeds. The proposed
 [contracts](contracts/catalogue.md) still need Booking/Discovery agreement.
 Messaging is disabled by default; HTTP writes still save durable outbox rows.
-Development Booking, Discovery and Payment containers remain health-only shells.
+The development overlay now runs the real Booking hold API; Payment is integrated
+in the base stack. Discovery remains a health-only shell. Booking does not yet
+publish availability or consume event metadata.
 
 ## Startup and synthetic data
 
@@ -107,10 +109,10 @@ database health, messaging enabled/connected state, snapshot/consumer outcomes,
 availability lag, clock skew and cache results. The exporter remains available
 when its database probe fails; backlog is then NaN rather than an invented zero.
 
-The monitoring overlay scrapes Catalogue, Ticketing, RabbitMQ and Prometheus.
+The monitoring overlay scrapes Catalogue, Payment, Ticketing, RabbitMQ and Prometheus.
 Grafana provisions the **Catalogue** dashboard (UID `catalogue`)
 with eight panels. Lag reference lines are 2 and 10 seconds; this batch does not
-implement alert notification rules. Payment and AI panels await real integration.
+implement alert notification rules. Payment panels are integrated; AI panels await Discovery integration.
 
 ## Verification and limits
 
@@ -124,5 +126,7 @@ Isolated live-broker probes also verified delivery to both event-change queues,
 post-confirm database-marker failure with stable-ID redelivery, broker stop/start
 with durable pending writes, seed preservation and live Prometheus/Grafana data.
 Queue probes substitute for unavailable real consumers; these are not accepted
-cross-service contract tests. No 500-buyer lag target, timed 60-second outage,
-full purchase flow, process-kill crash window or full-system startup is claimed.
+cross-service contract tests. The separate [failure harness](../tools/verify_catalogue_failures.py) now verifies
+real process-kill windows, a timed 60-second broker outage and database recovery
+in a generated private stack. See [evidence](evidence/catalogue-reliability.md).
+No 500-buyer lag target, full purchase flow or full-system startup is claimed.

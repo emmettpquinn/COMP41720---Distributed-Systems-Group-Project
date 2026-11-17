@@ -1,139 +1,128 @@
 # Ticket Booking Platform
 
-COMP41720 Distributed Systems group project.
+COMP41720 Distributed Systems group project. This README describes integration
+on `feature/catalogue-integration`; services are also developed on separate
+branches. See the [checkpoint tracker](docs/PROJECT_CONTINUITY.md),
+[Catalogue runbook](docs/catalogue-operations.md) and
+[development integration runbook](docs/integration-development.md).
 
-See [project continuity and checkpoints](docs/PROJECT_CONTINUITY.md) for the
-recovered plan, verified milestones, integration dependencies and next step.
-The [proposed Catalogue contracts](docs/contracts/catalogue.md) provide HTTP/event
-examples for consumer review. The local implementation follows these candidate
-shapes; team agreement is still pending. See the [Catalogue runbook](docs/catalogue-operations.md)
-for writes, messaging, caching, seeds and verification limits.
+## What runs here
 
-## Docker setup on this branch
+The base stack starts Catalogue, Ticketing/Notification and Payment, each with
+its own PostgreSQL database, plus RabbitMQ, MailHog and the gateway/browser UI.
+The development overlay adds Booking's real hold API and its private database,
+plus a clearly labelled Discovery health-only shell. The monitoring overlay adds
+Prometheus and Grafana. The gateway is an extra infrastructure component, not one
+of the five business services.
 
-This README describes local startup on `feature/catalogue-integration`. Services
-are developed across separate branches, so the containers included here describe
-this branch's integration setup rather than the team's overall progress.
+Catalogue provides versioned event/venue APIs, seat-map definitions, an atomic
+outbox, availability projection, bounded detail cache, synthetic seeds and metrics.
+Payment handles its simulated ledger/refunds/outbox; Ticketing handles tickets and
+emails. Booking currently provides holds only: no expiry, checkout/status API,
+saga, event consumer or availability publisher. Discovery's AI/search integration
+is pending on this branch. This stack does not yet perform a complete purchase.
 
-The base Compose file starts two application services: Ticketing and Notification,
-and Event Catalogue. Each has its own PostgreSQL database.
-RabbitMQ, a topology initialization job and MailHog support them. An optional
-development overlay adds health-only shells for Booking, Discovery and Payment.
-
-Catalogue exposes venue/event read and write APIs, versioned event/seat-map storage,
-a transactional outbox, an availability projection, a bounded detail cache and metrics.
-Synthetic Catalogue seeds load automatically. The candidate RabbitMQ adapter stays
-disabled by default until contracts are agreed. Booking, Discovery and Payment entries in the development
-overlay provide startup checks while service configurations are brought together from their development
-branches. The provider simulator, Ollama and gateway/UI can be connected
-as part of the shared integration work. An optional monitoring overlay connects
-Prometheus and Grafana to the exporters currently available in this branch.
-
-The Ticketing service and shared messaging baseline come from commit
-`bb17236`. Catalogue and shared startup additions are developed on
-`feature/catalogue-integration`; teammate branches are not modified.
+Source credits: Ticketing/shared messaging `bb17236`, Payment `63b8b0e`, Booking
+hold source `7996674`. Integration changes are recorded in the runbook; teammate
+branches are untouched. Candidate Catalogue contracts still need consumer
+agreement, so `CATALOGUE_MESSAGING_ENABLED` defaults to false.
 
 ## Start locally
 
-Install Docker Desktop with Docker Compose support, and make sure Docker Desktop
-is running. From the repository root:
+Install Docker Desktop with Compose support and start Docker Desktop. From the
+repository root, for the base stack:
 
 ```sh
 docker compose up -d --build --wait --wait-timeout 180
 ```
 
-The first build downloads images and Python packages. Offline startup requires
-these to be cached. No paid API credentials are needed. Database credentials in
-Compose are local development values; use synthetic data only.
-
-For an isolated development stack, use a project name such as `catalogue-dev`.
-Include the same `-p` option after `docker compose` in every command. For example:
-
-```sh
-docker compose -p catalogue-dev up -d --build --wait --wait-timeout 180
-```
-
-Use one project at a time: two stacks would compete for the same host ports.
-
-## Five-service development startup
-
-To start all five application containers, explicitly include the development
-overlay with the base file:
-
-```sh
-docker compose -f docker-compose.yml -f docker-compose.dev.yml up -d --build --wait --wait-timeout 180
-```
-
-If you already use a named project, include that same `-p` option to extend its
-existing stack. This overlay preserves Catalogue, Ticketing and their databases;
-it adds Booking on port 8002, Discovery on 8003 and Payment on 8004. All containers
-share the default Compose network.
-
-The three added containers use the shared development image recipe under
-`infra/bootstrap/`. They expose only `GET /health`, with an explicit identity:
-
-```json
-{"service": "booking", "mode": "bootstrap", "status": "ok"}
-```
-
-These responses are container startup checks. In this overlay, `/health` is the
-only endpoint; `/ready` and business endpoints return 404. The temporary shells
-have no database or messaging connections. Booking, search and payment behaviour
-comes from each service's own implementation when its container configuration is
-integrated, along with its database and messaging requirements.
-
-Use the same file options when inspecting or stopping the development stack:
-
-```sh
-docker compose -f docker-compose.yml -f docker-compose.dev.yml ps -a
-curl -fsS http://localhost:8002/health
-curl -fsS http://localhost:8003/health
-curl -fsS http://localhost:8004/health
-docker compose -f docker-compose.yml -f docker-compose.dev.yml logs --tail 50 booking discovery payment
-docker compose -f docker-compose.yml -f docker-compose.dev.yml stop
-```
-
-The shells also carry the Docker label `com.citytickets.mode=bootstrap` and identify
-themselves in startup logs. To use a service implementation from its development
-branch, update the corresponding overlay entry with that service's Dockerfile,
-configuration, readiness check and database requirements. Keep the shared bootstrap
-application focused on startup checks. The overlay does not modify service
-application files.
-
-## Monitoring startup
-
-The monitoring overlay reuses the pinned images and Grafana datasource from
-commit `63b8b0e`, with an adjusted scrape configuration for this branch. Start it
-with the base stack:
-
-```sh
-docker compose -f docker-compose.yml -f docker-compose.monitoring.yml up -d --build --wait --wait-timeout 180
-```
-
-To include the five application containers as well:
+For all five business containers, browser UI and monitoring:
 
 ```sh
 docker compose -f docker-compose.yml -f docker-compose.dev.yml -f docker-compose.monitoring.yml up -d --build --wait --wait-timeout 180
 ```
 
-Keep the same project name and file options for subsequent Compose commands.
-Prometheus is available at http://localhost:9090 and Grafana at
-http://localhost:3000. These two ports bind to the local machine only. Override
-`PROMETHEUS_PORT` or `GRAFANA_PORT` if they are occupied. The local Grafana login
-is `admin` / `stagedoor-demo`; set `GRAFANA_PASSWORD` before the first startup to
-use a different password. Existing Grafana volumes retain their original login.
+Use the same `-p` project name and `-f` file options in every subsequent command.
+For example, add `-p ticket-demo` for an isolated named project; alternate projects
+also need alternate host ports. Never stop unrelated containers to free ports.
+Builds download images/packages; offline startup requires cached dependencies.
+Local development credentials are synthetic; no paid API keys are needed.
 
-Grafana's default `Prometheus` datasource is provisioned automatically. Prometheus
-scrapes itself, Catalogue, Ticketing and RabbitMQ every five seconds. The
-provisioned Catalogue operations dashboard has eight panels for HTTP, availability
-lag, delivery outcomes, outbox backlog and messaging state. Use Grafana Explore or
-the Prometheus query page to inspect `up`. The three bootstrap shells have no
-metrics. The Payment target/dashboard remain with the Payment implementation
-until it is integrated. Full group monitoring and AI token-cost panels remain
-later checkpoints.
+Base URLs:
 
-Prometheus and Grafana each have a named data volume. Restarting their containers
-preserves stored settings and time-series data. Check their health with:
+- Browser UI: http://localhost:8080
+- Catalogue API: http://localhost:8001/docs and `/metrics`
+- Payment API: http://localhost:8004/docs and `/metrics`
+- Ticketing API: http://localhost:8005/docs and `/metrics`
+- RabbitMQ management: http://localhost:15672 (`guest` / `guest`)
+- RabbitMQ metrics: http://localhost:15692/metrics
+- MailHog inbox: http://localhost:8025
+
+The development overlay adds Booking at http://localhost:8002/docs and Discovery's
+bootstrap `/health` at http://localhost:8003/health. Discovery has no business API.
+The browser port binds to loopback; set `GATEWAY_PORT` to change it.
+
+The `topology-init`, `catalogue-migrate` and `catalogue-seed` jobs should exit 0.
+Catalogue loads one fictional venue/two events/four seats through its own write
+and outbox path. Reruns preserve existing IDs and edits. Development Booking
+separately loads matching synthetic inventory using its own code and database;
+`BOOKING_DEMO_SEED=false` disables this explicit fixture. Restart never resets
+existing holds. This fixture does not replace agreed asynchronous event ingestion.
+
+## Browse and reserve a demo seat
+
+Open the browser UI, select an event and choose a seat. The gateway calls
+Catalogue for browsing and Booking for the authoritative hold decision. Unknown
+availability is labelled unknown. A successful hold displays the actual reference;
+a refusal refetches the projection and marks that choice locally. A timeout can
+have an unknown outcome: retrying uses the same tab's synthetic customer ID.
+Checkout/search are unavailable until their service APIs are integrated. Current
+Booking holds do not expire; use synthetic data for this development flow.
+
+The gateway uses FastAPI/httpx for fixed same-origin routes, request-size limits
+and bounded timeouts. It exposes no direct payment-creation route. See the
+[integration runbook](docs/integration-development.md) for contracts and limits.
+
+## Health and messaging
+
+```sh
+docker compose ps -a
+curl -fsS http://localhost:8001/health
+curl -fsS http://localhost:8001/ready
+curl -fsS http://localhost:8004/ready
+curl -fsS http://localhost:8005/ready
+curl -fsS http://localhost:8080/health
+```
+
+Catalogue liveness is independent of PostgreSQL; readiness checks only its DB.
+Payment readiness checks its DB and enabled broker. Booking's development `/ready`
+checks its database and reports the hold-only capability. Gateway `/health` checks
+its own process; upstream failures are reported on the requested route.
+
+Catalogue saves outbox rows while messaging is off. Enable the candidate adapter
+only in an isolated stack or after contracts are accepted:
+
+```sh
+CATALOGUE_MESSAGING_ENABLED=true docker compose up -d catalogue
+```
+
+Include the original project/overlay options. This can publish accumulated rows.
+The worker uses confirmed mandatory publication and the shared retry/DLQ handler.
+See [candidate contracts](docs/contracts/catalogue.md) and the runbook. Payment's
+messaging is enabled by Compose; its Booking contracts still need agreement.
+
+## Monitoring
+
+The monitoring overlay starts Prometheus at http://localhost:9090 and Grafana at
+http://localhost:3000. Both ports bind to loopback. Set `PROMETHEUS_PORT`,
+`GRAFANA_PORT` and, before first startup, `GRAFANA_PASSWORD` as needed. Default local
+Grafana login is `admin` / `stagedoor-demo`; existing volumes retain their login.
+
+Five exporters are configured: Catalogue, Payment, Ticketing, RabbitMQ and
+Prometheus. The datasource and separate Catalogue/Payment dashboards are
+provisioned automatically. Booking's imported hold API and the Discovery shell
+have no metrics target. Catalogue lag panels have 2/10-second reference thresholds;
+notification alert rules and group AI-cost panels remain open.
 
 ```sh
 curl -fsS http://localhost:9090/-/ready
@@ -141,103 +130,28 @@ curl -fsS http://localhost:3000/api/health
 curl -fsS 'http://localhost:9090/api/v1/targets?state=active'
 ```
 
-The ports above assume no overrides. These checks confirm the monitoring wiring;
-they do not establish the full application resilience or performance targets.
+## Persistence, logs and shutdown
 
-## Check the services
-
-```sh
-docker compose ps -a
-curl -fsS http://localhost:8001/health
-curl -fsS http://localhost:8001/ready
-curl -fsS http://localhost:8005/ready
-```
-
-- Catalogue: http://localhost:8001/docs
-- Catalogue metrics: http://localhost:8001/metrics
-- Ticketing API: http://localhost:8005/docs
-- MailHog inbox: http://localhost:8025
-- RabbitMQ management: http://localhost:15672 (local login: `guest` / `guest`)
-- RabbitMQ metrics: http://localhost:15692/metrics
-
-`topology-init`, `catalogue-migrate` and `catalogue-seed` should exit with code 0; they are one-time
-jobs, not long-running services. Catalogue `/health` checks the application process.
-`/ready` executes `SELECT 1` against Catalogue's database within a bounded timeout; it returns 503
-when the database is unavailable. It does not claim messaging or business readiness.
-Catalogue messaging defaults to off. Writes still save outbox rows. Enable
-`CATALOGUE_MESSAGING_ENABLED=true` only against an isolated broker or after candidate
-contracts are agreed; this starts the confirmed publisher and availability consumer.
-See the [runbook](docs/catalogue-operations.md) before enabling it.
-
-Catalogue settings are `DATABASE_URL` and `DATABASE_TIMEOUT_SECONDS` (default 2).
-The app uses a small asyncpg connection pool. Its database is reachable only inside
-the Docker network and has a dedicated `catalogue-db` named volume; Ticketing keeps
-its existing database and volume. Named database volumes survive container restarts
-and ordinary Compose shutdown. RabbitMQ message persistence across container
-recreation is not established by this configuration.
-
-## Catalogue database and migrations
-
-Catalogue has its own `catalogue-db` PostgreSQL container and named volume. It
-stores `venues`, `events`, `event_seats`, `outbox`, `availability` and
-`processed_messages`, plus a `schema_migrations` ledger.
-Seat-map rows define seat IDs, sections and labels; Booking still owns holds,
-free/held/booked inventory and bookings in its own database.
-
-`catalogue-migrate` runs the SQL files from `catalogue/migrations/` after PostgreSQL
-is healthy and before the Catalogue application starts. Applied filenames are
-recorded, so repeated startup preserves existing rows. The runner serializes
-concurrent migrations with a database advisory lock and commits all pending SQL
-and ledger entries together; failure rolls that transaction back. Applied SQL
-files are immutable: add the next numbered migration rather than editing history.
-
-To apply migrations separately to an already configured Catalogue database:
+Each implemented business service has its own private database/volume. Catalogue
+runs immutable numbered migrations before seeds/API; migrations 001/002/003 store
+metadata, outbox and inbox/projection state. Do not edit applied migration history.
+Booking's startup schema and Payment's schema upgrade remain service-owned.
 
 ```sh
-docker compose run --rm catalogue-migrate
-docker compose exec -T catalogue-db psql -U catalogue -d catalogue -c '\dt'
-```
-
-Use the same project/file options as startup. No host database port is published.
-The schema enforces venue/event references, unique seat IDs per event, nonblank
-required text, positive event versions and allowed event states. `TIMESTAMPTZ`
-stores event instants; the API validates offsets, IANA timezones and nonempty
-unique seat maps. Migration `002_outbox.sql` adds immutable event messages;
-`003_availability.sql` adds the idempotent, ordered projection. See the runbook
-for optimistic updates, cancellation and synthetic seed behaviour.
-
-## Logs and shutdown
-
-```sh
-docker compose logs --tail 100 catalogue catalogue-db
+docker compose logs --tail 100 catalogue payment gateway
 docker compose stop
 ```
 
-`stop` retains containers and volumes. `docker compose down` removes this project's
-containers/network and retains named database volumes. Do not add `-v` unless you
-intend to delete that project's stored data.
+With development/monitoring overlays, include those same files. `stop` and normal
+`down` preserve named database/monitoring volumes. Adding `-v` deletes that project's
+volumes. The upstream Payment broker-volume change is deferred; RabbitMQ data
+persistence across container recreation is not established here.
 
-## Catalogue tests
+## Tests and evidence
 
-Use Python 3.12, matching the Docker image. Run these separately from Ticketing's
-tests so the two service-local `app` packages stay isolated:
-
-```sh
-cd catalogue
-python3.12 -m venv .venv
-. .venv/bin/activate
-python -m pip install -r requirements-dev.txt
-python -m pytest -q
-```
-
-The health tests use a fake pool to check liveness independence, readiness,
-acquisition/query timeouts and safe error responses. Database tests use a real
-PostgreSQL URL from `CATALOGUE_TEST_DB`; without it those tests are explicitly
-skipped. Each database test creates and removes a uniquely named schema, leaving
-existing Catalogue rows alone. The database role needs permission to create schemas.
-
-To run the full suite in Python 3.12 against the private Catalogue database, first
-start/migrate the stack, then run from the repository root:
+Run service-local tests separately because each service has its own `app` package.
+The Catalogue database suite uses uniquely named temporary schemas and needs a
+role allowed to create schemas. From the root, after building/starting:
 
 ```sh
 docker compose run --rm --no-deps \
@@ -248,10 +162,14 @@ docker compose run --rm --no-deps \
   catalogue-migrate sh -c 'python -m pip install -r requirements-dev.txt && python -m pytest -q -p no:cacheprovider'
 ```
 
-Again, include the startup project's `-p`/`-f` options when applicable. The suite
-checks migrations, persistence, HTTP validation, atomic event/outbox writes,
-optimistic updates, cancellation, duplicate/reordered snapshots, dispatcher
-retry/concurrency, bounded cache behaviour and seed repeatability. Live isolated
-broker checks cover retry/DLQ, stable-ID redelivery and outage recovery. These
-checks do not establish accepted peer contracts, a full purchase flow or the
-500-buyer performance target.
+Catalogue: 54 tests at last verification. Payment: 25 including the optional live
+broker test enabled for the integration check. Gateway: 7 boundary tests. Booking:
+6 added integration tests including a 20-buyer race and non-resetting seeds.
+Commands are in the integration runbook. Dependencies can emit a non-failing
+Starlette/httpx deprecation warning.
+
+The [failure harness](tools/verify_catalogue_failures.py) creates a fresh private
+Catalogue stack, injects process/broker/database failures and removes only its own
+synthetic project/volumes. Generated JSON/logs must stay outside Git. Queue probes
+are not actual Booking/Discovery consumers. Full-system purchase, 500-buyer lag,
+Discovery AI and final submission acceptance remain pending.

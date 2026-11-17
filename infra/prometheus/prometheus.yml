@@ -1,9 +1,12 @@
 # Based on commit 63b8b0e. Scrape only exporters connected on this branch.
-# Add Payment after its real container replaces the development shell.
+# Payment and Catalogue export real service metrics.
 global:
   scrape_interval: 5s
 
 scrape_configs:
+  - job_name: payment
+    static_configs:
+      - targets: ["payment:8000"]
   - job_name: catalogue
     static_configs:
       - targets: ["catalogue:8000"]
