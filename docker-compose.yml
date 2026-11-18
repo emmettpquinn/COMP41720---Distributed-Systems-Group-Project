@@ -102,6 +102,38 @@ services:
       topology-init:
         condition: service_completed_successfully
 
+  booking-db:
+    image: postgres:16-alpine
+    environment:
+      POSTGRES_USER: booking
+      POSTGRES_PASSWORD: booking
+      POSTGRES_DB: booking
+    volumes:
+      - booking-db:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U booking -d booking"]
+      interval: 3s
+      timeout: 3s
+      retries: 30
+
+  # Holds, and Catalogue's event.changed (seats, cancellations) from booking.event-changes.
+  # The demo seed must stay off while the consumer runs (docs/contracts/booking.md section 7).
+  booking:
+    build:
+      context: .
+      dockerfile: booking/Dockerfile
+    environment:
+      DATABASE_URL: postgresql://booking:booking@booking-db:5432/booking
+      AMQP_URL: amqp://guest:guest@rabbitmq:5672/
+      BOOKING_DEMO_SEED: ${BOOKING_DEMO_SEED:-false}
+    ports:
+      - "8002:8000"
+    depends_on:
+      booking-db:
+        condition: service_healthy
+      topology-init:
+        condition: service_completed_successfully
+
   discovery-db:
     image: pgvector/pgvector:pg16
     environment:
@@ -227,7 +259,7 @@ services:
       DATABASE_URL: postgresql://catalogue:catalogue@catalogue-db:5432/catalogue
       DATABASE_TIMEOUT_SECONDS: "2"
       AMQP_URL: amqp://guest:guest@rabbitmq:5672/
-      CATALOGUE_MESSAGING_ENABLED: ${CATALOGUE_MESSAGING_ENABLED:-false}
+      CATALOGUE_MESSAGING_ENABLED: ${CATALOGUE_MESSAGING_ENABLED:-true}
     ports:
       - "8001:8000"
     depends_on:
@@ -243,5 +275,6 @@ services:
 volumes:
   ticketing-db:
   payment-db:
+  booking-db:
   catalogue-db:
   discovery-db:
