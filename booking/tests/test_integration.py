@@ -111,10 +111,10 @@ class BookingIntegrationTests(unittest.TestCase):
         self.seed_seat()
         with ThreadPoolExecutor(max_workers=20) as executor:
             results=list(executor.map(lambda customer:db.hold_seat('race-event','A1',str(customer)),range(20)))
-        self.assertEqual(sum(outcome=='held' for outcome,ref in results),1)
-        self.assertEqual(sum(outcome=='taken' for outcome,ref in results),19)
-        winner=next(index for index,(outcome,ref) in enumerate(results) if outcome=='held')
-        self.assertEqual(db.hold_seat('race-event','A1',str(winner)),('already_yours',results[winner][1]))
+        self.assertEqual(sum(outcome=='held' for outcome,ref,_ in results),1)
+        self.assertEqual(sum(outcome=='taken' for outcome,ref,_ in results),19)
+        winner=next(index for index,(outcome,ref,_) in enumerate(results) if outcome=='held')
+        self.assertEqual(db.hold_seat('race-event','A1',str(winner)),('already_yours',results[winner][1],'held'))
 
     def test_http_hold_repeat_and_conflict(self):
         self.seed_seat();client=self.client()
@@ -135,8 +135,8 @@ class BookingIntegrationTests(unittest.TestCase):
         demo_seed.seed()
         first=db.hold_seat('event-demo-001','A1','buyer')
         demo_seed.seed()
-        self.assertEqual(db.hold_seat('event-demo-001','A1','buyer'),('already_yours',first[1]))
-        self.assertEqual(db.hold_seat('event-demo-001','A1','other'),('taken',None))
+        self.assertEqual(db.hold_seat('event-demo-001','A1','buyer'),('already_yours',first[1],'held'))
+        self.assertEqual(db.hold_seat('event-demo-001','A1','other'),('taken',None,None))
 
     def test_database_failure_preserves_health_and_returns_safe_503(self):
         client=self.client()
@@ -196,14 +196,14 @@ class BookingIntegrationTests(unittest.TestCase):
         # Seats as the demo seed leaves them: no label, no event record.
         self.query("INSERT INTO seats (event_id,seat_id,section) VALUES ('event-demo-001','A1','A')")
         self.query("INSERT INTO seats (event_id,seat_id,section,label) VALUES ('event-demo-001','A2','A','Kept label')")
-        outcome,ref=db.hold_seat('event-demo-001','A1','buyer-1')
+        outcome,ref,_=db.hold_seat('event-demo-001','A1','buyer-1')
         self.assertEqual(outcome,'held')
         before=self.seat_rows()[0]
         self.assertEqual(self.apply('created'),'applied')
         a1,a2=self.seat_rows()
         self.assertEqual(a1,('A1','A','A1','held',ref,'buyer-1',before[6]))
         self.assertEqual(a2[2],'Kept label')
-        self.assertEqual(db.hold_seat('event-demo-001','A1','buyer-1'),('already_yours',ref))
+        self.assertEqual(db.hold_seat('event-demo-001','A1','buyer-1'),('already_yours',ref,'held'))
 
     def test_http_hold_on_cancelled_event_and_on_seat_without_event(self):
         self.apply('created');self.apply('cancelled')
@@ -347,7 +347,7 @@ class BookingIntegrationTests(unittest.TestCase):
         self.assertEqual(k,1)
         with ThreadPoolExecutor(max_workers=20) as executor:
             results=list(executor.map(lambda n:db.hold_seat('event-test-many',f'T{n:02d}',f'buyer-test-{n}'),range(1,21)))
-        self.assertEqual([outcome for outcome,ref in results],['held']*20)
+        self.assertEqual([outcome for outcome,ref,_ in results],['held']*20)
         found=self.snapshots('event-test-many')
         self.assertEqual([e['payload']['sequence'] for e in found],list(range(1,21+k)))
         self.assertEqual(self.sequence('event-test-many'),20+k)
@@ -406,6 +406,10 @@ class BookingIntegrationTests(unittest.TestCase):
         self.query("INSERT INTO seats (event_id,seat_id,section,label) VALUES ('event-test-old','A1','A','A1'),('event-test-old','A2','A','A2')")
         self.query("UPDATE seats SET status='held',booking_ref='ref-test',customer_id='buyer-test' WHERE seat_id='A1'")
         db.init_schema()
+        # Give the held seat its booking, so the startup upgrade rule (4b) keeps it.
+        self.query("INSERT INTO bookings (booking_id,event_id,seat_id,customer_id,customer_email,customer_name,"
+                   "price_minor,currency,status,held_until) VALUES ('ref-test','event-test-old','A1','buyer-test',"
+                   "'buyer-test@example.test','buyer-test',4500,'EUR','held',now()+interval '10 minutes')")
         self.assertEqual(self.sequence('event-test-old'),0)
         self.assertEqual(db.backfill_availability(),1)
         self.assertEqual(db.backfill_availability(),0)
@@ -450,9 +454,208 @@ class BookingIntegrationTests(unittest.TestCase):
         self.apply('created')
         with ThreadPoolExecutor(max_workers=20) as executor:
             results=list(executor.map(lambda n:db.hold_seat('event-demo-001','A1',f'buyer-test-{n}'),range(20)))
-        self.assertEqual(sum(outcome=='held' for outcome,ref in results),1)
-        self.assertEqual(sum(outcome=='taken' for outcome,ref in results),19)
+        self.assertEqual(sum(outcome=='held' for outcome,ref,_ in results),1)
+        self.assertEqual(sum(outcome=='taken' for outcome,ref,_ in results),19)
         self.assertEqual([e['payload']['sequence'] for e in self.snapshots()],[1,2])
+
+    # --- Bookings: full hold, lookup, limits, upgrade rule (contract 1, 4, 4a, 4b, 5, 6, 8, 14) ---
+
+    def bookings(self):
+        return self.query('SELECT booking_id,event_id,seat_id,customer_id,customer_email,customer_name,'
+                          'price_minor,currency,status,checkout_started_at,payment_id FROM bookings ORDER BY created_at')
+
+    def booking_count(self):
+        return self.query('SELECT count(*) FROM bookings')[0][0]
+
+    def test_hold_creates_one_booking_with_fixed_price_and_database_clock(self):
+        self.apply('created')
+        body={'event_id':'event-demo-001','seat_id':'A1','customer_id':'buyer-test',
+              'customer_email':' buyer-test@example.org ','customer_name':'Test Buyer'}
+        result=self.client().post('/holds',json=body)
+        self.assertEqual(result.status_code,201)
+        booking_id=result.json()['booking_id']
+        self.assertEqual(self.bookings(),[(booking_id,'event-demo-001','A1','buyer-test','buyer-test@example.org',
+                                           'Test Buyer',4500,'EUR','held',None,None)])
+        # held_until = the database's now() + 10 min, and the seat carries the same value.
+        exact,ahead,seat_until,booking_until=self.query(
+            "SELECT b.held_until-b.created_at, b.held_until-now(), s.held_until, b.held_until FROM bookings b "
+            "JOIN seats s ON s.booking_ref=b.booking_id")[0]
+        self.assertEqual(exact,timedelta(minutes=10))
+        self.assertTrue(timedelta(minutes=9)<ahead<=timedelta(minutes=10))
+        self.assertEqual(seat_until,booking_until)
+        self.assertEqual(self.seat_rows()[0][4:6],(booking_id,'buyer-test'))
+
+    def test_hold_without_email_and_name_stores_fallback_and_seat_without_record_gets_booking(self):
+        self.seed_seat()  # race-event: no event record, so no snapshot, but a booking
+        result=self.client().post('/holds',json={'event_id':'race-event','seat_id':'A1','customer_id':'buyer-test'})
+        self.assertEqual(result.status_code,201)
+        self.assertEqual(self.bookings()[0][3:9],('buyer-test','buyer-test@example.test','buyer-test',4500,'EUR','held'))
+        self.assertEqual(self.outbox_count(),0)
+        # An explicit null counts as absent.
+        self.query("INSERT INTO seats (event_id,seat_id,section) VALUES ('race-event','A2','A')")
+        result=self.client().post('/holds',json={'event_id':'race-event','seat_id':'A2','customer_id':'buyer-test-2',
+                                                 'customer_email':None,'customer_name':None})
+        self.assertEqual(result.status_code,201)
+        self.assertEqual(self.bookings()[1][4:6],('buyer-test-2@example.test','buyer-test-2'))
+
+    def test_price_and_hold_length_come_from_config(self):
+        self.seed_seat()
+        with patch('config.BOOKING_PRICE_MINOR',1234),patch('config.BOOKING_CURRENCY','GBP'),patch('config.HOLD_MINUTES',3):
+            booking_id=db.hold_seat('race-event','A1','buyer-test')[1]
+        self.assertEqual(self.bookings()[0][6:8],(1234,'GBP'))
+        self.assertEqual(self.query('SELECT held_until-created_at FROM bookings WHERE booking_id=%s',(booking_id,))[0][0],
+                         timedelta(minutes=3))
+
+    def test_hold_response_keeps_old_fields_and_adds_booking_fields(self):
+        self.apply('created');client=self.client()
+        body={'event_id':'event-demo-001','seat_id':'A1','customer_id':'buyer-test'}
+        first=client.post('/holds',json=body)
+        self.assertEqual(first.status_code,201)
+        ref=first.json()['booking_ref']
+        self.assertEqual(first.json(),{'booking_ref':ref,'event_id':'event-demo-001','seat_id':'A1','status':'held',
+                                       'booking_id':ref,'booking_status':'held'})
+        retry=client.post('/holds',json=body)
+        self.assertEqual(retry.status_code,200)
+        self.assertEqual(retry.json(),first.json())
+        # Error replies are unchanged (no booking fields).
+        other=client.post('/holds',json=body|{'customer_id':'buyer-test-2'})
+        self.assertEqual((other.status_code,set(other.json())),(409,{'error','message'}))
+
+    def test_retry_returns_existing_booking_and_losers_create_none(self):
+        self.apply('created')
+        outcome,booking_id,status=db.hold_seat('event-demo-001','A1','buyer-test')
+        self.assertEqual((outcome,status),('held','held'))
+        self.assertEqual(db.hold_seat('event-demo-001','A1','buyer-test',customer_email='new@example.test'),
+                         ('already_yours',booking_id,'held'))
+        self.assertEqual(db.hold_seat('event-demo-001','A1','buyer-test-2'),('taken',None,None))
+        self.assertEqual(db.hold_seat('event-demo-001','Z9','buyer-test'),('not_found',None,None))
+        self.assertEqual(self.booking_count(),1)
+        self.assertEqual(self.bookings()[0][4],'buyer-test@example.test')  # a retry changes nothing
+        # The retry reports the booking's real state (here forced, as checkout will later do).
+        self.query("UPDATE bookings SET status='payment_pending' WHERE booking_id=%s",(booking_id,))
+        self.assertEqual(db.hold_seat('event-demo-001','A1','buyer-test'),('already_yours',booking_id,'payment_pending'))
+        self.apply('cancelled')
+        self.assertEqual(db.hold_seat('event-demo-001','A2','buyer-test'),('event_cancelled',None,None))
+        self.assertEqual(self.booking_count(),1)
+
+    def test_failed_booking_insert_rolls_back_the_whole_hold(self):
+        self.apply('created');self.seed_seat()
+        self.query("""CREATE FUNCTION fail_booking_insert() RETURNS trigger LANGUAGE plpgsql AS
+                      $$ BEGIN RAISE EXCEPTION 'simulated booking failure'; END $$""")
+        self.query('CREATE TRIGGER fail_bookings BEFORE INSERT ON bookings FOR EACH ROW EXECUTE FUNCTION fail_booking_insert()')
+        for event_id in ('event-demo-001','race-event'):   # with and without an event record
+            with self.assertRaises(psycopg2.Error):
+                db.hold_seat(event_id,'A1','buyer-test')
+            self.assertEqual(self.seat_rows(event_id)[0][3:7],('free',None,None,None))
+        result=self.client().post('/holds',json={'event_id':'event-demo-001','seat_id':'A1','customer_id':'buyer-test'})
+        self.assertEqual(result.status_code,503)
+        self.assertEqual((self.sequence(),self.outbox_count(),self.booking_count()),(1,1,0))
+        self.query('DROP TRIGGER fail_bookings ON bookings')
+        self.assertEqual(db.hold_seat('event-demo-001','A1','buyer-test')[0],'held')
+        self.assertEqual((self.sequence(),self.booking_count()),(2,1))
+
+    def test_twenty_buyers_one_seat_one_booking(self):
+        self.apply('created')
+        with ThreadPoolExecutor(max_workers=20) as executor:
+            results=list(executor.map(lambda n:db.hold_seat('event-demo-001','A1',f'buyer-test-{n}'),range(20)))
+        winners=[r for r in results if r[0]=='held']
+        self.assertEqual(len(winners),1)
+        rows=self.bookings()
+        self.assertEqual(len(rows),1)
+        self.assertEqual(rows[0][0],winners[0][1])
+        self.assertEqual(self.seat_rows()[0][4],winners[0][1])
+
+    def test_lookup_owner_only_with_identical_404s(self):
+        self.apply('created');client=self.client()
+        booking_id=client.post('/holds',json={'event_id':'event-demo-001','seat_id':'A1','customer_id':'buyer-test'}).json()['booking_id']
+        mine=client.get(f'/bookings/{booking_id}',params={'customer_id':'buyer-test'})
+        self.assertEqual(mine.status_code,200)
+        body=mine.json()
+        stored=self.query('SELECT held_until FROM bookings')[0][0]
+        self.assertEqual(body,{'booking_id':booking_id,'event_id':'event-demo-001','seat_id':'A1',
+                               'booking_status':'held','held_until':body['held_until'],'payment_id':None})
+        self.assertIsNotNone(datetime.fromisoformat(body['held_until']).utcoffset())
+        self.assertEqual(datetime.fromisoformat(body['held_until']),stored)
+        wrong=client.get(f'/bookings/{booking_id}',params={'customer_id':'buyer-test-2'})
+        unknown=client.get(f'/bookings/{uuid.uuid4()}',params={'customer_id':'buyer-test'})
+        for reply in (wrong,unknown):
+            self.assertEqual(reply.status_code,404)
+            self.assertEqual(reply.json(),{'error':'booking_not_found','message':'No such booking.'})
+        self.assertEqual(wrong.content,unknown.content)
+        self.assertEqual(client.get(f'/bookings/{booking_id}').status_code,422)                            # no customer_id
+        self.assertEqual(client.get(f'/bookings/{booking_id}',params={'customer_id':'  '}).status_code,422)
+        self.assertEqual(client.get(f'/bookings/{booking_id}',params={'customer_id':'c'*65}).status_code,422)
+        self.assertEqual(client.get('/bookings/'+'b'*65,params={'customer_id':'buyer-test'}).status_code,422)
+        self.assertEqual(client.get('/bookings/'+'b'*64,params={'customer_id':'buyer-test'}).status_code,404)
+        self.assertEqual(client.get('/ready').json()['capabilities'],['holds'])
+
+    def test_lookup_database_failure_is_safe_503(self):
+        client=self.client()
+        with patch('db.connect_once',side_effect=psycopg2.OperationalError('private details')):
+            result=client.get('/bookings/some-test-id',params={'customer_id':'buyer-test'})
+        self.assertEqual(result.status_code,503)
+        self.assertNotIn('private',result.text)
+
+    def test_input_limits(self):
+        client=self.client()
+        ok={'event_id':'e'*64,'seat_id':'s'*64,'customer_id':'c'*64,'customer_email':'m'*255,'customer_name':'n'*255}
+        self.query('INSERT INTO seats (event_id,seat_id,section) VALUES (%s,%s,%s)',('e'*64,'s'*64,'A'))
+        for field,too_long in (('event_id',65),('seat_id',65),('customer_id',65),('customer_email',256),('customer_name',256)):
+            result=client.post('/holds',json=ok|{field:'x'*too_long})
+            self.assertEqual(result.status_code,422,field)
+            self.assertIn('detail',result.json())
+        for field in ('customer_email','customer_name'):
+            self.assertEqual(client.post('/holds',json=ok|{field:'   '}).status_code,422,field)
+        self.assertEqual(self.booking_count(),0)
+        result=client.post('/holds',json=ok|{'customer_id':'  '+'c'*64+'  '})   # trimmed first
+        self.assertEqual(result.status_code,201)
+        self.assertEqual(self.bookings()[0][1:6],('e'*64,'s'*64,'c'*64,'m'*255,'n'*255))
+
+    def mark_held_without_booking(self,event_id,seat_id):
+        """A hold as the old hold-only code left it: seat held, no booking row."""
+        self.query("UPDATE seats SET status='held',booking_ref=%s,customer_id='buyer-test-old' WHERE event_id=%s AND seat_id=%s",
+                   (f'ref-test-old-{event_id}-{seat_id}',event_id,seat_id))
+
+    def test_upgrade_frees_held_seats_without_booking(self):
+        self.apply('created')                                                      # event-demo-001: A1, A2; sequence 1
+        db.apply_event_changed(str(uuid.uuid4()),self.big_event(seats=3))          # event-test-many: T01..T03; sequence 1
+        kept=db.hold_seat('event-test-many','T01','buyer-test')[1]                 # a real booking; sequence 2
+        self.mark_held_without_booking('event-demo-001','A1')
+        self.mark_held_without_booking('event-demo-001','A2')
+        self.mark_held_without_booking('event-test-many','T02')
+        self.seed_seat();self.mark_held_without_booking('race-event','A1')         # no event record
+        outbox_before=self.outbox_count()
+        self.assertEqual(db.free_holds_without_booking(),(4,2))
+        self.assertEqual([r[3:6] for r in self.seat_rows()],[('free',None,None)]*2)
+        self.assertEqual([r[3:7] for r in self.seat_rows('race-event')],[('free',None,None,None)])
+        self.assertEqual([r[0] for r in self.seat_rows('event-test-many') if r[3]=='held'],['T01'])
+        self.assertEqual(self.seat_rows('event-test-many')[0][4],kept)
+        # One snapshot per affected event with a record; none for race-event.
+        self.assertEqual(self.outbox_count(),outbox_before+2)
+        self.assertEqual(self.snapshots()[-1]['payload'],
+                         {'event_id':'event-demo-001','sequence':2,'seats_remaining':2,'available_seat_ids':['A1','A2']})
+        self.assertEqual(self.snapshots('event-test-many')[-1]['payload'],
+                         {'event_id':'event-test-many','sequence':3,'seats_remaining':2,'available_seat_ids':['T02','T03']})
+        self.assertEqual(self.snapshots('race-event'),[])
+        for envelope in self.snapshots()+self.snapshots('event-test-many'):
+            self.assert_valid_envelope(envelope)
+        # A second run (and a restart) changes nothing.
+        self.assertEqual(db.free_holds_without_booking(),(0,0))
+        self.client()
+        self.assertEqual(self.outbox_count(),outbox_before+2)
+        self.assertEqual(self.booking_count(),1)
+
+    def test_startup_upgrade_runs_before_backfill(self):
+        # An old event (sequence 0, never snapshotted) with a hold-only held seat.
+        self.query("INSERT INTO events (event_id,event_version,status,title,starts_at,timezone) "
+                   "VALUES ('event-test-start',1,'scheduled','Start','2026-11-27T19:30:00+00:00','Europe/Dublin')")
+        self.query("INSERT INTO seats (event_id,seat_id,section,label) VALUES ('event-test-start','A1','A','A1'),('event-test-start','A2','A','A2')")
+        self.mark_held_without_booking('event-test-start','A1')
+        self.client()
+        found=self.snapshots('event-test-start')
+        # Exactly one snapshot (from the upgrade; the backfill then skips it), showing A1 free again.
+        self.assertEqual([e['payload'] for e in found],
+                         [{'event_id':'event-test-start','sequence':1,'seats_remaining':2,'available_seat_ids':['A1','A2']}])
 
 
 def events_envelope(name):

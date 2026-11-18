@@ -7,7 +7,7 @@ CREATE TABLE IF NOT EXISTS seats (
                 CHECK (status IN ('free', 'held', 'booked')),
     booking_ref TEXT,                   -- empty while the seat is free
     customer_id TEXT,                   -- empty while the seat is free
-    held_until  TIMESTAMPTZ,            -- unused for now (seat expiry comes later)
+    held_until  TIMESTAMPTZ,            -- same value as the booking's held_until (set by a hold)
     PRIMARY KEY (event_id, seat_id),    -- a seat appears once per event
     CHECK (status <> 'free' OR (booking_ref IS NULL AND customer_id IS NULL AND held_until IS NULL))
 );
@@ -51,3 +51,28 @@ CREATE TABLE IF NOT EXISTS outbox (
 );
 -- The relay only ever looks for unpublished rows, oldest first.
 CREATE INDEX IF NOT EXISTS outbox_unpublished ON outbox (created_at) WHERE published_at IS NULL;
+
+-- One row per booking (contract sections 4 and 5). Created by a successful hold,
+-- in the same transaction as the seat update (section 4a, row 1). booking_id is
+-- the same value as the seat's booking_ref. Safe on an existing database: a new
+-- table; held seats that have no row here are freed on startup (section 4b,
+-- db.free_holds_without_booking). No foreign key to seats or events: seats are
+-- never deleted, and the tests rebuild those tables.
+CREATE TABLE IF NOT EXISTS bookings (
+    booking_id          TEXT PRIMARY KEY,   -- a UUID, as text
+    event_id            TEXT NOT NULL,
+    seat_id             TEXT NOT NULL,
+    customer_id         TEXT NOT NULL,
+    customer_email      TEXT NOT NULL,
+    customer_name       TEXT NOT NULL,
+    price_minor         INTEGER NOT NULL,   -- copied from config at hold time, never recalculated (section 8)
+    currency            TEXT NOT NULL,
+    status              TEXT NOT NULL
+                        CHECK (status IN ('held', 'payment_pending', 'confirmed', 'released',
+                                          'refund_required', 'refund_pending', 'refunded')),
+    held_until          TIMESTAMPTZ NOT NULL,   -- database clock: now() + HOLD_MINUTES
+    checkout_started_at TIMESTAMPTZ,            -- set by checkout (a later step)
+    payment_id          TEXT,                   -- set when Payment answers (a later step)
+    created_at          TIMESTAMPTZ NOT NULL DEFAULT now(),
+    updated_at          TIMESTAMPTZ NOT NULL DEFAULT now()
+);
