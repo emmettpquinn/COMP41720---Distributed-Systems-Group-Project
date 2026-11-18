@@ -1,5 +1,6 @@
 """All Postgres connection code for the Booking service."""
 import hashlib
+import threading
 import time
 import uuid
 from pathlib import Path
@@ -68,6 +69,23 @@ def _lock_event_creation(cur, event_id):
     cur.execute("SELECT pg_advisory_xact_lock(%s)", (int.from_bytes(digest[:8], "big", signed=True),))
 
 
+def write_outbox(cur, message_type, payload):
+    """Write one outgoing message as an outbox row (contract section 3).
+
+    Runs inside the caller's transaction and never commits: the row is saved
+    only if the caller's state change is saved too. The complete envelope is
+    stored once and never changed. Returns the envelope's message_id.
+    """
+    from messaging import Envelope  # imported here, like events.py does
+
+    envelope = Envelope.new(message_type, payload, producer=PRODUCER)
+    cur.execute(
+        "INSERT INTO outbox (message_id, type, envelope) VALUES (%s, %s, %s)",
+        (envelope.message_id, envelope.type, envelope.to_json().decode()),
+    )
+    return envelope.message_id
+
+
 def write_availability_snapshot(cur, event_id):
     """Write one seat.availability-changed outbox row (contract section 11).
 
@@ -76,8 +94,6 @@ def write_availability_snapshot(cur, event_id):
     the free seats AFTER the lock, and stores the complete envelope. Returns
     the new sequence.
     """
-    from messaging import Envelope  # imported here, like events.py does
-
     cur.execute(
         "UPDATE events SET sequence = sequence + 1 WHERE event_id = %s RETURNING sequence",
         (event_id,),
@@ -88,7 +104,8 @@ def write_availability_snapshot(cur, event_id):
     sequence = row[0]
     cur.execute("SELECT seat_id FROM seats WHERE event_id = %s AND status = 'free'", (event_id,))
     free = sorted(seat_id for (seat_id,) in cur.fetchall())
-    envelope = Envelope.new(
+    write_outbox(
+        cur,
         AVAILABILITY_CHANGED,
         {
             "event_id": event_id,
@@ -96,11 +113,6 @@ def write_availability_snapshot(cur, event_id):
             "seats_remaining": len(free),
             "available_seat_ids": free,
         },
-        producer=PRODUCER,
-    )
-    cur.execute(
-        "INSERT INTO outbox (message_id, type, envelope) VALUES (%s, %s, %s)",
-        (envelope.message_id, envelope.type, envelope.to_json().decode()),
     )
     return sequence
 
@@ -383,43 +395,112 @@ def backfill_availability():
 
 
 # --- Outbox relay queries (used by outbox.py) -----------------------------------
+#
+# The relay polls about 4 times a second. Opening a new connection for every
+# query made ~8 new Postgres connections a second even when idle, so the relay's
+# queries below share ONE connection, kept open between polls. Request paths
+# (holds, lookup) still use connect_once() per request.
+# - Same limits as connect_once() (it opens the connection): connect_timeout 2 s,
+#   statement_timeout 2 s.
+# - Each call is its own transaction and commits its own work ('with conn').
+# - On any error the connection is closed; the next call opens a new one.
+# - The lock makes sure two threads never use the connection at the same time.
+
+_relay_lock = threading.Lock()
+_relay_conn = None
+
+# The longest error text stored on a set-aside outbox row (contract section 3).
+OUTBOX_ERROR_MAX = 500
+
+# Pending = not yet published and not set aside (contract section 3).
+_PENDING = "published_at IS NULL AND failed_at IS NULL"
+
+
+def _relay_query(work):
+    """Run work(cur) on the relay's shared connection, in one committed transaction."""
+    global _relay_conn
+    with _relay_lock:
+        if _relay_conn is None or _relay_conn.closed:
+            _relay_conn = connect_once()
+        try:
+            with _relay_conn, _relay_conn.cursor() as cur:   # commits on success, rolls back on error
+                return work(cur)
+        except Exception:
+            # The connection may be broken (database restarted, network lost).
+            # Close it; the next call opens a fresh one.
+            _close_relay_conn()
+            raise
+
+
+def _close_relay_conn():
+    """Close the shared connection, ignoring errors. Caller holds _relay_lock."""
+    global _relay_conn
+    if _relay_conn is not None:
+        try:
+            _relay_conn.close()
+        except Exception:  # noqa: BLE001 - it may already be broken
+            pass
+        _relay_conn = None
+
+
+def close_relay_connection():
+    """Close the relay's shared connection (on shutdown). Safe to call any time."""
+    with _relay_lock:
+        _close_relay_conn()
+
 
 def pending_outbox(limit=50):
-    """Unpublished outbox rows, oldest first: [(message_id, envelope_text), ...]."""
-    conn = connect_once()
-    try:
-        with conn, conn.cursor() as cur:
-            cur.execute(
-                """SELECT message_id, envelope FROM outbox
-                   WHERE published_at IS NULL
-                   ORDER BY created_at, message_id
-                   LIMIT %s""",
-                (limit,),
-            )
-            return cur.fetchall()
-    finally:
-        conn.close()
+    """Pending outbox rows, oldest first: [(message_id, type, envelope_text), ...]."""
+    def work(cur):
+        cur.execute(
+            f"""SELECT message_id, type, envelope FROM outbox
+                WHERE {_PENDING}
+                ORDER BY created_at, message_id
+                LIMIT %s""",
+            (limit,),
+        )
+        return cur.fetchall()
+    return _relay_query(work)
 
 
 def mark_published(message_id):
     """Called only after the broker confirmed the message."""
-    conn = connect_once()
-    try:
-        with conn, conn.cursor() as cur:
-            cur.execute(
-                "UPDATE outbox SET published_at = clock_timestamp() "
-                "WHERE message_id = %s AND published_at IS NULL",
-                (message_id,),
-            )
-    finally:
-        conn.close()
+    def work(cur):
+        cur.execute(
+            "UPDATE outbox SET published_at = clock_timestamp() "
+            "WHERE message_id = %s AND published_at IS NULL",
+            (message_id,),
+        )
+    _relay_query(work)
+
+
+def set_aside_outbox(message_id, error):
+    """Contract section 3: a permanent publish failure. The relay will not retry the row.
+
+    One UPDATE, only if the row is still unpublished and not already set aside.
+    `error` is cut to OUTBOX_ERROR_MAX characters. True if the row was set aside.
+    """
+    def work(cur):
+        cur.execute(
+            "UPDATE outbox SET failed_at = clock_timestamp(), error = %s "
+            "WHERE message_id = %s AND published_at IS NULL AND failed_at IS NULL",
+            (error[:OUTBOX_ERROR_MAX], message_id),
+        )
+        return cur.rowcount == 1
+    return _relay_query(work)
 
 
 def count_pending_outbox():
-    conn = connect_once()
-    try:
-        with conn, conn.cursor() as cur:
-            cur.execute("SELECT count(*) FROM outbox WHERE published_at IS NULL")
-            return cur.fetchone()[0]
-    finally:
-        conn.close()
+    """Rows the relay will still try to publish (set-aside rows do not count)."""
+    def work(cur):
+        cur.execute(f"SELECT count(*) FROM outbox WHERE {_PENDING}")
+        return cur.fetchone()[0]
+    return _relay_query(work)
+
+
+def count_failed_outbox():
+    """Rows set aside after a permanent publish failure."""
+    def work(cur):
+        cur.execute("SELECT count(*) FROM outbox WHERE failed_at IS NOT NULL")
+        return cur.fetchone()[0]
+    return _relay_query(work)

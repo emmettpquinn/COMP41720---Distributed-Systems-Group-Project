@@ -52,6 +52,8 @@ class BookingIntegrationTests(unittest.TestCase):
         factory=patch('db.connect_once',self.connect)
         factory.start()
         self.addCleanup(factory.stop)
+        # The relay keeps one shared connection (db.py); never let it outlive this test's schema.
+        self.addCleanup(db.close_relay_connection)
         db.init_schema()
 
     def connect(self):
@@ -98,7 +100,7 @@ class BookingIntegrationTests(unittest.TestCase):
         return {row[0] for row in self.query('SELECT message_id FROM processed_messages')}
 
     def client(self):
-        env=patch.dict(os.environ,{'BOOKING_DEMO_SEED':'false'})
+        env=patch('config.BOOKING_DEMO_SEED',False)
         env.start();self.addCleanup(env.stop)
         # Never consume the real queue from a test: no RabbitMQ consumer here.
         amqp=patch('config.AMQP_URL','')
@@ -656,6 +658,288 @@ class BookingIntegrationTests(unittest.TestCase):
         # Exactly one snapshot (from the upgrade; the backfill then skips it), showing A1 free again.
         self.assertEqual([e['payload'] for e in found],
                          [{'event_id':'event-test-start','sequence':1,'seats_remaining':2,'available_seat_ids':['A1','A2']}])
+
+    # --- Step 6b-1: relay batch, temporary vs permanent failures, write_outbox, relay connection ---
+
+    def add_outbox_rows(self,count,message_type='booking.test-relay'):
+        """count outbox rows, created_at one second apart, INSERTED NEWEST FIRST
+        (so only created_at can give the right order). Returns message_ids, oldest first."""
+        from messaging import Envelope
+        envelopes=[Envelope.new(message_type,{'n':n},producer='booking') for n in range(count)]
+        connection=self.connect()
+        try:
+            with connection,connection.cursor() as cursor:
+                for n in reversed(range(count)):
+                    cursor.execute("INSERT INTO outbox (message_id,type,envelope,created_at) VALUES (%s,%s,%s,"
+                                   "timestamptz '2026-01-01 00:00:00+00' + make_interval(secs => %s))",
+                                   (envelopes[n].message_id,message_type,envelopes[n].to_json().decode(),n))
+        finally:
+            connection.close()
+        return [e.message_id for e in envelopes]
+
+    def recorder(self,fail=None):
+        """A fake publish. fail(message_id) may return an exception to raise instead."""
+        sent=[]
+        async def publish(text):
+            message_id=json.loads(text)['message_id']
+            error=fail(message_id) if fail else None
+            if error is not None:
+                raise error
+            sent.append(message_id)
+        return publish,sent
+
+    def outbox_state(self,message_id):
+        """(published?, set aside?, error) for one outbox row."""
+        published,failed,error=self.query('SELECT published_at,failed_at,error FROM outbox WHERE message_id=%s',(message_id,))[0]
+        return (published is not None,failed is not None,error)
+
+    def gauges(self):
+        """booking_outbox_pending and booking_outbox_failed, after a refresh from the database."""
+        asyncio.run(outbox.refresh_pending())
+        return (REGISTRY.get_sample_value('booking_outbox_pending'),REGISTRY.get_sample_value('booking_outbox_failed'))
+
+    def test_relay_publishes_oldest_fifty_then_the_rest(self):                                   # T1
+        ids=self.add_outbox_rows(60)
+        publish,sent=self.recorder()
+        self.assertEqual(asyncio.run(outbox.dispatch_once(publish)),50)
+        self.assertEqual(sent,ids[:50])
+        self.assertEqual(asyncio.run(outbox.dispatch_once(publish)),10)
+        self.assertEqual(sent,ids)
+        self.assertEqual(self.gauges(),(0,0))
+
+    def test_temporary_failure_keeps_the_row_and_later_rows_pending(self):                       # T2
+        ids=self.add_outbox_rows(3)
+        # A confirm timeout: aiormq's publish raises TimeoutError (asyncio.timeout).
+        publish,sent=self.recorder(lambda m:TimeoutError('no confirm within 5 s') if m==ids[1] else None)
+        with self.assertRaises(outbox.PublishFailed) as caught:
+            asyncio.run(outbox.dispatch_once(publish))
+        self.assertIsInstance(caught.exception.__cause__,TimeoutError)
+        self.assertEqual(sent,[ids[0]])
+        self.assertEqual([self.outbox_state(m) for m in ids],[(True,False,None),(False,False,None),(False,False,None)])
+        self.assertEqual(self.gauges(),(2,0))
+        # A lost connection is temporary too; once the broker is back the rows go out in order.
+        publish,sent=self.recorder(lambda m:ConnectionError('connection lost') if m==ids[1] else None)
+        with self.assertRaises(outbox.PublishFailed):
+            asyncio.run(outbox.dispatch_once(publish))
+        publish,sent=self.recorder()
+        self.assertEqual(asyncio.run(outbox.dispatch_once(publish)),2)
+        self.assertEqual(sent,ids[1:])
+        self.assertEqual(self.gauges(),(0,0))
+
+    def test_permanent_failure_sets_the_row_aside_and_the_relay_moves_on(self):                 # T3
+        ids=self.add_outbox_rows(3)
+        tried=[]
+        def fail(message_id):
+            tried.append(message_id)
+            return unroutable_error() if message_id==ids[1] else None
+        publish,sent=self.recorder(fail)
+        with self.assertLogs('booking.outbox','WARNING') as logs:
+            self.assertEqual(asyncio.run(outbox.dispatch_once(publish)),2)
+        self.assertEqual(sent,[ids[0],ids[2]])                       # row 3 went out in the same run
+        published,set_aside,error=self.outbox_state(ids[1])
+        self.assertEqual((published,set_aside),(False,True))
+        for part in ('PublishError','312','NO_ROUTE'):
+            self.assertIn(part,error)
+        self.assertTrue(any(ids[1] in line and 'booking.test-relay' in line for line in logs.output))
+        self.assertEqual((db.count_pending_outbox(),db.count_failed_outbox()),(0,1))
+        self.assertEqual(self.gauges(),(0,1))
+        tried.clear()
+        self.assertEqual(asyncio.run(outbox.dispatch_once(publish)),0)
+        self.assertEqual(tried,[])                                    # never retried
+        # Only an unpublished, not-yet-set-aside row can be set aside; the error is cut to 500.
+        self.assertFalse(db.set_aside_outbox(ids[1],'again'))
+        self.assertEqual(self.outbox_state(ids[1])[2],error)
+        self.assertFalse(db.set_aside_outbox(ids[0],'published already'))
+        (extra,)=self.add_outbox_rows(1)
+        self.assertTrue(db.set_aside_outbox(extra,'x'*600))
+        self.assertEqual(len(self.outbox_state(extra)[2]),500)
+
+    def test_broker_nack_is_temporary(self):                                                    # T4
+        ids=self.add_outbox_rows(3)
+        publish,sent=self.recorder(lambda m:nack_error() if m==ids[1] else None)
+        with self.assertRaises(outbox.PublishFailed) as caught:
+            asyncio.run(outbox.dispatch_once(publish))
+        from aio_pika.exceptions import DeliveryError,PublishError
+        self.assertIsInstance(caught.exception.__cause__,DeliveryError)
+        self.assertNotIsInstance(caught.exception.__cause__,PublishError)
+        self.assertEqual(sent,[ids[0]])
+        self.assertEqual(self.outbox_state(ids[1]),(False,False,None))
+        self.assertEqual(self.gauges(),(2,0))
+        self.assertFalse(outbox.is_permanent(nack_error()))
+        self.assertTrue(outbox.is_permanent(unroutable_error()))
+
+    def test_write_outbox_inside_the_callers_transaction(self):                                 # T5
+        from messaging import Envelope
+        payload={'booking_id':'booking-test-1','count':1,'items':['a','b']}
+        connection=self.connect()
+        try:
+            with connection,connection.cursor() as cursor:
+                message_id=db.write_outbox(cursor,'booking.test-type',payload)
+                self.assertEqual(self.outbox_count(),0)   # not committed: another connection cannot see it
+        finally:
+            connection.close()
+        row_type,text,published_at,failed_at=self.query(
+            'SELECT type,envelope,published_at,failed_at FROM outbox WHERE message_id=%s',(message_id,))[0]
+        envelope=Envelope.from_json(text.encode())
+        self.assertEqual((row_type,envelope.type),('booking.test-type','booking.test-type'))
+        self.assertEqual(envelope.message_id,message_id)
+        self.assertEqual(str(uuid.UUID(message_id)),message_id)
+        self.assertEqual((envelope.producer,envelope.version,envelope.payload),('booking',1,payload))
+        self.assertEqual((published_at,failed_at),(None,None))
+        # A rolled-back transaction leaves no row.
+        connection=self.connect()
+        try:
+            cursor=connection.cursor()
+            other=db.write_outbox(cursor,'booking.test-type',payload)
+            connection.rollback()
+        finally:
+            connection.close()
+        self.assertEqual(self.query('SELECT count(*) FROM outbox WHERE message_id=%s',(other,))[0][0],0)
+        self.assertEqual(self.outbox_count(),1)
+
+    def test_snapshot_envelope_is_unchanged(self):                                              # T6
+        self.apply('created')
+        connection=self.connect()
+        try:
+            with connection,connection.cursor() as cursor:
+                db._lock_event_row(cursor,'event-demo-001')
+                self.assertEqual(db.write_availability_snapshot(cursor,'event-demo-001'),2)  # returns the sequence
+        finally:
+            connection.close()
+        found=self.snapshots()
+        self.assertEqual(len(found),2)
+        for envelope in found:
+            self.assert_valid_envelope(envelope)   # exactly event_id, sequence, seats_remaining, available_seat_ids
+        self.assertEqual(found[-1]['payload'],{'event_id':'event-demo-001','sequence':2,'seats_remaining':2,
+                                               'available_seat_ids':['A1','A2']})
+        self.assertEqual(self.query('SELECT type FROM outbox WHERE message_id=%s',(found[-1]['message_id'],)),
+                         [('seat.availability-changed',)])
+
+    def test_relay_reuses_one_connection_and_reconnects_after_an_error(self):                   # T7
+        ids=self.add_outbox_rows(2)
+        opened=[]
+        def counting_connect():
+            connection=self.connect();opened.append(connection);return connection
+        def backend_pid():
+            def work(cursor):
+                cursor.execute('SELECT pg_backend_pid()');return cursor.fetchone()[0]
+            return db._relay_query(work)
+        with patch('db.connect_once',counting_connect):
+            db.close_relay_connection()
+            first=backend_pid()
+            db.pending_outbox();db.mark_published(ids[0]);db.set_aside_outbox(ids[1],'test error')
+            db.count_pending_outbox();db.count_failed_outbox()
+            asyncio.run(outbox.refresh_pending())
+            asyncio.run(outbox.dispatch_once(self.recorder()[0]))
+            with ThreadPoolExecutor(max_workers=10) as executor:       # the lock: never two at once
+                self.assertEqual(list(executor.map(lambda _:db.count_failed_outbox(),range(20))),[1]*20)
+            self.assertEqual(backend_pid(),first)
+            self.assertEqual(len(opened),1)
+            # Each call committed its own work: another connection already sees it.
+            self.assertEqual(self.outbox_state(ids[0])[:2],(True,False))
+            self.assertEqual(self.outbox_state(ids[1]),(False,True,'test error'))
+            # A forced connection error: the server ends the relay's session.
+            self.query('SELECT pg_terminate_backend(%s)',(first,))
+            for _ in range(50):
+                if not self.query('SELECT 1 FROM pg_stat_activity WHERE pid=%s',(first,)):
+                    break
+                asyncio.run(asyncio.sleep(0.1))
+            with self.assertRaises(psycopg2.Error):
+                db.count_pending_outbox()
+            self.assertEqual(db.count_pending_outbox(),0)              # the next call reconnects and works
+            self.assertEqual(len(opened),2)
+            second=backend_pid()
+            self.assertNotEqual(second,first)
+            # Any other database error also closes it; the next call opens a new one.
+            with self.assertRaises(psycopg2.Error):
+                db._relay_query(lambda cursor:cursor.execute('SELECT 1/0'))
+            self.assertEqual(db.count_failed_outbox(),1)
+            self.assertEqual(len(opened),3)
+            self.assertNotEqual(backend_pid(),second)
+
+    def test_bad_event_changed_raises_and_records_nothing(self):                                # T8
+        base=events_envelope('created')
+        without=lambda field:{k:v for k,v in base.payload.items() if k!=field}
+        bad={'unknown status':base.payload|{'status':'postponed'},
+             'event_version 0':base.payload|{'event_version':0},
+             'event_version text':base.payload|{'event_version':'1'},
+             'event_version bool':base.payload|{'event_version':True},
+             'missing event_id':without('event_id'),
+             'missing status':without('status'),
+             'missing title':without('title'),
+             'missing timezone':without('timezone')}
+        for name,payload in bad.items():
+            with self.subTest(name):
+                envelope=dataclasses.replace(base,message_id=str(uuid.uuid4()),payload=payload)
+                with self.assertRaises((ValueError,KeyError)):
+                    asyncio.run(events.handle(envelope))
+                self.assertEqual(self.processed(),set())
+                self.assertIsNone(self.event_row())
+                self.assertEqual(self.seat_rows(),[])
+                self.assertEqual(self.outbox_count(),0)
+
+    def test_http_metrics_use_the_route_template(self):                                         # T9
+        client=self.client()
+        raw='booking-test-metrics-'+uuid.uuid4().hex[:12]
+        self.assertEqual(client.get(f'/bookings/{raw}',params={'customer_id':'test-buyer-metrics'}).status_code,404)
+        text=client.get('/metrics').text
+        self.assertIn('path="/bookings/{booking_id}"',text)
+        self.assertNotIn(raw,text)
+        self.assertNotIn('test-buyer-metrics',text)
+
+    def test_cancelled_event_beats_seat_taken_and_seat_not_found(self):                         # T10
+        self.apply('created')
+        self.assertEqual(db.hold_seat('event-demo-001','A1','buyer-test-1')[0],'held')
+        self.apply('cancelled')
+        client=self.client()
+        for seat in ('A1','Z9'):        # A1: held by someone else; Z9: no such seat
+            with self.subTest(seat):
+                result=client.post('/holds',json={'event_id':'event-demo-001','seat_id':seat,'customer_id':'buyer-test-2'})
+                self.assertEqual(result.status_code,409)
+                self.assertEqual(result.json()['error'],'event_cancelled')
+                self.assertEqual(db.hold_seat('event-demo-001',seat,'buyer-test-2'),('event_cancelled',None,None))
+
+    def test_newer_event_changed_fills_only_an_empty_section(self):                             # T11
+        self.apply('created')
+        self.query("UPDATE seats SET section='' WHERE event_id='event-demo-001' AND seat_id='A1'")
+        self.query("UPDATE seats SET section='Kept section' WHERE event_id='event-demo-001' AND seat_id='A2'")
+        self.assertEqual(self.apply('updated'),'applied')     # version 2, scheduled, seats A1 and A2 in section A
+        a1,a2=self.seat_rows()
+        self.assertEqual(a1[:4],('A1','A','A1','free'))
+        self.assertEqual(a2[:4],('A2','Kept section','A2','free'))
+
+    def test_demo_seed_off_by_default_and_runs_only_when_config_is_true(self):                 # T12
+        import subprocess,sys
+        def config_value(env):
+            return subprocess.run([sys.executable,'-c','import config; print(config.BOOKING_DEMO_SEED)'],
+                                  env=env,cwd=Path(db.__file__).parent,capture_output=True,text=True,check=True).stdout.strip()
+        unset={k:v for k,v in os.environ.items() if k!='BOOKING_DEMO_SEED'}
+        self.assertEqual(config_value(unset),'False')
+        self.assertEqual(config_value(unset|{'BOOKING_DEMO_SEED':'true'}),'True')
+        self.client()                                          # config value False
+        self.assertEqual(self.query('SELECT count(*) FROM seats')[0][0],0)
+        with patch('config.BOOKING_DEMO_SEED',True):
+            with TestClient(app):
+                pass
+        self.assertGreater(self.query('SELECT count(*) FROM seats')[0][0],0)
+
+
+def unroutable_error(routing_key='booking.test-unroutable'):
+    """Exactly what aiormq 7.2.5 raises for a basic.return with on_return_raises=True
+    (aiormq/channel.py, _on_return_frame: PublishError(message, frame))."""
+    from aio_pika.exceptions import PublishError
+    from aiormq.abc import DeliveredMessage
+    from pamqp.commands import Basic
+    from pamqp.header import ContentHeader
+    frame=Basic.Return(reply_code=312,reply_text='NO_ROUTE',exchange='events',routing_key=routing_key)
+    return PublishError(DeliveredMessage(delivery=frame,header=ContentHeader(),body=b'',channel=None),frame)
+
+
+def nack_error():
+    """What aiormq 7.2.5 raises for a broker nack (aiormq/channel.py, _confirm_delivery: DeliveryError(None, frame))."""
+    from aio_pika.exceptions import DeliveryError
+    from pamqp.commands import Basic
+    return DeliveryError(None,Basic.Nack(delivery_tag=1))
 
 
 def events_envelope(name):
