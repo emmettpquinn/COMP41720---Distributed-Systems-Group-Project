@@ -3,6 +3,7 @@ ENV PYTHONDONTWRITEBYTECODE=1 PYTHONUNBUFFERED=1
 WORKDIR /srv
 COPY booking/requirements.txt .
 RUN pip install --no-cache-dir -r requirements.txt
+COPY shared/messaging ./messaging
 COPY booking/*.py ./
 COPY booking/schema.sql ./
 COPY catalogue/seed-data.json ./demo-data.json

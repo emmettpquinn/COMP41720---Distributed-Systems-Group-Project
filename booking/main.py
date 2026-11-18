@@ -1,6 +1,9 @@
 """Starts the Booking service. Run with:  python main.py"""
 from contextlib import asynccontextmanager
 
+import asyncio
+import contextlib
+import logging
 import os
 import time
 
@@ -9,8 +12,11 @@ from fastapi import FastAPI
 
 import config
 import db
+import events
 import metrics
 from api import router
+
+logging.basicConfig(level=logging.INFO, format="%(levelname)s %(name)s: %(message)s")
 
 
 @asynccontextmanager
@@ -19,7 +25,19 @@ async def lifespan(app):
     if os.getenv("BOOKING_DEMO_SEED", "false").lower() == "true":
         from demo_seed import seed
         seed()
-    yield
+    task = None
+    if config.AMQP_URL:
+        # Fail startup on a missing shared package, rather than hide it in a task.
+        import messaging  # noqa: F401
+        # Runs in the background: holds and /ready never wait for RabbitMQ.
+        task = asyncio.create_task(events.run(config.AMQP_URL))
+    try:
+        yield
+    finally:
+        if task:
+            task.cancel()
+            with contextlib.suppress(asyncio.CancelledError):
+                await task
 
 
 app = FastAPI(title="Booking", lifespan=lifespan)
