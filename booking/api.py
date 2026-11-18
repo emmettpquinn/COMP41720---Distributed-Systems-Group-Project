@@ -3,10 +3,12 @@ from typing import Annotated
 
 import psycopg2
 from fastapi import APIRouter, HTTPException
-from fastapi.responses import JSONResponse
+from fastapi.responses import JSONResponse, Response
+from prometheus_client import CONTENT_TYPE_LATEST, generate_latest
 from pydantic import BaseModel, StringConstraints
 
 import db
+import metrics
 
 router = APIRouter()
 
@@ -39,12 +41,20 @@ def ready():
     return {"status": "ready", "capabilities": ["holds"]}
 
 
+@router.get("/metrics")
+def get_metrics():
+    """Prometheus scrapes this. Text format, not JSON."""
+    return Response(generate_latest(), media_type=CONTENT_TYPE_LATEST)
+
+
 @router.post("/holds")
 def create_hold(req: HoldRequest):
     try:
         outcome, booking_ref = db.hold_seat(req.event_id, req.seat_id, req.customer_id)
     except psycopg2.Error as error:
         raise HTTPException(503, "Booking database is unavailable") from error
+
+    metrics.HOLDS.labels(metrics.HOLD_LABELS[outcome]).inc()
 
     if outcome in ("held", "already_yours"):
         body = {
