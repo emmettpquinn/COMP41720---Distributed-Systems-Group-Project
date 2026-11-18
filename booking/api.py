@@ -74,6 +74,12 @@ def create_hold(req: HoldRequest):
             status_code=409,
         )
 
+    if outcome == "event_cancelled":
+        return JSONResponse(
+            {"error": "event_cancelled", "message": "This event has been cancelled."},
+            status_code=409,
+        )
+
     return JSONResponse(
         {"error": "seat_not_found", "message": "No such seat for this event."},
         status_code=404,

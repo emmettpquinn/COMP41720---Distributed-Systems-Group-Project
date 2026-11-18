@@ -15,6 +15,10 @@ DATABASE_URL = os.getenv(
 RABBITMQ_HOST = os.getenv("RABBITMQ_HOST", "localhost")
 RABBITMQ_PORT = int(os.getenv("RABBITMQ_PORT", "5672"))
 
+# RabbitMQ URL for the event.changed consumer (events.py). Set it to an empty
+# value to run without messaging (holds still work).
+AMQP_URL = os.getenv("AMQP_URL", "amqp://guest:guest@localhost:5672/")
+
 # Port Booking listens on. TEMPORARY: the team is still deciding which port each service gets.
 PORT = int(os.getenv("PORT", "8002"))
 

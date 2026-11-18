@@ -1,7 +1,11 @@
 """Integration additions use unique schemas, never existing Booking inventory."""
 
+import asyncio
+import dataclasses
 from concurrent.futures import ThreadPoolExecutor
+import json
 import os
+from pathlib import Path
 import unittest
 from unittest.mock import patch
 import uuid
@@ -9,10 +13,29 @@ import uuid
 import psycopg2
 from psycopg2 import sql
 from fastapi.testclient import TestClient
+from prometheus_client import REGISTRY
 
 import db
 import demo_seed
+import events
 from main import app
+
+# Catalogue's real message examples: <repo>/catalogue/examples/contracts. In the
+# container (tests mounted at /srv/tests) mount them at /catalogue/examples/contracts.
+EXAMPLES=Path(__file__).resolve().parents[2]/'catalogue'/'examples'/'contracts'
+
+# The seats table as it was before this step (no label column), for the upgrade test.
+OLD_SEATS_TABLE="""CREATE TABLE seats (
+    event_id TEXT NOT NULL, seat_id TEXT NOT NULL, section TEXT NOT NULL,
+    status TEXT NOT NULL DEFAULT 'free' CHECK (status IN ('free', 'held', 'booked')),
+    booking_ref TEXT, customer_id TEXT, held_until TIMESTAMPTZ,
+    PRIMARY KEY (event_id, seat_id),
+    CHECK (status <> 'free' OR (booking_ref IS NULL AND customer_id IS NULL AND held_until IS NULL)))"""
+
+
+def example(name):
+    """One of Catalogue's example envelopes, e.g. example('created')."""
+    return json.loads((EXAMPLES/f'event-{name}.json').read_text())
 
 
 @unittest.skipUnless(os.getenv('BOOKING_TEST_DB'), 'Set BOOKING_TEST_DB for isolated PostgreSQL checks')
@@ -48,9 +71,36 @@ class BookingIntegrationTests(unittest.TestCase):
         finally:
             connection.close()
 
+    def query(self,statement,params=()):
+        connection=self.connect()
+        try:
+            with connection,connection.cursor() as cursor:
+                cursor.execute(statement,params)
+                return cursor.fetchall() if cursor.description else None
+        finally:
+            connection.close()
+
+    def apply(self,name,message_id=None,**changes):
+        envelope=example(name)
+        return db.apply_event_changed(message_id or envelope['message_id'],envelope['payload']|changes)
+
+    def event_row(self,event_id='event-demo-001'):
+        rows=self.query('SELECT event_version,status,title,starts_at,timezone FROM events WHERE event_id=%s',(event_id,))
+        return rows[0] if rows else None
+
+    def seat_rows(self,event_id='event-demo-001'):
+        return self.query('SELECT seat_id,section,label,status,booking_ref,customer_id,held_until FROM seats '
+                          'WHERE event_id=%s ORDER BY seat_id',(event_id,))
+
+    def processed(self):
+        return {row[0] for row in self.query('SELECT message_id FROM processed_messages')}
+
     def client(self):
         env=patch.dict(os.environ,{'BOOKING_DEMO_SEED':'false'})
         env.start();self.addCleanup(env.stop)
+        # Never consume the real queue from a test: no RabbitMQ consumer here.
+        amqp=patch('config.AMQP_URL','')
+        amqp.start();self.addCleanup(amqp.stop)
         client=TestClient(app)
         client.__enter__();self.addCleanup(client.__exit__,None,None,None)
         return client
@@ -103,3 +153,109 @@ class BookingIntegrationTests(unittest.TestCase):
         self.assertEqual(result.status_code,200)
         self.assertEqual(result.json()['capabilities'],['holds'])
         self.assertEqual(self.client().post('/checkout',json={}).status_code,404)
+
+    # --- event.changed (contract sections 3 and 7) ---
+
+    def test_created_creates_event_and_labelled_seats(self):
+        self.assertEqual(self.apply('created'),'applied')
+        self.assertEqual(self.event_row(),(1,'scheduled','Evening Performance','2026-11-27T19:30:00+00:00','Europe/Dublin'))
+        self.assertEqual(self.seat_rows(),[('A1','A','A1','free',None,None,None),('A2','A','A2','free',None,None,None)])
+        self.assertEqual(self.processed(),{example('created')['message_id']})
+        self.assertEqual(db.hold_seat('event-demo-001','A1','buyer')[0],'held')
+
+    def test_same_message_id_twice_changes_nothing(self):
+        first=example('created')['message_id']
+        self.assertEqual(self.apply('created'),'applied')
+        # Same message_id, even with a newer payload: the second delivery is a no-op.
+        self.assertEqual(self.apply('updated',message_id=first),'duplicate')
+        self.assertEqual(self.event_row()[:3],(1,'scheduled','Evening Performance'))
+        self.assertEqual(self.processed(),{first})
+
+    def test_same_version_other_message_id_is_recorded_only(self):
+        self.apply('created')
+        other=str(uuid.uuid4())
+        self.assertEqual(self.apply('created',message_id=other,title='Should not apply'),'stale')
+        self.assertEqual(self.event_row()[:3],(1,'scheduled','Evening Performance'))
+        self.assertEqual(self.processed(),{example('created')['message_id'],other})
+
+    def test_older_version_after_newer_is_ignored(self):
+        self.assertEqual(self.apply('updated'),'applied')
+        self.assertEqual(self.apply('created'),'stale')
+        self.assertEqual(self.event_row()[:3],(2,'scheduled','Evening Performance - revised'))
+        self.assertEqual(len(self.processed()),2)
+
+    def test_cancelled_before_created_stays_cancelled_without_seats(self):
+        self.assertEqual(self.apply('cancelled'),'applied')
+        self.assertEqual(self.apply('created'),'stale')
+        self.assertEqual(self.event_row()[:2],(3,'cancelled'))
+        self.assertEqual(self.seat_rows(),[])
+
+    def test_snapshot_on_held_seat_keeps_hold_and_fills_label(self):
+        # Seats as the demo seed leaves them: no label, no event record.
+        self.query("INSERT INTO seats (event_id,seat_id,section) VALUES ('event-demo-001','A1','A')")
+        self.query("INSERT INTO seats (event_id,seat_id,section,label) VALUES ('event-demo-001','A2','A','Kept label')")
+        outcome,ref=db.hold_seat('event-demo-001','A1','buyer-1')
+        self.assertEqual(outcome,'held')
+        before=self.seat_rows()[0]
+        self.assertEqual(self.apply('created'),'applied')
+        a1,a2=self.seat_rows()
+        self.assertEqual(a1,('A1','A','A1','held',ref,'buyer-1',before[6]))
+        self.assertEqual(a2[2],'Kept label')
+        self.assertEqual(db.hold_seat('event-demo-001','A1','buyer-1'),('already_yours',ref))
+
+    def test_http_hold_on_cancelled_event_and_on_seat_without_event(self):
+        self.apply('created');self.apply('cancelled')
+        client=self.client()
+        result=client.post('/holds',json={'event_id':'event-demo-001','seat_id':'A1','customer_id':'buyer'})
+        self.assertEqual(result.status_code,409)
+        self.assertEqual(result.json(),{'error':'event_cancelled','message':'This event has been cancelled.'})
+        self.assertEqual(self.seat_rows()[0][3],'free')
+        self.seed_seat()  # race-event has no event record: today's behaviour
+        self.assertEqual(client.post('/holds',json={'event_id':'race-event','seat_id':'A1','customer_id':'buyer'}).status_code,201)
+
+    def test_database_failure_records_nothing_and_raises(self):
+        # A real database error after processed_messages and events were written.
+        self.query("""CREATE FUNCTION fail_seat_insert() RETURNS trigger LANGUAGE plpgsql AS
+                      $$ BEGIN RAISE EXCEPTION 'simulated database failure'; END $$""")
+        self.query('CREATE TRIGGER fail_seats BEFORE INSERT ON seats FOR EACH ROW EXECUTE FUNCTION fail_seat_insert()')
+        envelope=events_envelope('created')
+        with self.assertRaises(psycopg2.Error):
+            asyncio.run(events.handle(envelope))
+        self.assertEqual(self.processed(),set())
+        self.assertIsNone(self.event_row())
+        # Once the cause is gone, the retried delivery applies normally.
+        self.query('DROP TRIGGER fail_seats ON seats')
+        asyncio.run(events.handle(envelope))
+        self.assertEqual(self.processed(),{envelope.message_id})
+        self.assertEqual(len(self.seat_rows()),2)
+
+    def test_listener_dispatches_by_type_and_counts_outcomes(self):
+        from messaging import Outcome
+        asyncio.run(events.handle(events_envelope('created')))
+        self.assertEqual(self.event_row()[0],1)
+        other=dataclasses.replace(events_envelope('created'),type='payment.result',message_id=str(uuid.uuid4()))
+        asyncio.run(events.handle(other))  # logged and acknowledged: no effect
+        self.assertEqual(len(self.processed()),1)
+        labels={'type':'event.changed','outcome':'processed'}
+        before=REGISTRY.get_sample_value('booking_messages_total',labels) or 0
+        events.track_outcome(Outcome.PROCESSED,'event.changed',None)
+        self.assertEqual(REGISTRY.get_sample_value('booking_messages_total',labels),before+1)
+
+    def test_schema_upgrade_keeps_held_seat(self):
+        self.query('DROP TABLE seats, events, processed_messages')
+        self.query(OLD_SEATS_TABLE)
+        self.query("INSERT INTO seats (event_id,seat_id,section,status,booking_ref,customer_id) "
+                   "VALUES ('event-demo-001','A1','A','held','ref-1','buyer-1')")
+        db.init_schema();db.init_schema()  # safe to run on every start
+        columns=[row[0] for row in self.query("SELECT column_name FROM information_schema.columns "
+                                             "WHERE table_schema=%s AND table_name='seats'",(self.schema,))]
+        self.assertIn('label',columns)
+        self.assertEqual(self.seat_rows(),[('A1','A',None,'held','ref-1','buyer-1',None)])
+        self.assertEqual(self.query('SELECT count(*) FROM events')[0][0],0)
+        self.assertEqual(self.query('SELECT count(*) FROM processed_messages')[0][0],0)
+
+
+def events_envelope(name):
+    """Parse an example exactly as the shared consumer does."""
+    from messaging import Envelope
+    return Envelope.from_json((EXAMPLES/f'event-{name}.json').read_bytes())
