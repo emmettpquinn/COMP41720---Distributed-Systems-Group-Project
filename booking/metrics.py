@@ -7,5 +7,5 @@ ERRORS = Counter("booking_http_errors_total", "HTTP errors (status >= 400)", ["s
 LATENCY = Histogram("booking_http_request_duration_seconds", "HTTP request time", ["method", "path"])
 HOLDS = Counter("booking_holds_total", "Hold requests by outcome", ["outcome"])
 
-# db.hold_seat's outcome -> the label we show on the dashboard.
+# db.hold_seat's outcome -> the label to show on the dashboard.
 HOLD_LABELS = {"held": "held", "already_yours": "retry", "taken": "taken", "not_found": "not_found"}
