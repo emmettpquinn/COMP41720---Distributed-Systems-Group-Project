@@ -32,3 +32,22 @@ CREATE TABLE IF NOT EXISTS processed_messages (
     message_id   TEXT PRIMARY KEY,
     processed_at TIMESTAMPTZ NOT NULL DEFAULT now()
 );
+
+-- Availability sequence per event (contract section 11). 0 = no snapshot written
+-- yet; the first snapshot is 1. Only ever incremented, never reset. Safe on an
+-- existing database: existing events get 0 and are backfilled once on startup.
+ALTER TABLE events ADD COLUMN IF NOT EXISTS sequence BIGINT NOT NULL DEFAULT 0 CHECK (sequence >= 0);
+
+-- Transactional outbox (contract section 3). A row is written in the same
+-- transaction as the state change; the relay (outbox.py) publishes it later and
+-- only then sets published_at. The envelope text is stored exactly as written
+-- and is never changed, so a republish sends the same message_id and body.
+CREATE TABLE IF NOT EXISTS outbox (
+    message_id   TEXT PRIMARY KEY,      -- a UUID, as text
+    type         TEXT NOT NULL,         -- e.g. 'seat.availability-changed' (= routing key)
+    envelope     TEXT NOT NULL,         -- the full envelope JSON
+    created_at   TIMESTAMPTZ NOT NULL DEFAULT clock_timestamp(),
+    published_at TIMESTAMPTZ            -- NULL until the broker confirmed it
+);
+-- The relay only ever looks for unpublished rows, oldest first.
+CREATE INDEX IF NOT EXISTS outbox_unpublished ON outbox (created_at) WHERE published_at IS NULL;
