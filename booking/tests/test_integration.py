@@ -7,10 +7,13 @@ from datetime import datetime, timedelta
 import json
 import os
 from pathlib import Path
+import threading
+import time
 import unittest
 from unittest.mock import patch
 import uuid
 
+import httpx
 import psycopg2
 from psycopg2 import sql
 from fastapi.testclient import TestClient
@@ -20,6 +23,7 @@ import db
 import demo_seed
 import events
 import outbox
+import payments
 from main import app
 
 # Catalogue's real message examples: <repo>/catalogue/examples/contracts. In the
@@ -152,10 +156,12 @@ class BookingIntegrationTests(unittest.TestCase):
             self.assertEqual(result.status_code,503)
             self.assertNotIn('private',result.text)
 
-    def test_readiness_identifies_hold_only_capability(self):
-        result=self.client().get('/ready')
+    def test_readiness_reports_holds_and_checkout_without_calling_payment(self):               # C13
+        client=self.checkout_client()
+        result=client.get('/ready')
         self.assertEqual(result.status_code,200)
-        self.assertEqual(result.json()['capabilities'],['holds'])
+        self.assertEqual(result.json()['capabilities'],['holds','checkout'])
+        self.assertEqual(self.payment_calls,[])
         self.assertEqual(self.client().post('/checkout',json={}).status_code,404)
 
     # --- event.changed (contract sections 3 and 7) ---
@@ -589,7 +595,7 @@ class BookingIntegrationTests(unittest.TestCase):
         self.assertEqual(client.get(f'/bookings/{booking_id}',params={'customer_id':'c'*65}).status_code,422)
         self.assertEqual(client.get('/bookings/'+'b'*65,params={'customer_id':'buyer-test'}).status_code,422)
         self.assertEqual(client.get('/bookings/'+'b'*64,params={'customer_id':'buyer-test'}).status_code,404)
-        self.assertEqual(client.get('/ready').json()['capabilities'],['holds'])
+        self.assertEqual(client.get('/ready').json()['capabilities'],['holds','checkout'])
 
     def test_lookup_database_failure_is_safe_503(self):
         client=self.client()
@@ -922,6 +928,340 @@ class BookingIntegrationTests(unittest.TestCase):
             with TestClient(app):
                 pass
         self.assertGreater(self.query('SELECT count(*) FROM seats')[0][0],0)
+
+    # --- Checkout and Payment's HTTP answer (step 6b-2; contract sections 4, 6, 9, 12) ---
+
+    def checkout_client(self,reply=None,gate=None,hang=False):
+        """A TestClient whose Payment is a fake (httpx.MockTransport), with no real pauses.
+
+        reply(body) -> httpx.Response (default: paid). If gate (a threading.Event) is
+        given, the fake waits for it before answering, without blocking the event
+        loop. hang=True: the fake never answers (cancelled at shutdown).
+        self.payment_calls lists (request body, booking status in the database at
+        the moment Payment was called).
+        """
+        self.payment_calls=[]
+        self.fake_now=0.0
+        reply=reply or (lambda body:payment_reply('paid',body))
+        if gate is not None:
+            self.addCleanup(gate.set)       # never leave a waiting fake behind
+
+        async def handler(request):
+            body=json.loads(request.content)
+            rows=await asyncio.to_thread(self.query,'SELECT status FROM bookings WHERE booking_id=%s',(body['booking_id'],))
+            self.payment_calls.append((body,rows[0][0]))
+            if hang:
+                await asyncio.sleep(60)
+            if gate is not None:
+                await asyncio.to_thread(gate.wait,10)
+            return reply(body)
+
+        async def no_pause(seconds):
+            pass
+
+        def create_runner(url):
+            self.http=httpx.AsyncClient(transport=httpx.MockTransport(handler))
+            breaker=payments.CircuitBreaker(clock=lambda:self.fake_now)
+            return payments.CheckoutRunner(payments.PaymentClient(self.http,url,breaker,sleep=no_pause))
+        factory=patch('payments.create_runner',create_runner)
+        factory.start();self.addCleanup(factory.stop)
+        return self.client()
+
+    def hold(self,client,seat='A1',customer='buyer-test',event_id='event-demo-001'):
+        result=client.post('/holds',json={'event_id':event_id,'seat_id':seat,'customer_id':customer})
+        self.assertEqual(result.status_code,201)
+        return result.json()['booking_id']
+
+    def checkout(self,client,booking_id,customer='buyer-test'):
+        return client.post(f'/bookings/{booking_id}/checkout',json={'customer_id':customer})
+
+    def wait_until(self,condition,timeout=5):
+        deadline=time.monotonic()+timeout
+        while time.monotonic()<deadline:
+            if condition():
+                return
+            time.sleep(0.02)
+        self.fail('condition not reached in time')
+
+    def booking_status(self,booking_id):
+        return self.query('SELECT status FROM bookings WHERE booking_id=%s',(booking_id,))[0][0]
+
+    def wait_for_status(self,booking_id,wanted):
+        self.wait_until(lambda:self.booking_status(booking_id)==wanted)
+
+    def background_idle(self):
+        return not app.state.checkout._tasks
+
+    def messages(self,message_type):
+        """Outbox envelopes of one type, oldest first."""
+        rows=self.query('SELECT envelope FROM outbox WHERE type=%s ORDER BY created_at',(message_type,))
+        return [json.loads(text) for (text,) in rows]
+
+    def assert_booking_envelope(self,envelope,message_type):
+        """Parses as the shared consumer does, and its type is bound to a queue (never set aside)."""
+        from messaging import QUEUES, Envelope
+        parsed=Envelope.from_json(json.dumps(envelope).encode())
+        uuid.UUID(parsed.message_id)
+        self.assertEqual((parsed.type,parsed.version,parsed.producer),(message_type,1,'booking'))
+        self.assertTrue(any(message_type in queue.bindings for queue in QUEUES))
+
+    def counter(self,name,**labels):
+        return REGISTRY.get_sample_value(name,labels) or 0
+
+    def test_checkout_commits_then_replies_202_before_payment_answers(self):                   # C1, C2, C16
+        self.apply('created')
+        gate=threading.Event()
+        client=self.checkout_client(gate=gate)
+        booking_id=self.hold(client)
+        started=self.counter('booking_checkouts_total',outcome='started')
+        confirmed=self.counter('booking_payment_answers_total',result='confirmed')
+        result=self.checkout(client,booking_id)
+        # The 202 arrived while the fake Payment was still waiting for the gate.
+        self.assertEqual(result.status_code,202)
+        self.assertEqual(result.json(),{'booking_id':booking_id,'booking_status':'payment_pending'})
+        self.assertEqual(self.query('SELECT status,checkout_started_at IS NOT NULL FROM bookings')[0],('payment_pending',True))
+        self.wait_until(lambda:len(self.payment_calls)==1)
+        body,status_when_called=self.payment_calls[0]
+        self.assertEqual(status_when_called,'payment_pending')    # committed BEFORE Payment was called
+        self.assertEqual(body,{'booking_id':booking_id,'amount':4500,'currency':'EUR',
+                               'customer_email':'buyer-test@example.test'})
+        # A repeat while the payment is in progress: 202 again, no second call.
+        repeat=self.checkout(client,booking_id)
+        self.assertEqual((repeat.status_code,repeat.json()['booking_status']),(202,'payment_pending'))
+        gate.set()
+        self.wait_for_status(booking_id,'confirmed')
+        self.wait_until(self.background_idle)
+        self.assertEqual(len(self.payment_calls),1)
+        self.assertEqual(self.counter('booking_checkouts_total',outcome='started'),started+1)
+        self.assertEqual(self.counter('booking_payment_answers_total',result='confirmed'),confirmed+1)
+        # Confirmed is final: a later checkout is refused.
+        late=self.checkout(client,booking_id)
+        self.assertEqual((late.status_code,late.json()['error']),(409,'not_checkoutable'))
+
+    def test_checkout_unknown_booking_wrong_customer_and_bad_input(self):                       # C3
+        self.apply('created')
+        client=self.checkout_client()
+        booking_id=self.hold(client)
+        unknown=self.checkout(client,'booking-test-unknown')
+        wrong=self.checkout(client,booking_id,customer='someone-else-test')
+        self.assertEqual((unknown.status_code,wrong.status_code),(404,404))
+        self.assertEqual(unknown.json(),wrong.json())
+        self.assertEqual(unknown.json()['error'],'booking_not_found')
+        self.assertEqual(client.post(f'/bookings/{booking_id}/checkout',json={'customer_id':' '}).status_code,422)
+        self.assertEqual(client.post(f'/bookings/{booking_id}/checkout',json={}).status_code,422)
+        self.assertEqual(self.checkout(client,'b'*65).status_code,422)
+        self.assertEqual(self.booking_status(booking_id),'held')
+        self.assertEqual(self.payment_calls,[])
+
+    def test_checkout_refusals_cancelled_expired_and_no_event_record(self):                    # C4
+        self.apply('created')
+        client=self.checkout_client()
+        expired=self.hold(client,seat='A2',customer='buyer-test-2')
+        self.query("UPDATE bookings SET held_until=now()-interval '1 second' WHERE booking_id=%s",(expired,))
+        result=self.checkout(client,expired,customer='buyer-test-2')
+        self.assertEqual((result.status_code,result.json()['error']),(409,'not_checkoutable'))
+        cancelled=self.hold(client)
+        self.apply('cancelled')
+        result=self.checkout(client,cancelled)
+        self.assertEqual((result.status_code,result.json()['error']),(409,'event_cancelled'))
+        self.seed_seat()     # race-event has no event record
+        no_record=self.hold(client,seat='A1',customer='buyer-test-3',event_id='race-event')
+        result=self.checkout(client,no_record,customer='buyer-test-3')
+        self.assertEqual((result.status_code,result.json()['error']),(409,'not_checkoutable'))
+        self.assertEqual({status for (status,) in self.query('SELECT status FROM bookings')},{'held'})
+        self.assertEqual(self.payment_calls,[])
+
+    def test_breaker_open_or_trial_running_refuses_checkout_and_keeps_the_hold(self):          # C5
+        self.apply('created')
+        client=self.checkout_client()
+        booking_id=self.hold(client)
+        breaker=app.state.checkout.breaker
+        for _ in range(5):
+            breaker.record_failure()
+        outbox_rows=self.outbox_count()
+        result=self.checkout(client,booking_id)
+        self.assertEqual((result.status_code,result.json()['error']),(503,'payment_service_unavailable'))
+        self.assertEqual(self.query('SELECT status,checkout_started_at FROM bookings')[0],('held',None))
+        self.assertEqual(self.outbox_count(),outbox_rows)
+        self.assertEqual(client.get('/metrics').text.count('booking_payment_breaker_state 1.0'),1)
+        # 30 s later, but the one trial is already running: still 503.
+        self.fake_now+=30
+        self.assertTrue(breaker.try_acquire())
+        self.assertEqual(self.checkout(client,booking_id).status_code,503)
+        # The trial ends without an answer either way (409/422): a checkout may become the next trial.
+        breaker.record_neutral()
+        self.assertEqual(self.checkout(client,booking_id).status_code,202)
+        self.wait_for_status(booking_id,'confirmed')
+        self.assertEqual(breaker.state,payments.CLOSED)
+        self.assertEqual(len(self.payment_calls),1)
+
+    def test_cancelled_event_beats_the_open_breaker(self):                                      # C5 (order)
+        self.apply('created')
+        client=self.checkout_client()
+        booking_id=self.hold(client)
+        self.apply('cancelled')
+        for _ in range(5):
+            app.state.checkout.breaker.record_failure()
+        result=self.checkout(client,booking_id)
+        self.assertEqual((result.status_code,result.json()['error']),(409,'event_cancelled'))
+
+    def test_paid_confirms_books_the_seat_and_writes_booking_confirmed(self):                 # C6, C15 (row 5)
+        long_title='T'*300
+        self.apply('created',title=long_title,seats=[{'seat_id':'A1','section':'A','label':'L'*100},
+                                                      {'seat_id':'A2','section':'A'}])   # A2: no label
+        client=self.checkout_client()
+        first=self.hold(client)
+        second=self.hold(client,seat='A2',customer='buyer-test-2')
+        snapshots=len(self.snapshots())
+        self.assertEqual(self.checkout(client,first).status_code,202)
+        self.assertEqual(self.checkout(client,second,customer='buyer-test-2').status_code,202)
+        self.wait_for_status(first,'confirmed');self.wait_for_status(second,'confirmed')
+        self.assertEqual(self.query('SELECT payment_id FROM bookings WHERE booking_id=%s',(first,))[0][0],'pay-test-'+first[:8])
+        self.assertEqual([row[3] for row in self.seat_rows()],['booked','booked'])
+        self.assertEqual(len(self.snapshots()),snapshots)        # row 5 changes no free seats
+        found={e['payload']['booking_id']:e for e in self.messages('booking.confirmed')}
+        self.assertEqual(set(found),{first,second})
+        for envelope in found.values():
+            self.assert_booking_envelope(envelope,'booking.confirmed')
+        self.assertEqual(found[first]['payload'],{
+            'booking_id':first,'customer_email':'buyer-test@example.test','customer_name':'buyer-test',
+            'event_id':'event-demo-001','event_title':'T'*200,'event_starts_at':'2026-11-27T19:30:00+00:00',
+            'seat_label':'L'*64})
+        self.assertEqual(found[second]['payload']['seat_label'],'A2')   # falls back to the seat ID
+
+    def test_paid_after_the_event_was_cancelled_requests_a_refund(self):                      # C7 (row 6)
+        self.apply('created')
+        gate=threading.Event()
+        client=self.checkout_client(gate=gate)
+        booking_id=self.hold(client)
+        self.assertEqual(self.checkout(client,booking_id).status_code,202)
+        self.wait_until(lambda:len(self.payment_calls)==1)
+        # The event is cancelled while the payment is in progress.
+        self.assertEqual(self.apply('cancelled'),'applied')
+        sequence=self.sequence()
+        gate.set()
+        self.wait_for_status(booking_id,'refund_required')
+        payment_id='pay-test-'+booking_id[:8]
+        self.assertEqual(self.query('SELECT payment_id FROM bookings')[0][0],payment_id)
+        self.assertEqual(self.seat_rows()[0][3:7],('free',None,None,None))
+        latest=self.snapshots()[-1]
+        self.assertEqual(latest['payload']['sequence'],sequence+1)
+        self.assertIn('A1',latest['payload']['available_seat_ids'])
+        [cancelled]=self.messages('booking.cancelled')
+        [refund]=self.messages('refund.requested')
+        self.assert_booking_envelope(cancelled,'booking.cancelled')
+        self.assert_booking_envelope(refund,'refund.requested')
+        self.assertEqual(cancelled['payload'],{'booking_id':booking_id,'reason':'event_cancelled',
+                                               'customer_email':'buyer-test@example.test','customer_name':'buyer-test',
+                                               'event_title':'Evening Performance - revised'})
+        self.assertEqual(refund['payload'],{'booking_id':booking_id,'payment_id':payment_id,
+                                            'customer_email':'buyer-test@example.test'})
+        self.assertEqual(self.messages('booking.confirmed'),[])
+
+    def test_failed_or_refunded_releases_the_seat(self):                                        # C8 (row 7)
+        self.apply('created')
+        statuses={}
+        client=self.checkout_client(reply=lambda body:payment_reply(statuses[body['booking_id']],body))
+        failed=self.hold(client)
+        refunded=self.hold(client,seat='A2',customer='buyer-test-2')
+        statuses.update({failed:'failed',refunded:'refunded'})
+        sequence=self.sequence()
+        self.assertEqual(self.checkout(client,failed).status_code,202)
+        self.assertEqual(self.checkout(client,refunded,customer='buyer-test-2').status_code,202)
+        self.wait_for_status(failed,'released');self.wait_for_status(refunded,'released')
+        self.assertEqual(self.query('SELECT count(*) FROM bookings WHERE payment_id IS NOT NULL')[0][0],2)
+        self.assertEqual(self.free_seats('event-demo-001'),['A1','A2'])
+        self.assertEqual(self.sequence(),sequence+2)
+        self.assertEqual(self.snapshots()[-1]['payload']['available_seat_ids'],['A1','A2'])
+        cancelled=self.messages('booking.cancelled')
+        self.assertEqual(sorted(e['payload']['booking_id'] for e in cancelled),sorted([failed,refunded]))
+        self.assertEqual({e['payload']['reason'] for e in cancelled},{'payment_failed'})
+        self.assertEqual(self.messages('refund.requested'),[])
+
+    def test_answer_for_a_booking_not_payment_pending_changes_nothing(self):                    # C9
+        self.apply('created')
+        booking_id=db.hold_seat('event-demo-001','A1','buyer-test')[1]
+        rows=self.outbox_count()
+        self.assertEqual(db.apply_payment_answer(booking_id,'paid','pay-test-1'),'noop')      # still held
+        self.assertEqual(db.start_checkout(booking_id,'buyer-test',True),'started')
+        self.assertEqual(db.apply_payment_answer(booking_id,'paid','pay-test-1'),'confirmed')
+        self.assertEqual(db.apply_payment_answer(booking_id,'failed','pay-test-1'),'noop')    # second answer
+        self.assertEqual(self.booking_status(booking_id),'confirmed')
+        self.assertEqual(self.seat_rows()[0][3],'booked')
+        self.assertEqual(self.outbox_count(),rows+1)                                          # one booking.confirmed
+
+    def test_no_answer_leaves_the_booking_payment_pending(self):                                # C10
+        self.apply('created')
+        client=self.checkout_client(reply=lambda body:httpx.Response(503,json={'detail':'down'}))
+        booking_id=self.hold(client)
+        rows=self.outbox_count()
+        no_answer=self.counter('booking_payment_answers_total',result='no_answer')
+        self.assertEqual(self.checkout(client,booking_id).status_code,202)
+        self.wait_until(lambda:len(self.payment_calls)==3)
+        self.wait_until(self.background_idle)
+        self.assertEqual(self.booking_status(booking_id),'payment_pending')
+        self.assertEqual(self.seat_rows()[0][3],'held')
+        self.assertEqual(self.outbox_count(),rows)
+        self.assertEqual(self.counter('booking_payment_answers_total',result='no_answer'),no_answer+1)
+
+    def test_payment_answers_holds_and_event_changed_do_not_deadlock(self):                     # C11
+        db.apply_event_changed(str(uuid.uuid4()),self.big_event())
+        pending=[]
+        for n in range(1,6):
+            booking_id=db.hold_seat('event-test-many',f'T{n:02d}',f'buyer-test-{n}')[1]
+            self.assertEqual(db.start_checkout(booking_id,f'buyer-test-{n}',True),'started')
+            pending.append(booking_id)
+        answers=[lambda b=b,s=s:db.apply_payment_answer(b,s,'pay-test-'+b[:8])
+                 for b,s in zip(pending,['paid','failed','paid','refunded','paid'])]
+        holds=[lambda n=n:db.hold_seat('event-test-many',f'T{n:02d}',f'buyer-test-{n}') for n in range(6,16)]
+        changes=[lambda v=v:db.apply_event_changed(str(uuid.uuid4()),self.big_event(version=v,extra=[f'X{v}'])) for v in range(2,5)]
+        jobs=holds[:5]+answers[:2]+changes+answers[2:]+holds[5:]
+        with ThreadPoolExecutor(max_workers=len(jobs)) as executor:
+            futures=[executor.submit(job) for job in jobs]
+            for future in futures:
+                future.result(timeout=30)       # a deadlock error would raise here
+        statuses=dict(self.query('SELECT booking_id,status FROM bookings WHERE booking_id = ANY(%s)',(pending,)))
+        self.assertEqual([statuses[b] for b in pending],['confirmed','released','confirmed','released','confirmed'])
+        found=self.snapshots('event-test-many')
+        self.assertEqual([e['payload']['sequence'] for e in found],list(range(1,len(found)+1)))
+        self.assertEqual(found[-1]['payload']['available_seat_ids'],self.free_seats('event-test-many'))
+
+    def test_failed_outbox_insert_rolls_back_the_whole_answer(self):                            # C12
+        self.apply('created')
+        booking_id=db.hold_seat('event-demo-001','A1','buyer-test')[1]
+        self.assertEqual(db.start_checkout(booking_id,'buyer-test',True),'started')
+        self.query("""CREATE FUNCTION fail_outbox_insert() RETURNS trigger LANGUAGE plpgsql AS
+                      $$ BEGIN RAISE EXCEPTION 'simulated outbox failure'; END $$""")
+        self.query('CREATE TRIGGER fail_outbox BEFORE INSERT ON outbox FOR EACH ROW EXECUTE FUNCTION fail_outbox_insert()')
+        for status in ('paid','failed'):
+            with self.subTest(status),self.assertRaises(psycopg2.Error):
+                db.apply_payment_answer(booking_id,status,'pay-test-1')
+        self.assertEqual(self.query('SELECT status,payment_id FROM bookings')[0],('payment_pending',None))
+        self.assertEqual(self.seat_rows()[0][3:5],('held',booking_id))
+        self.assertEqual(self.sequence(),2)      # creation snapshot + the hold's snapshot only
+
+    def test_shutdown_cancels_a_call_in_flight(self):                                          # C14
+        self.apply('created')
+        client=self.checkout_client(hang=True)
+        booking_id=self.hold(client)
+        self.assertEqual(self.checkout(client,booking_id).status_code,202)
+        self.wait_until(lambda:len(self.payment_calls)==1)
+        client.__exit__(None,None,None)          # the app shuts down while Payment has not answered
+        self.assertEqual(self.booking_status(booking_id),'payment_pending')
+        self.assertTrue(self.http.is_closed)
+
+    def test_startup_refuses_a_bad_currency(self):                                              # P11 (lifespan)
+        with patch('config.BOOKING_CURRENCY','eur'):
+            with self.assertRaises(ValueError):
+                with TestClient(app):
+                    pass
+
+
+def payment_reply(status,body):
+    """Payment's 200 body (payment/app/store.py format_payment) for a fake Payment."""
+    return httpx.Response(200,json={'payment_id':'pay-test-'+body['booking_id'][:8],'booking_id':body['booking_id'],
+                                    'amount':body['amount'],'currency':body['currency'],'status':status,
+                                    'refund_id':None,'created_at':'2026-11-18T12:00:00+00:00'})
 
 
 def unroutable_error(routing_key='booking.test-unroutable'):

@@ -238,6 +238,189 @@ def get_booking(booking_id, customer_id):
     }
 
 
+# --- Checkout and Payment's answer (contract sections 4, 6, 9 and 12) -----------
+
+BOOKING_CONFIRMED = "booking.confirmed"
+BOOKING_CANCELLED = "booking.cancelled"
+REFUND_REQUESTED = "refund.requested"
+
+# Payment's HTTP 200 answers (contract section 9). 'refunded' is handled like 'failed' (section 8).
+PAYMENT_STATUSES = ("paid", "failed", "refunded")
+
+# Length caps for every message Booking publishes (contract section 1).
+EVENT_TITLE_MAX = 200
+SEAT_LABEL_MAX = 64
+
+
+def start_checkout(booking_id, customer_id, breaker_accepts):
+    """Contract section 6 (rows 2 and 3). Returns the outcome:
+
+    'not_found', 'repeat' (already payment_pending), 'event_cancelled',
+    'not_checkoutable', 'breaker_open' (nothing written), or 'started'
+    (now payment_pending and committed; only then may Payment be called).
+
+    Locks ONLY the booking row (lock order, section 4a). The event's status is
+    read without a lock; a cancellation that lands after this commit is caught
+    when Payment's answer is applied (row 6).
+    """
+    conn = connect_once()
+    try:
+        with conn, conn.cursor() as cur:
+            cur.execute(
+                """SELECT b.status, b.held_until > now(), e.status
+                   FROM bookings b LEFT JOIN events e ON e.event_id = b.event_id
+                   WHERE b.booking_id = %s AND b.customer_id = %s
+                   FOR UPDATE OF b""",
+                (booking_id, customer_id),
+            )
+            row = cur.fetchone()
+            # The checks, in the contract's order (section 6).
+            if row is None:
+                return "not_found"
+            status, not_expired, event_status = row
+            if status == "payment_pending":
+                return "repeat"
+            if event_status == "cancelled":
+                return "event_cancelled"
+            if status != "held" or not not_expired or event_status is None:
+                return "not_checkoutable"
+            if not breaker_accepts:
+                return "breaker_open"      # row 3: the booking stays held
+            # Row 2: the ONE conditional update (section 4a).
+            cur.execute(
+                """UPDATE bookings
+                   SET status = 'payment_pending', checkout_started_at = now(), updated_at = now()
+                   WHERE booking_id = %s AND status = 'held' AND held_until > now()
+                     AND EXISTS (SELECT 1 FROM events
+                                 WHERE events.event_id = bookings.event_id
+                                   AND events.status <> 'cancelled')""",
+                (booking_id,),
+            )
+            if cur.rowcount != 1:
+                # The booking row is locked and now() is fixed for the
+                # transaction, so only a cancellation committed between the two
+                # statements can get here.
+                return "event_cancelled"
+            return "started"
+    finally:
+        conn.close()
+
+
+def payment_request(booking_id):
+    """What the background call sends to Payment: (price_minor, currency, customer_email)."""
+    conn = connect_once()
+    try:
+        with conn, conn.cursor() as cur:
+            cur.execute("SELECT price_minor, currency, customer_email FROM bookings WHERE booking_id = %s",
+                        (booking_id,))
+            row = cur.fetchone()
+    finally:
+        conn.close()
+    if row is None:
+        raise LookupError(f"No booking {booking_id!r}")
+    return row
+
+
+def apply_payment_answer(booking_id, payment_status, payment_id):
+    """Apply Payment's answer to a payment_pending booking: row 5, 6 or 7 (contract section 4).
+
+    One transaction, lock order event row -> booking row -> seat row:
+    - paid, event not cancelled -> confirmed, seat booked, booking.confirmed
+    - paid, event cancelled -> refund_required, seat free, availability,
+      booking.cancelled (event_cancelled), refund.requested
+    - failed or refunded -> released, seat free, availability,
+      booking.cancelled (payment_failed)
+    payment_id is stored in every case. Returns 'confirmed', 'refund_required',
+    'released', or 'noop' (the booking was no longer payment_pending: nothing
+    written). Any error rolls back everything.
+    """
+    if payment_status not in PAYMENT_STATUSES:
+        raise ValueError(f"Unknown payment status {payment_status!r}")
+    conn = connect_once()
+    try:
+        with conn, conn.cursor() as cur:
+            cur.execute("SELECT event_id, seat_id FROM bookings WHERE booking_id = %s", (booking_id,))
+            row = cur.fetchone()
+            if row is None:
+                raise LookupError(f"No booking {booking_id!r}")
+            event_id, seat_id = row
+
+            # 1. The event row. Checkout refuses a booking without an event
+            # record, so the record must exist (no creation lock is needed).
+            if not _lock_event_row(cur, event_id):
+                raise LookupError(f"No event record for {event_id!r}")
+            cur.execute("SELECT status, title, starts_at FROM events WHERE event_id = %s", (event_id,))
+            event_status, title, starts_at = cur.fetchone()
+
+            if payment_status == "paid":
+                new_status = "refund_required" if event_status == "cancelled" else "confirmed"
+            else:
+                new_status = "released"
+
+            # 2. The booking row: the deciding conditional update (section 4a).
+            cur.execute(
+                """UPDATE bookings SET status = %s, payment_id = %s, updated_at = now()
+                   WHERE booking_id = %s AND status = 'payment_pending'
+                   RETURNING customer_email, customer_name""",
+                (new_status, payment_id, booking_id),
+            )
+            won = cur.fetchone()
+            if won is None:
+                return "noop"
+            customer_email, customer_name = won
+
+            # 3. The seat row, keyed on the booking; exactly one must change.
+            if new_status == "confirmed":
+                cur.execute(
+                    """UPDATE seats SET status = 'booked'
+                       WHERE event_id = %s AND seat_id = %s AND booking_ref = %s AND status = 'held'
+                       RETURNING label""",
+                    (event_id, seat_id, booking_id),
+                )
+            else:
+                cur.execute(
+                    """UPDATE seats SET status = 'free', booking_ref = NULL, customer_id = NULL, held_until = NULL
+                       WHERE event_id = %s AND seat_id = %s AND booking_ref = %s AND status = 'held'
+                       RETURNING label""",
+                    (event_id, seat_id, booking_id),
+                )
+            seat = cur.fetchone()
+            if seat is None:
+                raise LookupError(f"Seat {seat_id!r} is not held by booking {booking_id!r}")
+            event_title = title[:EVENT_TITLE_MAX]
+
+            # 4. The outbox rows, in the same transaction.
+            if new_status == "confirmed":
+                write_outbox(cur, BOOKING_CONFIRMED, {
+                    "booking_id": booking_id,
+                    "customer_email": customer_email,
+                    "customer_name": customer_name,
+                    "event_id": event_id,
+                    "event_title": event_title,
+                    "event_starts_at": starts_at,
+                    "seat_label": (seat[0] or seat_id)[:SEAT_LABEL_MAX],   # no label: use the seat ID
+                })
+                return new_status
+
+            write_availability_snapshot(cur, event_id)
+            write_outbox(cur, BOOKING_CANCELLED, {
+                "booking_id": booking_id,
+                "reason": "event_cancelled" if new_status == "refund_required" else "payment_failed",
+                "customer_email": customer_email,
+                "customer_name": customer_name,
+                "event_title": event_title,
+            })
+            if new_status == "refund_required":
+                write_outbox(cur, REFUND_REQUESTED, {
+                    "booking_id": booking_id,
+                    "payment_id": payment_id,
+                    "customer_email": customer_email,
+                })
+            return new_status
+    finally:
+        conn.close()
+
+
 # --- event.changed ------------------------------------------------------------
 
 EVENT_STATUSES = ("scheduled", "cancelled")

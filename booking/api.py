@@ -1,8 +1,9 @@
 """The HTTP endpoints of the Booking service."""
+import asyncio
 from typing import Annotated
 
 import psycopg2
-from fastapi import APIRouter, HTTPException, Query
+from fastapi import APIRouter, HTTPException, Query, Request
 from fastapi.responses import JSONResponse, Response
 from prometheus_client import CONTENT_TYPE_LATEST, generate_latest
 from pydantic import BaseModel, StringConstraints
@@ -29,6 +30,20 @@ class HoldRequest(BaseModel):
     customer_name: TextStr | None = None
 
 
+class CheckoutRequest(BaseModel):
+    customer_id: IdStr
+
+
+# db.start_checkout's refusals -> (HTTP status, error, message) (contract section 6).
+CHECKOUT_REFUSALS = {
+    "not_found": (404, "booking_not_found", "No such booking."),
+    "event_cancelled": (409, "event_cancelled", "This event has been cancelled."),
+    "not_checkoutable": (409, "not_checkoutable", "This booking can no longer be checked out."),
+    "breaker_open": (503, "payment_service_unavailable",
+                     "Payments are unavailable right now. Your seat is still reserved; please try again shortly."),
+}
+
+
 @router.get("/health")
 def health():
     return {"status": "ok"}
@@ -45,7 +60,9 @@ def ready():
             conn.close()
     except psycopg2.Error as error:
         raise HTTPException(503, "Booking database is unavailable") from error
-    return {"status": "ready", "capabilities": ["holds"]}
+    # Payment is deliberately not checked: holds work without it, and checkout
+    # answers 503 itself while the circuit breaker is open.
+    return {"status": "ready", "capabilities": ["holds", "checkout"]}
 
 
 @router.get("/metrics")
@@ -113,3 +130,25 @@ def get_booking(booking_id: IdStr, customer_id: Annotated[IdStr, Query()]):
             status_code=404,
         )
     return booking
+
+
+@router.post("/bookings/{booking_id}/checkout")
+async def checkout(booking_id: IdStr, req: CheckoutRequest, request: Request):
+    """Contract section 6. Replies 202 at once; Payment is called in the background.
+
+    async def, so the background task can be started on the event loop with
+    asyncio.create_task; the database work runs in a thread (asyncio.to_thread).
+    """
+    runner = request.app.state.checkout
+    try:
+        outcome = await asyncio.to_thread(
+            db.start_checkout, booking_id, req.customer_id, runner.breaker.accepts_checkout())
+    except psycopg2.Error as error:
+        raise HTTPException(503, "Booking database is unavailable") from error
+    metrics.CHECKOUTS.labels(outcome).inc()
+    if outcome == "started":
+        runner.start(booking_id)      # only after payment_pending was committed (section 4a)
+    if outcome in ("started", "repeat"):
+        return JSONResponse({"booking_id": booking_id, "booking_status": "payment_pending"}, status_code=202)
+    status, error, message = CHECKOUT_REFUSALS[outcome]
+    return JSONResponse({"error": error, "message": message}, status_code=status)
