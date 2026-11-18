@@ -3,7 +3,7 @@
 Owner: Erwan (Booking).
  
 Status labels:
-- IMPLEMENTED: exists in the code on master.
+- IMPLEMENTED: built and tested.
 - ACCEPTED: Booking accepts a teammate's proposal; becomes agreed when their
   document says so too.
 - PROPOSED: Booking's design, not yet built.
@@ -17,6 +17,8 @@ under "Deliberate breaking changes" (§14).
 - Field names: lowercase_with_underscores. Message types use dots and hyphens.
 - Times: offset-aware ISO 8601. `occurred_at` is UTC. Event times
   (`starts_at`) are passed through exactly as Catalogue sends them.
+- IMPLEMENTED: Booking's `occurred_at` comes from Booking's own clock, in
+  UTC. In `seat.availability-changed`, `available_seat_ids` is sorted.
 - Text inputs are trimmed; a field that is empty after trimming is invalid.
 - Length limits:
   - Booking rejects inputs over: IDs 64; `customer_email`, `customer_name` 255.
@@ -40,20 +42,30 @@ Exchange `events` (topic; routing key = message type). Booking consumes:
 Each queue: one attempt plus three retries (after 1, 2 and 4 s), then
 `<queue>.dlq`. An unparseable message goes straight to the DLQ.
  
-Booking's rules (PROPOSED):
+Booking's rules (IMPLEMENTED unless labelled):
 - Uses `shared/messaging/consumer.py`.
 - Decides what a message means by its `type`, never by a payload `status`
   field (`refund.failed` carries `status: "paid"`).
 - Records each consumed `message_id` in the same transaction as its effect,
   including when the effect is a no-op; a repeated `message_id` does nothing.
+- A bad `event.changed` (unknown `status`, invalid `event_version`, or a
+  missing required field) is retried, then dead-lettered. A missing `seats`
+  list counts as no seats. Any other message type on `booking.event-changes`
+  is logged and acknowledged.
 - Writes every outgoing message as an outbox row in the same transaction as
   the state change; a relay publishes afterwards (publish, then mark sent,
-  with publisher confirms).
-- A message about a `booking_id` Booking does not know is logged, counted in a
-  metric and acknowledged, not retried.
-- Requires Catalogue's messaging to be switched on in compose
-  (`CATALOGUE_MESSAGING_ENABLED=true`); otherwise Booking never receives
-  `event.changed`.
+  with publisher confirms). Holds never wait for the relay.
+- Outbox: the envelope is stored once and never changed. The relay polls
+  about every 0.25 s, takes up to 50 unsent rows, oldest first, and
+  publishes each with publisher confirms and mandatory delivery (5 s confirm
+  timeout), then marks it sent. A failed publish leaves the row unsent for a
+  later try. Delivery is at-least-once. One relay instance is assumed; a
+  second Booking replica would send duplicates.
+- PROPOSED: A message about a `booking_id` Booking does not know is logged,
+  counted in a metric and acknowledged, not retried.
+- Note: Catalogue's messaging is on by default in compose
+  (`CATALOGUE_MESSAGING_ENABLED=true`). If it is switched off, Booking never
+  receives `event.changed`.
 ## 4. States — PROPOSED
  
 Seat status (inventory): `free` | `held` | `booked`.
@@ -108,6 +120,11 @@ Notes:
   change the matching rows.
 - Row 2 commits BEFORE Payment is called. Payment is never called inside a
   database transaction, and no row lock is held during a Payment call.
+- Lock order (IMPLEMENTED for holds and `event.changed`): the per-event
+  creation lock, then the event row, then the seat rows, in every path that
+  changes seats of an event. A hold takes the creation lock only while the
+  event has no record; `event.changed` always takes it. Rows 4, 6, 7, 8 and
+  13 must follow this order (PROPOSED).
 - What shares one transaction ("processed `message_id`" applies only when a
   message triggered the row, not an HTTP reply or a timer):
 | Row(s) | In one transaction |
@@ -123,16 +140,17 @@ Notes:
 | 12 | booking conditional check (`status = 'refund_pending'`, e.g. increment `refund_attempts`), `refund.requested` outbox row |
 | 13 | event status/version, processed `message_id`; `UPDATE bookings … WHERE event_id = E AND status = 'held'` (any count); their seats → free; sequence; one availability outbox row; one `booking.cancelled` outbox row per released booking |
  
+- Row 1 is IMPLEMENTED except the booking INSERT (bookings are a later step).
 - Known risk: the per-event sequence lock (rows 1, 4, 6, 7, 8, 13) makes holds
-  on the same event queue behind each other. Measure it in the 500-buyer test
-  before relying on it.
+  on the same event queue behind each other. Holds on an event with a record
+  take the event lock even when they lose the seat. Measure it in the
+  500-buyer test before relying on it.
 ### 4b. Upgrade rule — PROPOSED
 On first start with the new schema, any seat `held` with no booking row (holds
 made by the current hold-only code) is set back to `free`.
  
 ## 5. POST /holds
-IMPLEMENTED (on master via 970258f, which imported 7996674 from
-booking/skeleton; see §13.5):
+IMPLEMENTED:
 Request: `event_id`, `seat_id`, `customer_id` (required, trimmed, non-empty).
 - 201 Seat held. `{ booking_ref, event_id, seat_id, status: "held" }`
 - 200 Seat already held by this same customer (a retry); same body,
@@ -140,21 +158,25 @@ Request: `event_id`, `seat_id`, `customer_id` (required, trimmed, non-empty).
 - 409 Held or booked by someone else, or already booked (even by this
   customer). `{ error: "seat_taken", message: "That seat was just taken.
   We've refreshed the map, pick another." }`
+- 409 Event cancelled. `{ error: "event_cancelled", message: "This event
+  has been cancelled." }` A cancelled event always gives this reply, never
+  201, 200, 404 or `seat_taken`. The cancelled check is part of the hold's
+  single conditional update.
 - 404 No such seat for this event.
   `{ error: "seat_not_found", message: "No such seat for this event." }`
 - 422 Missing, empty or invalid fields (FastAPI `detail` format).
 - 503 Any database error (FastAPI `detail` format).
 Also implemented: `GET /health`; `GET /ready` (checks the database, reports
 `capabilities: ["holds"]`); an optional demo seed (`BOOKING_DEMO_SEED=true`),
-which must be off once the `event.changed` consumer runs (§7).
+off by default; it must stay off while the `event.changed` consumer runs (§7).
+- A seat whose event has no record can still be held, and writes no
+  availability snapshot (§11).
 PROPOSED additions (additive unless noted in §14):
 - Optional request fields `customer_email`, `customer_name`. If absent,
   Booking stores `<customer_id>@example.test` and `customer_id`.
 - Response adds `booking_id` (same value as `booking_ref`) and
   `booking_status` (the booking's state from §4). `status` keeps meaning
   "this customer holds the seat" and stays `"held"`, because the UI checks it.
-- 409 `{ error: "event_cancelled", message }` when the event is cancelled.
-  The cancelled check is part of the hold's single conditional update.
 - The booking's price is fixed at hold time (§8).
 - Length limits from §1 (422 if exceeded; see §14).
 - `/ready` capabilities will add "checkout".
@@ -194,30 +216,37 @@ The page polls this. What it shows:
 ## 7. event.changed (consumed) — ACCEPTED (Catalogue's proposal)
 Payload as in `catalogue/examples/contracts/event-*.json`.
  
-Booking stores:
-- Per event: `event_id`, `event_version`, `status`, `title`, `starts_at`,
-  `timezone`, plus its own availability `sequence`.
+Booking stores (IMPLEMENTED):
+- Per event: `event_id`, `event_version`, `status`, `title`, `starts_at`
+  (stored exactly as Catalogue sends it), `timezone`, plus its own
+  availability `sequence`.
 - Per seat: `seat_id`, `section`, `label`.
-Rules (PROPOSED):
+Rules (IMPLEMENTED unless labelled):
 - Apply only an `event_version` newer than the stored one. Equal or older:
   do nothing (but record the `message_id`).
 - Any newer snapshot with status `scheduled` creates missing seats from
-  `seats[]`, and fills in a missing `label` or `section` on existing seats.
+  `seats[]`, and fills in a missing `label` or an empty `section` on
+  existing seats.
   It never changes a seat's status. This covers `created`, an `updated` that
   overtakes it, and seats left by the demo seed.
 - `updated` changes stored metadata only; held and booked seats keep their
   status. Seat-map changes after publication are out of scope (Catalogue
   excludes them too).
+- Cancelling an event Booking already knows writes no availability snapshot
+  until row 13 is built. An update that adds no seats writes none (§11).
 - `cancelled` is remembered even if it arrives first, so an older creation
-  cannot reopen inventory. Then: new holds and checkouts are refused; held
-  bookings are released (row 13); a payment in progress that succeeds is
-  refunded (row 6), one that fails is released as usual (row 7).
-- Confirmed bookings on a cancelled event keep their valid ticket and are not
-  refunded: OPEN (§13.2). The fix, if wanted, is row 6's refund path applied
+  cannot reopen inventory. Then new holds are refused (409 `event_cancelled`,
+  §5).
+- PROPOSED: after `cancelled`, checkouts are refused; held bookings are
+  released (row 13); a payment in progress that succeeds is refunded (row 6),
+  one that fails is released as usual (row 7).
+- OPEN: Confirmed bookings on a cancelled event keep their valid ticket and
+  are not refunded (§13.2). The fix, if wanted, is row 6's refund path applied
   to each confirmed booking on that event.
-- The demo seed (§5) must be off (`BOOKING_DEMO_SEED=false`) whenever this
-  consumer runs; it uses the same event IDs as Catalogue's seed. A seat with
-  no event record cannot be checked out (§6, check 4).
+- The demo seed (§5) is off by default (`BOOKING_DEMO_SEED=false`) and must
+  stay off whenever this consumer runs; it uses the same event IDs as
+  Catalogue's seed.
+- PROPOSED: A seat with no event record cannot be checked out (§6, check 4).
 ## 8. Payment (consumed API) — ACCEPTED (Payment's implementation)
 POST /payments
 `{ booking_id, amount (integer minor units), currency, customer_email }`
@@ -298,14 +327,21 @@ Payload exactly: `event_id`, `sequence`, `seats_remaining`,
 `available_seat_ids` (the full set of free seats). No other fields.
 `seats_remaining` equals the number of IDs.
  
-Rules (PROPOSED):
-- Published whenever an event's free set changes (§4 rows 1, 4, 6, 7, 8, 13),
-  and once when Booking first creates its record for an event from
-  `event.changed` (whether or not its seats already existed). Until then,
-  Catalogue shows availability as unknown.
-- `sequence` starts at 1 per event. It is incremented in the same transaction
-  as the seat change and the outbox row, and the snapshot is computed after
-  taking the sequence lock. It is never reset.
+Rules (IMPLEMENTED unless labelled):
+- A snapshot is written:
+  - on a successful hold on an event that has a record (§4 row 1);
+  - when Booking first creates its record for an event from `event.changed`
+    (whether or not its seats already existed); a cancelled-first event gets
+    a snapshot of its free seats, normally none;
+  - when a newer version adds seats.
+  Until the first snapshot, Catalogue shows availability as unknown.
+- PROPOSED: also whenever an event's free set changes in §4 rows 4, 6, 7, 8
+  and 13.
+- `sequence` starts at 1 per event; 0 means "no snapshot yet". It is
+  incremented in the same transaction as the seat change and the outbox row,
+  and the snapshot is computed after taking the sequence lock. It is never
+  reset.
+- On startup, each event with `sequence` 0 gets exactly one snapshot.
 - For a cancelled event the snapshot is published as normal; Catalogue keeps
   the event shown as cancelled.
 - Catalogue rejects (retries, then dead-letters) a snapshot for an event or
@@ -313,6 +349,10 @@ Rules (PROPOSED):
   Catalogue.
 - PROPOSED: a Booking database reset is supported only as a full stack reset
   (`docker compose down -v`).
+- Metrics: `booking_outbox_pending` (gauge: outbox rows not yet published),
+  `booking_outbox_published_total{type}` (rows the broker confirmed), and
+  `booking_messages_total{type, outcome}` (consumed messages; `outcome` is
+  `processed`, `retried` or `dead_lettered`).
 ## 12. Messages Booking publishes to Ticketing and Payment
 ACCEPTED: fields as Ticketing reads them today (`docs/messaging.md`,
 `notification/app/handlers.py`) and as Payment validates `refund.requested`
@@ -345,22 +385,24 @@ refund.requested
 3. Pricing owner (flat config price meanwhile).
 4. Gateway routes for checkout and status, the `checkout` capability, and UI
    for checkout, polling and the 503 (gateway owner).
-5. Merge `booking/skeleton` into master to link the hold's commit history.
+5. Withdrawn: a repository question, not part of the contract.
 6. A refund made directly in Payment on a confirmed booking: Booking ignores
    it, so the seat stays booked while Ticketing voids the ticket. Handle, or
    leave (the gateway does not expose Payment)?
 7. Ticketing: reword the `payments_unavailable` email
    (notification/app/emails.py:10), which currently says "please try again"
    although the customer may have been charged.
-8. Dev compose: `BOOKING_DEMO_SEED` defaults to on (docker-compose.dev.yml);
-   it must default to off once Booking's consumer runs (§7).
+8. RESOLVED: compose now defaults `BOOKING_DEMO_SEED` to off.
+9. Outbox cleanup: published rows are kept forever.
+10. Discovery's demo seeder publishes `event.changed` without `status`,
+    `timezone` or `seats`; Booking would dead-letter those (the seeder is off
+    by default). Discovery's owner to decide.
 ## 14. Deliberate breaking changes — PROPOSED
 - IDs longer than 64 characters are rejected with 422 (today they are
   accepted). Agreed by Booking's owner, because Ticketing and Payment cannot
   store them.
 ## 15. Tests that will change (booking/tests/test_integration.py)
-- Exact `hold_seat()` return tuples (lines 65, 86, 87) if its return value
-  changes.
-- Seat inserts without `label` or an event record (line 47, demo_seed.py:17)
-  if those become required.
-- `/ready` capabilities `['holds']` (line 104) when checkout is added.
+- Exact `hold_seat()` return tuples if its return value changes.
+- Seat inserts without `label` or an event record (in the tests and in the
+  demo seed) if those become required.
+- `/ready` capabilities `['holds']` when checkout is added.
