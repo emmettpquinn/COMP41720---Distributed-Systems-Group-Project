@@ -107,13 +107,23 @@ def write_availability_snapshot(cur, event_id):
 
 # --- Holds --------------------------------------------------------------------
 
-def hold_seat(event_id, seat_id, customer_id):
-    """Try to hold a seat. Returns (outcome, booking_ref).
+def hold_seat(event_id, seat_id, customer_id, customer_email=None, customer_name=None):
+    """Try to hold a seat. Returns (outcome, booking_id, booking_status).
 
     outcome is one of: 'held', 'already_yours', 'taken', 'not_found',
-    'event_cancelled'.
+    'event_cancelled'. booking_id (= the seat's booking_ref) and booking_status
+    are None unless outcome is 'held' or 'already_yours'.
+
+    A successful hold also creates the booking (contract section 4, row 1), in
+    the same transaction as the seat update and the snapshot. customer_email
+    and customer_name are optional; if absent, '<customer_id>@example.test' and
+    customer_id are stored (section 5).
     """
     new_ref = str(uuid.uuid4())
+    if customer_email is None:
+        customer_email = f"{customer_id}@example.test"
+    if customer_name is None:
+        customer_name = customer_id
     conn = connect_once()
     try:
         with conn, conn.cursor() as cur:
@@ -128,21 +138,35 @@ def hold_seat(event_id, seat_id, customer_id):
 
             # The ONE conditional update: it only succeeds if the seat is free right now
             # and its event is not cancelled. A seat with no event record can still be held.
+            # held_until uses the database clock (contract 4a), not this machine's.
             cur.execute(
                 """UPDATE seats
-                   SET status = 'held', booking_ref = %s, customer_id = %s
+                   SET status = 'held', booking_ref = %s, customer_id = %s,
+                       held_until = now() + make_interval(mins => %s)
                    WHERE event_id = %s AND seat_id = %s AND status = 'free'
                      AND NOT EXISTS (SELECT 1 FROM events
                                      WHERE events.event_id = seats.event_id
-                                       AND events.status = 'cancelled')""",
-                (new_ref, customer_id, event_id, seat_id),
+                                       AND events.status = 'cancelled')
+                   RETURNING held_until""",
+                (new_ref, customer_id, config.HOLD_MINUTES, event_id, seat_id),
             )
-            if cur.rowcount == 1:
-                # Contract 4a row 1: same transaction as the seat update. If this
-                # fails, the whole hold is rolled back.
+            won = cur.fetchone()
+            if won is not None:
+                # Contract 4a row 1: the booking, then the snapshot, in the same
+                # transaction as the seat update. If either fails, the whole hold
+                # is rolled back (seat free, no booking, no outbox row).
+                # The price is copied from config now and never recalculated (section 8).
+                cur.execute(
+                    """INSERT INTO bookings (booking_id, event_id, seat_id, customer_id,
+                                             customer_email, customer_name, price_minor,
+                                             currency, status, held_until)
+                       VALUES (%s, %s, %s, %s, %s, %s, %s, %s, 'held', %s)""",
+                    (new_ref, event_id, seat_id, customer_id, customer_email, customer_name,
+                     config.BOOKING_PRICE_MINOR, config.BOOKING_CURRENCY, won[0]),
+                )
                 if has_record:
                     write_availability_snapshot(cur, event_id)
-                return "held", new_ref
+                return "held", new_ref, "held"
 
             # The update changed nothing. Look things up ONLY to choose the reply.
             cur.execute(
@@ -150,20 +174,56 @@ def hold_seat(event_id, seat_id, customer_id):
                 (event_id,),
             )
             if cur.fetchone() is not None:
-                return "event_cancelled", None
+                return "event_cancelled", None, None
             cur.execute(
-                "SELECT status, customer_id, booking_ref FROM seats WHERE event_id = %s AND seat_id = %s",
+                """SELECT seats.status, seats.customer_id, seats.booking_ref, bookings.status
+                   FROM seats LEFT JOIN bookings ON bookings.booking_id = seats.booking_ref
+                   WHERE seats.event_id = %s AND seats.seat_id = %s""",
                 (event_id, seat_id),
             )
             row = cur.fetchone()
             if row is None:
-                return "not_found", None
-            status, holder, ref = row
-            if status == "held" and holder == customer_id:
-                return "already_yours", ref
-            return "taken", None
+                return "not_found", None, None
+            status, holder, ref, booking_status = row
+            # A retry returns the existing booking. A held seat always has one
+            # (the startup upgrade rule frees any that do not); if one ever
+            # does not, it is treated as taken rather than replying without a
+            # booking.
+            if status == "held" and holder == customer_id and booking_status is not None:
+                return "already_yours", ref, booking_status
+            return "taken", None, None
     finally:
         conn.close()
+
+
+def get_booking(booking_id, customer_id):
+    """One booking, only if it belongs to customer_id (contract section 6).
+
+    Returns a dict, or None for an unknown booking AND for a customer_id that
+    does not match, so the caller cannot tell the two apart.
+    """
+    conn = connect_once()
+    try:
+        with conn, conn.cursor() as cur:
+            cur.execute(
+                """SELECT booking_id, event_id, seat_id, status, held_until, payment_id
+                   FROM bookings WHERE booking_id = %s AND customer_id = %s""",
+                (booking_id, customer_id),
+            )
+            row = cur.fetchone()
+    finally:
+        conn.close()
+    if row is None:
+        return None
+    booking_id, event_id, seat_id, status, held_until, payment_id = row
+    return {
+        "booking_id": booking_id,
+        "event_id": event_id,
+        "seat_id": seat_id,
+        "booking_status": status,
+        "held_until": held_until.isoformat(),   # TIMESTAMPTZ: offset-aware
+        "payment_id": payment_id,
+    }
 
 
 # --- event.changed ------------------------------------------------------------
@@ -250,7 +310,51 @@ def apply_event_changed(message_id, payload):
         conn.close()
 
 
-# --- Startup backfill ---------------------------------------------------------
+# --- Startup: upgrade rule and backfill ---------------------------------------
+
+# A held seat whose booking_ref has no booking row (made by the hold-only code).
+_HELD_WITHOUT_BOOKING = """status = 'held' AND NOT EXISTS
+    (SELECT 1 FROM bookings WHERE bookings.booking_id = seats.booking_ref)"""
+
+
+def free_holds_without_booking():
+    """Contract section 4b: set every held seat with no booking row back to free.
+
+    Runs on startup, before backfill_availability. One transaction per event,
+    in the hold's lock order (creation lock if the event has no record, then the
+    event row, then its seats). Each event with a record that had seats freed
+    gets ONE availability snapshot in the same transaction; an event without a
+    record gets none (section 11). A second run frees nothing.
+    Returns (seats freed, snapshots written).
+    """
+    conn = connect()
+    try:
+        with conn, conn.cursor() as cur:
+            cur.execute(f"SELECT DISTINCT event_id FROM seats WHERE {_HELD_WITHOUT_BOOKING} ORDER BY event_id")
+            event_ids = [event_id for (event_id,) in cur.fetchall()]
+        freed = snapshots = 0
+        for event_id in event_ids:
+            with conn, conn.cursor() as cur:
+                has_record = _lock_event_row(cur, event_id)
+                if not has_record:
+                    _lock_event_creation(cur, event_id)
+                    has_record = _lock_event_row(cur, event_id)
+                # Re-checked under the lock, so only seats still in that state change.
+                cur.execute(
+                    f"""UPDATE seats
+                        SET status = 'free', booking_ref = NULL, customer_id = NULL, held_until = NULL
+                        WHERE event_id = %s AND {_HELD_WITHOUT_BOOKING}""",
+                    (event_id,),
+                )
+                count = cur.rowcount
+                if count and has_record:
+                    write_availability_snapshot(cur, event_id)
+                    snapshots += 1
+                freed += count
+        return freed, snapshots
+    finally:
+        conn.close()
+
 
 def backfill_availability():
     """Give every event that has never had a snapshot (sequence 0) exactly one.

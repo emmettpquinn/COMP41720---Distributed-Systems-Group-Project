@@ -26,6 +26,13 @@ async def lifespan(app):
     if os.getenv("BOOKING_DEMO_SEED", "false").lower() == "true":
         from demo_seed import seed
         seed()
+    # Contract section 4b: seats held by the old hold-only code have no booking;
+    # free them first, so the backfill below sees the right free set.
+    freed, upgrade_snapshots = db.free_holds_without_booking()
+    logging.getLogger("booking").info(
+        "Upgrade rule: freed %d held seat(s) without a booking (%d availability snapshot(s))",
+        freed, upgrade_snapshots,
+    )
     # Contract section 11: every event that has never had a snapshot gets one
     # (written to the outbox; the relay publishes it). A second start writes none.
     written = db.backfill_availability()
