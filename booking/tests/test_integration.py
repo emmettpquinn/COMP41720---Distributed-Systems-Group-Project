@@ -3,6 +3,7 @@
 import asyncio
 import dataclasses
 from concurrent.futures import ThreadPoolExecutor
+from datetime import datetime, timedelta
 import json
 import os
 from pathlib import Path
@@ -18,6 +19,7 @@ from prometheus_client import REGISTRY
 import db
 import demo_seed
 import events
+import outbox
 from main import app
 
 # Catalogue's real message examples: <repo>/catalogue/examples/contracts. In the
@@ -253,6 +255,204 @@ class BookingIntegrationTests(unittest.TestCase):
         self.assertEqual(self.seat_rows(),[('A1','A',None,'held','ref-1','buyer-1',None)])
         self.assertEqual(self.query('SELECT count(*) FROM events')[0][0],0)
         self.assertEqual(self.query('SELECT count(*) FROM processed_messages')[0][0],0)
+
+    # --- Outbox and seat.availability-changed (contract sections 3, 4a and 11) ---
+
+    def snapshots(self,event_id='event-demo-001'):
+        """Availability envelopes in the outbox for one event, oldest sequence first."""
+        rows=self.query("SELECT envelope FROM outbox WHERE type='seat.availability-changed'")
+        found=[json.loads(text) for (text,) in rows]
+        return sorted((e for e in found if e['payload']['event_id']==event_id),key=lambda e:e['payload']['sequence'])
+
+    def outbox_count(self):
+        return self.query('SELECT count(*) FROM outbox')[0][0]
+
+    def sequence(self,event_id='event-demo-001'):
+        return self.query('SELECT sequence FROM events WHERE event_id=%s',(event_id,))[0][0]
+
+    def free_seats(self,event_id):
+        return sorted(r[0] for r in self.query("SELECT seat_id FROM seats WHERE event_id=%s AND status='free'",(event_id,)))
+
+    def big_event(self,event_id='event-test-many',seats=25,version=1,extra=()):
+        """A Catalogue-style created payload with many seats (test IDs only)."""
+        payload=example('created')['payload']|{'event_id':event_id,'event_version':version}
+        payload['seats']=[{'seat_id':f'T{n:02d}','section':'T','label':f'T{n:02d}'} for n in range(1,seats+1)]
+        payload['seats']+=[{'seat_id':seat,'section':'T','label':seat} for seat in extra]
+        return payload
+
+    def assert_valid_envelope(self,envelope):
+        """What Catalogue's AvailabilityMessage accepts (catalogue/app/schemas.py)."""
+        self.assertEqual(set(envelope),{'message_id','type','occurred_at','version','producer','payload'})
+        uuid.UUID(envelope['message_id'])
+        self.assertEqual(envelope['type'],'seat.availability-changed')
+        self.assertEqual(envelope['version'],1)
+        self.assertEqual(envelope['producer'],'booking')
+        self.assertEqual(datetime.fromisoformat(envelope['occurred_at']).utcoffset(),timedelta(0))
+        payload=envelope['payload']
+        self.assertEqual(set(payload),{'event_id','sequence','seats_remaining','available_seat_ids'})
+        self.assertIsInstance(payload['sequence'],int);self.assertGreater(payload['sequence'],0)
+        ids=payload['available_seat_ids']
+        self.assertEqual(len(set(ids)),len(ids))
+        self.assertEqual(payload['seats_remaining'],len(ids))
+        self.assertEqual(ids,sorted(ids))
+
+    def test_held_hold_writes_one_complete_snapshot(self):
+        self.apply('created')
+        before=self.outbox_count()
+        result=self.client().post('/holds',json={'event_id':'event-demo-001','seat_id':'A1','customer_id':'buyer-test'})
+        self.assertEqual(result.status_code,201)
+        self.assertEqual(self.outbox_count(),before+1)
+        latest=self.snapshots()[-1]
+        self.assert_valid_envelope(latest)
+        self.assertEqual(latest['payload'],{'event_id':'event-demo-001','sequence':2,'seats_remaining':1,'available_seat_ids':['A2']})
+        self.assertEqual(self.sequence(),2)
+        self.assertEqual(self.query('SELECT published_at FROM outbox WHERE message_id=%s',(latest['message_id'],)),[(None,)])
+
+    def test_other_hold_outcomes_write_nothing(self):
+        self.apply('created')
+        client=self.client()
+        body={'event_id':'event-demo-001','seat_id':'A1','customer_id':'buyer-test-1'}
+        self.assertEqual(client.post('/holds',json=body).status_code,201)
+        count=self.outbox_count();seq=self.sequence()
+        self.assertEqual(client.post('/holds',json=body).status_code,200)                                # retry
+        self.assertEqual(client.post('/holds',json=body|{'customer_id':'buyer-test-2'}).status_code,409) # taken
+        self.assertEqual(client.post('/holds',json=body|{'seat_id':'Z9'}).status_code,404)               # not found
+        self.seed_seat()  # race-event has no event record
+        self.assertEqual(client.post('/holds',json={'event_id':'race-event','seat_id':'A1','customer_id':'buyer-test'}).status_code,201)
+        self.assertEqual((self.outbox_count(),self.sequence()),(count,seq))
+        self.apply('cancelled')  # newer version of an existing event: no new free seats, no snapshot
+        self.assertEqual(self.outbox_count(),count)
+        self.assertEqual(client.post('/holds',json=body|{'seat_id':'A2'}).status_code,409)               # cancelled
+        self.assertEqual((self.outbox_count(),self.sequence()),(count,seq))
+
+    def test_failed_outbox_insert_rolls_back_the_hold(self):
+        self.apply('created')
+        self.query("""CREATE FUNCTION fail_outbox_insert() RETURNS trigger LANGUAGE plpgsql AS
+                      $$ BEGIN RAISE EXCEPTION 'simulated outbox failure'; END $$""")
+        self.query('CREATE TRIGGER fail_outbox BEFORE INSERT ON outbox FOR EACH ROW EXECUTE FUNCTION fail_outbox_insert()')
+        with self.assertRaises(psycopg2.Error):
+            db.hold_seat('event-demo-001','A1','buyer-test')
+        result=self.client().post('/holds',json={'event_id':'event-demo-001','seat_id':'A1','customer_id':'buyer-test'})
+        self.assertEqual(result.status_code,503)
+        self.assertEqual(self.seat_rows()[0][3:6],('free',None,None))
+        self.assertEqual(self.sequence(),1)
+        self.assertEqual(self.outbox_count(),1)  # only the creation snapshot
+        self.query('DROP TRIGGER fail_outbox ON outbox')
+        self.assertEqual(db.hold_seat('event-demo-001','A1','buyer-test')[0],'held')
+        self.assertEqual(self.sequence(),2)
+
+    def test_concurrent_holds_get_gapless_sequences(self):
+        db.apply_event_changed(str(uuid.uuid4()),self.big_event())
+        k=len(self.snapshots('event-test-many'))
+        self.assertEqual(k,1)
+        with ThreadPoolExecutor(max_workers=20) as executor:
+            results=list(executor.map(lambda n:db.hold_seat('event-test-many',f'T{n:02d}',f'buyer-test-{n}'),range(1,21)))
+        self.assertEqual([outcome for outcome,ref in results],['held']*20)
+        found=self.snapshots('event-test-many')
+        self.assertEqual([e['payload']['sequence'] for e in found],list(range(1,21+k)))
+        self.assertEqual(self.sequence('event-test-many'),20+k)
+        self.assertEqual(found[-1]['payload']['available_seat_ids'],self.free_seats('event-test-many'))
+        self.assertEqual(found[-1]['payload']['seats_remaining'],5)
+        for envelope in found:
+            self.assert_valid_envelope(envelope)
+
+    def test_concurrent_holds_and_event_changed_do_not_deadlock(self):
+        db.apply_event_changed(str(uuid.uuid4()),self.big_event())
+        holds=[lambda n=n:db.hold_seat('event-test-many',f'T{n:02d}',f'buyer-test-{n}') for n in range(1,21)]
+        # Newer versions that each add a seat, so they write snapshots too.
+        changes=[lambda v=v:db.apply_event_changed(str(uuid.uuid4()),self.big_event(version=v,extra=[f'X{v}'])) for v in range(2,6)]
+        jobs=holds[:10]+changes+holds[10:]
+        with ThreadPoolExecutor(max_workers=len(jobs)) as executor:
+            futures=[executor.submit(job) for job in jobs]
+            results=[future.result(timeout=30) for future in futures]  # a deadlock error would raise here
+        self.assertEqual([r[0] for r in results[:10]+results[14:]],['held']*20)
+        found=self.snapshots('event-test-many')
+        sequences=[e['payload']['sequence'] for e in found]
+        self.assertEqual(sequences,list(range(1,len(found)+1)))
+        self.assertEqual(found[-1]['payload']['available_seat_ids'],self.free_seats('event-test-many'))
+
+    def test_first_event_changed_writes_one_snapshot(self):
+        self.assertEqual(self.apply('created'),'applied')
+        found=self.snapshots()
+        self.assertEqual(len(found),1)
+        self.assert_valid_envelope(found[0])
+        self.assertEqual(found[0]['payload'],{'event_id':'event-demo-001','sequence':1,'seats_remaining':2,'available_seat_ids':['A1','A2']})
+        self.assertEqual(self.apply('created'),'duplicate')                       # same message again
+        self.assertEqual(self.apply('created',message_id=str(uuid.uuid4())),'stale')
+        self.assertEqual(self.apply('updated'),'applied')                         # newer, no new seats
+        self.assertEqual(len(self.snapshots()),1)
+
+    def test_cancelled_first_event_writes_snapshot_with_no_seats(self):
+        self.assertEqual(self.apply('cancelled'),'applied')
+        found=self.snapshots()
+        self.assertEqual(len(found),1)
+        self.assertEqual(found[0]['payload'],{'event_id':'event-demo-001','sequence':1,'seats_remaining':0,'available_seat_ids':[]})
+        self.assertEqual(self.apply('created'),'stale')
+        self.assertEqual(len(self.snapshots()),1)
+
+    def test_newer_version_with_new_seats_writes_snapshot(self):
+        db.apply_event_changed(str(uuid.uuid4()),self.big_event(seats=2))
+        db.apply_event_changed(str(uuid.uuid4()),self.big_event(seats=2,version=2,extra=['X1']))
+        found=self.snapshots('event-test-many')
+        self.assertEqual([e['payload']['sequence'] for e in found],[1,2])
+        self.assertEqual(found[-1]['payload']['available_seat_ids'],['T01','T02','X1'])
+
+    def test_backfill_gives_old_events_one_snapshot(self):
+        # An event stored before this step (no sequence column yet) with one held seat.
+        self.query('DROP TABLE events')
+        self.query("""CREATE TABLE events (event_id TEXT PRIMARY KEY, event_version BIGINT NOT NULL,
+                      status TEXT NOT NULL, title TEXT NOT NULL, starts_at TEXT NOT NULL, timezone TEXT NOT NULL)""")
+        self.query("INSERT INTO events VALUES ('event-test-old',1,'scheduled','Old','2026-11-27T19:30:00+00:00','Europe/Dublin')")
+        self.query("INSERT INTO seats (event_id,seat_id,section,label) VALUES ('event-test-old','A1','A','A1'),('event-test-old','A2','A','A2')")
+        self.query("UPDATE seats SET status='held',booking_ref='ref-test',customer_id='buyer-test' WHERE seat_id='A1'")
+        db.init_schema()
+        self.assertEqual(self.sequence('event-test-old'),0)
+        self.assertEqual(db.backfill_availability(),1)
+        self.assertEqual(db.backfill_availability(),0)
+        found=self.snapshots('event-test-old')
+        self.assertEqual(len(found),1)
+        self.assertEqual(found[0]['payload'],{'event_id':'event-test-old','sequence':1,'seats_remaining':1,'available_seat_ids':['A2']})
+        self.client()  # startup runs the backfill too: still exactly one
+        self.assertEqual(len(self.snapshots('event-test-old')),1)
+
+    def test_startup_runs_backfill(self):
+        self.query("INSERT INTO events (event_id,event_version,status,title,starts_at,timezone) "
+                   "VALUES ('event-test-start',1,'scheduled','Start','2026-11-27T19:30:00+00:00','Europe/Dublin')")
+        self.client()
+        self.assertEqual([e['payload']['sequence'] for e in self.snapshots('event-test-start')],[1])
+
+    def test_relay_marks_published_only_after_publish_succeeds(self):
+        self.apply('created')
+        stored=self.query('SELECT message_id,envelope FROM outbox')[0]
+
+        async def fail(text):
+            raise ConnectionError('broker down')
+        with self.assertRaises(outbox.PublishFailed):
+            asyncio.run(outbox.dispatch_once(fail))
+        self.assertEqual(self.query('SELECT published_at FROM outbox'),[(None,)])
+        asyncio.run(outbox.refresh_pending())
+        self.assertEqual(REGISTRY.get_sample_value('booking_outbox_pending'),1)
+
+        sent=[]
+        async def succeed(text):
+            sent.append(text)
+        labels={'type':'seat.availability-changed'}
+        before=REGISTRY.get_sample_value('booking_outbox_published_total',labels) or 0
+        self.assertEqual(asyncio.run(outbox.dispatch_once(succeed)),1)
+        self.assertEqual(sent,[stored[1]])  # the stored body, unchanged
+        self.assertIsNotNone(self.query('SELECT published_at FROM outbox')[0][0])
+        self.assertEqual(REGISTRY.get_sample_value('booking_outbox_published_total',labels),before+1)
+        self.assertEqual(asyncio.run(outbox.dispatch_once(succeed)),0)  # nothing is sent twice
+        asyncio.run(outbox.refresh_pending())
+        self.assertEqual(REGISTRY.get_sample_value('booking_outbox_pending'),0)
+
+    def test_race_on_event_with_record_has_one_winner_and_one_snapshot(self):
+        self.apply('created')
+        with ThreadPoolExecutor(max_workers=20) as executor:
+            results=list(executor.map(lambda n:db.hold_seat('event-demo-001','A1',f'buyer-test-{n}'),range(20)))
+        self.assertEqual(sum(outcome=='held' for outcome,ref in results),1)
+        self.assertEqual(sum(outcome=='taken' for outcome,ref in results),19)
+        self.assertEqual([e['payload']['sequence'] for e in self.snapshots()],[1,2])
 
 
 def events_envelope(name):

@@ -1,5 +1,5 @@
 """Prometheus metrics for the Booking service (same style as payment/app/metrics.py)."""
-from prometheus_client import Counter, Histogram
+from prometheus_client import Counter, Gauge, Histogram
 
 
 REQUESTS = Counter("booking_http_requests_total", "HTTP requests", ["method", "path", "status"])
@@ -9,6 +9,10 @@ HOLDS = Counter("booking_holds_total", "Hold requests by outcome", ["outcome"])
 # Consumed messages, from shared run_consumer's on_outcome hook
 # (outcome: processed, retried, dead_lettered).
 MESSAGES = Counter("booking_messages_total", "Consumed messages by type and outcome", ["type", "outcome"])
+# Transactional outbox (outbox.py): rows not yet confirmed by RabbitMQ, and
+# rows the broker confirmed, by message type.
+OUTBOX_PENDING = Gauge("booking_outbox_pending", "Outbox rows not yet published")
+OUTBOX_PUBLISHED = Counter("booking_outbox_published_total", "Outbox rows published (broker confirmed)", ["type"])
 
 # db.hold_seat's outcome -> the label to show on the dashboard.
 HOLD_LABELS = {"held": "held", "already_yours": "retry", "taken": "taken", "not_found": "not_found",

@@ -14,6 +14,7 @@ import config
 import db
 import events
 import metrics
+import outbox
 from api import router
 
 logging.basicConfig(level=logging.INFO, format="%(levelname)s %(name)s: %(message)s")
@@ -25,17 +26,25 @@ async def lifespan(app):
     if os.getenv("BOOKING_DEMO_SEED", "false").lower() == "true":
         from demo_seed import seed
         seed()
-    task = None
+    # Contract section 11: every event that has never had a snapshot gets one
+    # (written to the outbox; the relay publishes it). A second start writes none.
+    written = db.backfill_availability()
+    if written:
+        logging.getLogger("booking").info("Backfilled availability for %d event(s)", written)
+    await outbox.refresh_pending()
+    tasks = []
     if config.AMQP_URL:
         # Fail startup on a missing shared package, rather than hide it in a task.
         import messaging  # noqa: F401
-        # Runs in the background: holds and /ready never wait for RabbitMQ.
-        task = asyncio.create_task(events.run(config.AMQP_URL))
+        # Both run in the background: holds and /ready never wait for RabbitMQ.
+        tasks.append(asyncio.create_task(events.run(config.AMQP_URL)))
+        tasks.append(asyncio.create_task(outbox.run(config.AMQP_URL)))
     try:
         yield
     finally:
-        if task:
+        for task in tasks:
             task.cancel()
+        for task in tasks:
             with contextlib.suppress(asyncio.CancelledError):
                 await task
 
