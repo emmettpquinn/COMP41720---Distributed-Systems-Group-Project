@@ -5,6 +5,15 @@ The implementation is now imported into `feature/catalogue-integration`; the
 source branch and shared envelope/topology are unchanged. This review closes the
 code-inspection part of INT02. Booking acceptance remains pending.
 
+## Integration update (2026-11-19)
+
+The review above and remaining dated observations below describe the earlier
+import. Booking now implements the accepted asynchronous checkout wrapper,
+Payment result handling, safety net and refunds. Real-service checks passed
+purchase, decline and late-success refund. The current gateway/UI exposes Booking
+checkout/status, not direct Payment routes. See [current Booking contract](booking.md)
+and [integration evidence](../integration-development.md#booking-integration-verification-2026-11-19).
+
 ## Implemented interface
 
 - `POST /payments`: stable `booking_id`, positive integer minor-unit `amount`,

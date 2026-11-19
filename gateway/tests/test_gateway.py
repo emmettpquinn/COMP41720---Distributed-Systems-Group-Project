@@ -1,6 +1,9 @@
 """Exercise the gateway's public boundary without running peer services."""
 
 import unittest
+import os
+import json
+from unittest.mock import patch
 
 import httpx
 from fastapi.testclient import TestClient
@@ -129,3 +132,68 @@ class DiscoveryGatewayTests(unittest.TestCase):
         response=self.client(handler,search_enabled=True).get('/api/discovery/search?q=music')
         self.assertEqual(response.status_code,504)
         self.assertNotIn('reservation',response.json()['detail'])
+
+
+class CheckoutGatewayTests(unittest.TestCase):
+    client = GatewayTests.client
+
+    def test_checkout_and_status_are_explicit_opt_in_booking_routes(self):
+        seen = []
+        def handler(request):
+            seen.append(request)
+            return httpx.Response(202 if request.method == 'POST' else 200,
+                                  json={'booking_id':'test-booking','status':'payment_pending'})
+        client = self.client(handler, holds_enabled=True, checkout_enabled=True)
+        self.assertTrue(client.get('/api/capabilities').json()['checkout'])
+        self.assertEqual(client.post('/api/booking/bookings/test-booking/checkout', json={'customer_id':'synthetic-owner'}).status_code, 202)
+        self.assertEqual(json.loads(seen[0].content), {'customer_id':'synthetic-owner'})
+        self.assertEqual(client.get('/api/booking/bookings/test-booking?customer_id=synthetic-owner').status_code, 200)
+        self.assertEqual([(r.method, str(r.url)) for r in seen], [
+            ('POST','http://booking:8000/bookings/test-booking/checkout'),
+            ('GET','http://booking:8000/bookings/test-booking?customer_id=synthetic-owner')])
+        self.assertEqual(client.get('/api/booking/bookings/test-booking/checkout').status_code, 405)
+        self.assertEqual(client.post('/api/booking/bookings/test-booking', json={}).status_code, 405)
+        self.assertEqual(client.post('/api/payment/payments', json={}).status_code, 404)
+        self.assertEqual(len(seen), 2)
+
+    def test_disabled_checkout_never_contacts_booking_but_holds_still_work(self):
+        seen = []
+        def handler(request):
+            seen.append(request)
+            return httpx.Response(201, json={'status':'held'})
+        client = self.client(handler, holds_enabled=True)
+        self.assertFalse(client.get('/api/capabilities').json()['checkout'])
+        self.assertEqual(client.post('/api/booking/bookings/test-booking/checkout', json={}).status_code, 503)
+        self.assertEqual(client.get('/api/booking/bookings/test-booking').status_code, 503)
+        self.assertEqual(seen, [])
+        self.assertEqual(client.post('/api/booking/holds', json={}).status_code, 201)
+        self.assertEqual(len(seen), 1)
+
+    def test_checkout_timeout_is_unknown_and_post_is_not_retried(self):
+        seen = []
+        def handler(request):
+            seen.append(request)
+            raise httpx.ReadTimeout('synthetic timeout', request=request)
+        client = self.client(handler, holds_enabled=True, checkout_enabled=True)
+        response = client.post('/api/booking/bookings/test-booking/checkout', json={})
+        self.assertEqual(response.status_code, 504)
+        self.assertIn('unknown', response.json()['detail'])
+        self.assertIn('booking status', response.json()['detail'])
+        self.assertEqual(len(seen), 1)
+
+    def test_payment_unavailable_body_survives_for_browser_retry_decision(self):
+        body = {'error':'payment_service_unavailable'}
+        client = self.client(lambda request: httpx.Response(503, json=body),
+                             holds_enabled=True, checkout_enabled=True)
+        response = client.post('/api/booking/bookings/test-booking/checkout', json={})
+        self.assertEqual(response.status_code, 503)
+        self.assertEqual(response.json(), body)
+
+    def test_checkout_flag_validation_and_default(self):
+        with patch.dict(os.environ, {}, clear=True):
+            self.assertFalse(Settings.from_env().checkout_enabled)
+        with patch.dict(os.environ, {'BOOKING_CHECKOUT_ENABLED':'yes'}, clear=True):
+            with self.assertRaises(ValueError): Settings.from_env()
+        with self.assertRaises(ValueError): Settings(checkout_enabled=True)
+        with patch.dict(os.environ, {'BOOKING_CHECKOUT_ENABLED':'true','BOOKING_HOLDS_ENABLED':'true'}, clear=True):
+            self.assertTrue(Settings.from_env().checkout_enabled)

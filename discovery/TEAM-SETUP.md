@@ -21,26 +21,36 @@ To stop this project while retaining its data:
 docker compose -p discovery-real -f discovery/compose.standalone.yml -f discovery/compose.real-model.yml -f discovery/compose.monitoring.yml stop
 ```
 
-## Connect Catalogue
+## Integrated Catalogue setup on this branch
 
-This branch contains Discovery, not a merge of all team branches. After combining it with Catalogue commit `7b9524c` or a reviewed successor, run:
+The base Compose file now includes real Discovery with a private pgvector DB and
+an explicit HTTP model simulator. Booking also runs from the main Compose file;
+the development overlay is retained for compatibility. Start the integrated stack with:
 
-```powershell
-$env:CATALOGUE_MESSAGING_ENABLED = 'true'
-docker compose -f docker-compose.yml -f docker-compose.discovery.yml up --build -d
+```sh
+CATALOGUE_MESSAGING_ENABLED=true docker compose -f docker-compose.yml -f docker-compose.dev.yml -f docker-compose.monitoring.yml up -d --build --wait --wait-timeout 240
 ```
 
-Catalogue: port 8001. Discovery: port 8003. Both use the shared RabbitMQ. Do not add the health-only Discovery shell from `docker-compose.dev.yml`. Do not enable the optional `demo-data` profile for a real Catalogue test. The independent stack uses port 8004, which can conflict with the group's Payment mapping; stop the independent stack before starting the whole group.
+Catalogue is on port 8001, Discovery on 8003. The independent demo above uses 8004,
+which conflicts with integrated Payment; keep the projects/ports separate. The
+shared gateway/browser and monitoring now include Discovery. Default simulation
+is explicitly labelled and does not run a learned model. For real Ollama, add the
+root `docker-compose.ollama.yml` overlay on a fresh project or build a new index
+version for existing data; do not delete volumes to switch model identity.
 
-Payloads use `change` (created/updated/cancelled); legacy demo `action` remains supported. Conflicting action/change/status is rejected. Duplicate messages and older event versions cannot overwrite newer state. Contracts: `contracts/event.changed.schema.json` and `contracts/openapi.json`.
-
-Pending agreement: Discovery permits titles up to 500 characters, descriptions up to 8000, 50 tags and 200 characters per tag. Catalogue currently accepts broader lengths. Search phrase timezone defaults to Europe/Dublin; event timestamps must carry offsets. Venue and seats are not used for ranking.
+Payloads use `change` (created/updated/cancelled); legacy demo `action` remains
+supported. Conflicting action/change/status is rejected. Catalogue inputs now
+match the consumer's title/description/tag limits; existing historical oversized
+envelopes are not rewritten. Booking has accepted the Catalogue event and
+availability contracts and now consumes the shared event messages.
+See [integration details](../docs/contracts/discovery-integration.md).
 
 ## Frontend and monitoring
 
-Call GET `/search?q=...` or GET `/events/{event_id}/similar`. Render the returned `label`, particularly `Showing keyword results`, and retain `mode`/`fallback_reason` for diagnostics. No browser gateway integration is included here.
+Call GET `/search?q=...` or GET `/events/{event_id}/similar`. Render the returned `label`, particularly `Showing keyword results`, and retain `mode`/`fallback_reason` for diagnostics. The root gateway/UI integrates these read routes and their labels.
 
-Metrics are exposed at `/metrics`; Grafana panels and scrape configuration live in `monitoring/`. The temporary group overlay exposes Discovery Grafana on 3003 and Prometheus on 9093. Coordinate shared monitoring with the group.
+Metrics are exposed at `/metrics`; Grafana panels and scrape configuration live in `monitoring/`. The root monitoring overlay provisions Discovery beside the existing dashboards
+and scrapes the integrated service; independent monitoring remains separate.
 
 Use one API worker: the four-call bulkhead and circuit breaker are process-local. The default Ollama timeout is 1.5 seconds. Admin index routes require `X-Admin-Token`; the Compose default is a local development token, not a deployment secret.
 
@@ -67,3 +77,6 @@ This creates a unique synthetic event through Catalogue, checks its visibility a
 ## Verified scope on 16 November 2026
 
 All 46 tests passed against a separate PostgreSQL test database. A live Catalogue 7b9524c -> RabbitMQ -> Discovery create/update/cancel check passed in an isolated checkout using simulated embeddings. That integration check shared one disposable PostgreSQL database with distinct service tables; it does not establish the intended database isolation or full group startup. Earlier independent tests used real Ollama with synthetic messages. A combined real-Catalogue/real-Ollama rehearsal, shared frontend and agreement on payload limits remain team integration work.
+
+Integration verification on 2026-11-17 is documented in the root runbook; the
+upstream 16 November observations above retain their original scope.
