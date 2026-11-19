@@ -2246,6 +2246,250 @@ class BookingIntegrationTests(unittest.TestCase):
         self.assertEqual(self.booking_status(booking_id),'confirmed')
         self.assertEqual(self.net_outcome('error'),errors+1)
 
+    # --- Refund recovery command (contract section 4 row 12, section 10; step 7c) ---
+
+    def refund_pending_bookings(self,count=1):
+        """count bookings in refund_pending on event-test-many: paid after the event was
+        cancelled (row 6), then Payment rejected the refund (refund.failed, row 11)."""
+        booking_ids=[self.pending_booking(seat=f'T{n:02d}',customer=f'buyer-test-{n}') for n in range(1,count+1)]
+        db.apply_event_changed(str(uuid.uuid4()),self.big_event(version=2)|{'status':'cancelled'})
+        for booking_id in booking_ids:
+            self.assertEqual(db.apply_payment_answer(booking_id,'paid','pay-test-'+booking_id[:8]),'refund_required')
+            self.consume(payment_envelope('refund.failed',booking_id,'paid'))
+            self.assertEqual(self.booking_status(booking_id),'refund_pending')
+        return booking_ids
+
+    def recover(self,*argv):
+        """Run the command as `python refund_recovery.py ...` would: (exit code, stdout, stderr)."""
+        import contextlib,io
+        import refund_recovery
+        out,err=io.StringIO(),io.StringIO()
+        with contextlib.redirect_stdout(out),contextlib.redirect_stderr(err):
+            code=refund_recovery.main(list(argv))
+        return code,out.getvalue(),err.getvalue()
+
+    def attempts_and_updated(self,booking_id):
+        return self.query('SELECT refund_attempts,updated_at FROM bookings WHERE booking_id=%s',(booking_id,))[0]
+
+    def test_recovery_requests_a_new_refund_for_refund_pending(self):                           # R1 (row 12)
+        booking_id,=self.refund_pending_bookings()
+        original=self.messages('refund.requested')
+        self.assertEqual(len(original),1)                                  # row 6's request
+        _,updated=self.attempts_and_updated(booking_id)
+        seats=self.seat_rows('event-test-many')
+        code,out,_=self.recover(booking_id)
+        self.assertEqual(code,0)
+        self.assertIn('refund requested again (attempt 1','\n'+out)
+        requests=self.messages('refund.requested')
+        self.assertEqual(len(requests),2)                                  # exactly one new row
+        new=requests[1]
+        self.assert_booking_envelope(new,'refund.requested')
+        self.assertNotEqual(new['message_id'],original[0]['message_id'])  # a NEW message_id
+        self.assertIn(new['message_id'],out)
+        self.assertEqual(new['payload'],{'booking_id':booking_id,'payment_id':'pay-test-'+booking_id[:8],
+                                         'customer_email':'buyer-test-1@example.test'})
+        self.assertEqual(new['payload'],original[0]['payload'])           # same fields as row 6
+        self.assertEqual(self.booking_status(booking_id),'refund_pending')
+        self.assertEqual(self.attempts_and_updated(booking_id),(1,updated))   # updated_at untouched
+        self.assertEqual(self.seat_rows('event-test-many'),seats)         # no seat change
+
+    def test_recovery_then_refund_completed_is_refunded(self):                                  # R2 (rows 12 -> 10)
+        booking_id,=self.refund_pending_bookings()
+        self.assertEqual(self.recover(booking_id)[0],0)
+        self.consume(payment_envelope('refund.completed',booking_id,'refunded'))
+        self.assertEqual(self.booking_status(booking_id),'refunded')
+
+    def test_recovery_refuses_other_states_and_writes_nothing(self):                            # R3
+        # Bookings in the other states are made BEFORE the event is cancelled.
+        required=self.pending_booking(seat='T05',customer='buyer-test-5')
+        refunded=self.pending_booking(seat='T06',customer='buyer-test-6')
+        confirmed=self.pending_booking(seat='T07',customer='buyer-test-7')
+        self.assertEqual(db.apply_payment_answer(confirmed,'paid','pay-test-7'),'confirmed')     # row 5
+        released=db.hold_seat('event-test-many','T08','buyer-test-8')[1]       # released by row 13
+        pending,no_payment=self.refund_pending_bookings(2)                    # cancels the event
+        self.query('UPDATE bookings SET payment_id=NULL WHERE booking_id=%s',(no_payment,))   # test schema only
+        self.assertEqual(db.apply_payment_answer(required,'paid','pay-test-5'),'refund_required')   # row 6
+        db.apply_payment_answer(refunded,'paid','pay-test-6')
+        self.consume(payment_envelope('refund.completed',refunded,'refunded'))
+        self.consume(payment_envelope('refund.completed',pending,'refunded'))
+        db.apply_event_changed(str(uuid.uuid4()),self.big_event(event_id='event-test-other'))
+        held=db.hold_seat('event-test-other','T01','buyer-test-held')[1]
+        cases={'no-such-booking-test':'no such booking','x'*65:'no such booking',
+               held:'status is held, not refund_pending',
+               released:'status is released, not refund_pending',
+               confirmed:'status is confirmed, not refund_pending',
+               pending:'status is refunded, not refund_pending',
+               refunded:'status is refunded, not refund_pending',
+               required:'messaging.replay payment.refund-requests',
+               no_payment:'no payment_id stored'}
+        rows=self.outbox_count()
+        before={b:self.attempts_and_updated(b) for b in (pending,no_payment,required,refunded,confirmed,released,held)}
+        for booking_id,expected in cases.items():
+            with self.subTest(expected=expected):
+                code,out,_=self.recover(booking_id)
+                self.assertEqual(code,1)
+                self.assertIn('refused',out)
+                self.assertIn(expected,out)
+        self.assertEqual(self.outbox_count(),rows)                         # nothing written
+        self.assertEqual({b:self.attempts_and_updated(b) for b in before},before)
+
+    def test_recovery_twice_gives_two_requests_with_different_ids(self):                         # R4
+        booking_id,=self.refund_pending_bookings()
+        self.assertEqual(self.recover(booking_id)[0],0)
+        code,out,_=self.recover(booking_id)
+        self.assertEqual(code,0)
+        self.assertIn('attempt 2',out)
+        ids=[m['message_id'] for m in self.messages('refund.requested')]
+        self.assertEqual(len(ids),3)
+        self.assertEqual(len(set(ids)),3)
+        self.assertEqual(self.attempts_and_updated(booking_id)[0],2)
+        self.assertEqual(self.booking_status(booking_id),'refund_pending')
+
+    def test_recovery_all_does_only_refund_pending(self):                                        # R5
+        code,out,_=self.recover('--all')
+        self.assertEqual((code,out.strip()),(0,'Nothing to do: no booking is in refund_pending.'))
+        required=self.pending_booking(seat='T09',customer='buyer-test-9')     # before the cancellation
+        first,second=self.refund_pending_bookings(2)
+        db.apply_payment_answer(required,'paid','pay-test-9')                  # event cancelled -> refund_required
+        self.assertEqual(self.booking_status(required),'refund_required')
+        self.query("UPDATE bookings SET updated_at=now()-interval '1 minute' WHERE booking_id=%s",(second,))
+        rows=self.outbox_count()
+        code,out,_=self.recover('--all')
+        self.assertEqual(code,0)
+        lines=out.strip().splitlines()
+        self.assertEqual(lines[0],'Found 2 booking(s) in refund_pending.')
+        self.assertTrue(lines[1].startswith(second+': refund requested again'))   # longest waiting first
+        self.assertTrue(lines[2].startswith(first+': refund requested again'))
+        self.assertEqual(self.outbox_count(),rows+2)
+        self.assertEqual(self.attempts_and_updated(required)[0],0)
+
+    def wait_for_lock_waiters(self,count):
+        """Wait until count other sessions of this database are blocked on a lock."""
+        self.wait_until(lambda:self.query(
+            "SELECT count(*) FROM pg_stat_activity WHERE datname=current_database() "
+            "AND wait_event_type='Lock'")[0][0]>=count)
+
+    def test_recovery_and_refund_completed_race(self):                                           # R6 (Q3)
+        # (a) refund.completed (row 10) holds the booking row and commits first:
+        #     the command waits, then finds 'refunded' and writes nothing.
+        booking_id,=self.refund_pending_bookings()
+        rows=self.outbox_count()
+        lock=self.connect()
+        try:
+            cur=lock.cursor()
+            cur.execute("""UPDATE bookings SET status='refunded',updated_at=now()
+                           WHERE booking_id=%s AND status=ANY(%s)""",(booking_id,['refund_required','refund_pending']))
+            with ThreadPoolExecutor(1) as pool:
+                result=pool.submit(self.recover,booking_id)
+                self.wait_for_lock_waiters(1)
+                lock.commit()
+                code,out,_=result.result(timeout=5)
+        finally:
+            lock.close()
+        self.assertEqual(code,1)
+        self.assertIn('status is refunded',out)
+        self.assertEqual(self.outbox_count(),rows)
+        self.assertEqual(self.attempts_and_updated(booking_id)[0],0)
+        # (b) the command gets the row first, row 10 waits behind it: one new request,
+        #     then refunded. Postgres queues row-lock waiters in arrival order.
+        db.apply_event_changed(str(uuid.uuid4()),self.big_event(event_id='event-test-race'))
+        other=db.hold_seat('event-test-race','T01','buyer-test-race')[1]
+        self.assertEqual(db.start_checkout(other,'buyer-test-race',True),'started')
+        db.apply_event_changed(str(uuid.uuid4()),self.big_event(event_id='event-test-race',version=2)|{'status':'cancelled'})
+        db.apply_payment_answer(other,'paid','pay-test-race')
+        self.consume(payment_envelope('refund.failed',other,'paid'))
+        rows=self.outbox_count()
+        completed=payment_envelope('refund.completed',other,'refunded')
+        lock=self.connect()
+        try:
+            lock.cursor().execute('SELECT 1 FROM bookings WHERE booking_id=%s FOR UPDATE',(other,))
+            with ThreadPoolExecutor(2) as pool:
+                command=pool.submit(self.recover,other)
+                self.wait_for_lock_waiters(1)
+                row10=pool.submit(db.apply_refund_message,completed.message_id,other,'refund.completed')
+                self.wait_for_lock_waiters(2)
+                lock.commit()
+                code,out,_=command.result(timeout=5)
+                self.assertEqual(row10.result(timeout=5),'refunded')
+        finally:
+            lock.close()
+        self.assertEqual(code,0)
+        self.assertEqual(self.outbox_count(),rows+1)
+        self.assertEqual(self.booking_status(other),'refunded')
+        self.assertEqual(self.attempts_and_updated(other)[0],1)
+
+    def test_recovery_cli_usage_and_database_down(self):                                          # R7
+        for argv in ((),('some-booking-test','--all')):
+            with self.subTest(argv=argv):
+                code,_,err=self.recover(*argv)
+                self.assertEqual(code,2)
+                self.assertIn('usage',err)
+        with patch('db.connect_once',side_effect=psycopg2.OperationalError('simulated outage')):
+            for argv in (('some-booking-test',),('--all',)):
+                with self.subTest(argv=argv):
+                    code,out,err=self.recover(*argv)
+                    self.assertEqual((code,out),(2,''))
+                    self.assertIn('Booking database unavailable',err)
+
+    def test_schema_upgrade_adds_refund_attempts(self):                                          # R8
+        booking_id,=self.refund_pending_bookings()
+        self.query('ALTER TABLE bookings DROP COLUMN refund_attempts')     # as before this step
+        db.init_schema();db.init_schema()                                   # safe to run on every start
+        self.assertEqual(self.attempts_and_updated(booking_id)[0],0)
+        self.assertEqual(self.booking_status(booking_id),'refund_pending')
+        self.assertEqual(self.recover(booking_id)[0],0)
+
+    # --- Bookings by status and refund ages on /metrics (contract section 10; step 7c) ---
+
+    def status_gauges(self,client):
+        client.get('/metrics')
+        counts={s:REGISTRY.get_sample_value('booking_bookings',{'status':s})
+                for s in ('held','payment_pending','confirmed','released','refund_required','refund_pending','refunded')}
+        ages={s:REGISTRY.get_sample_value('booking_refund_oldest_age_seconds',{'status':s})
+              for s in ('refund_required','refund_pending')}
+        return counts,ages
+
+    def test_metrics_bookings_by_status_all_seven(self):                                          # G1
+        client=self.client()
+        counts,ages=self.status_gauges(client)
+        self.assertEqual(set(counts.values()),{0.0})                      # all 7 shown, 0 when none
+        self.assertEqual(ages,{'refund_required':0.0,'refund_pending':0.0})
+        pending,refunded=self.refund_pending_bookings(2)
+        self.consume(payment_envelope('refund.completed',refunded,'refunded'))
+        db.apply_event_changed(str(uuid.uuid4()),self.big_event(event_id='event-test-other'))
+        db.hold_seat('event-test-other','T01','buyer-test-other')
+        counts,_=self.status_gauges(client)
+        self.assertEqual(counts,{'held':1.0,'payment_pending':0.0,'confirmed':0.0,'released':0.0,
+                                 'refund_required':0.0,'refund_pending':1.0,'refunded':1.0})
+
+    def test_metrics_oldest_refund_age(self):                                                    # G2
+        client=self.client()
+        pending,=self.refund_pending_bookings()
+        self.query("UPDATE bookings SET updated_at=now()-interval '120 seconds' WHERE booking_id=%s",(pending,))
+        _,ages=self.status_gauges(client)
+        self.assertAlmostEqual(ages['refund_pending'],120,delta=10)
+        self.assertEqual(ages['refund_required'],0.0)
+        self.assertEqual(self.recover(pending)[0],0)                         # row 12 does not reset the age
+        _,ages=self.status_gauges(client)
+        self.assertAlmostEqual(ages['refund_pending'],120,delta=10)
+        self.consume(payment_envelope('refund.completed',pending,'refunded'))
+        _,ages=self.status_gauges(client)
+        self.assertEqual(ages['refund_pending'],0.0)                         # 0 when none
+
+    def test_metrics_answer_when_database_down(self):                                            # G3
+        client=self.client()
+        self.refund_pending_bookings()
+        before,_=self.status_gauges(client)
+        self.assertEqual(before['refund_pending'],1.0)
+        errors=self.counter('booking_status_refresh_errors_total')
+        with patch('db.connect_once',side_effect=psycopg2.OperationalError('simulated outage')), \
+             self.assertLogs('booking.api','WARNING'):
+            response=client.get('/metrics')
+        self.assertEqual(response.status_code,200)
+        self.assertIn('booking_http_requests_total',response.text)
+        self.assertEqual(self.counter('booking_status_refresh_errors_total'),errors+1)
+        self.assertEqual(REGISTRY.get_sample_value('booking_bookings',{'status':'refund_pending'}),1.0)  # last value kept
+
 
 def down(body):
     """A fake Payment that gives no answer (connection refused)."""

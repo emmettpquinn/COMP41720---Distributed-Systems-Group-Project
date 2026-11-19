@@ -1,5 +1,6 @@
 """The HTTP endpoints of the Booking service."""
 import asyncio
+import logging
 from typing import Annotated
 
 import psycopg2
@@ -12,6 +13,7 @@ import db
 import metrics
 
 router = APIRouter()
+log = logging.getLogger("booking.api")
 
 # Text fields are trimmed first, then must be non-empty and within the
 # contract's limits (section 1): IDs 64, customer_email and customer_name 255.
@@ -68,7 +70,26 @@ def ready():
 @router.get("/metrics")
 def get_metrics():
     """Prometheus scrapes this. Text format, not JSON."""
+    refresh_booking_gauges()
     return Response(generate_latest(), media_type=CONTENT_TYPE_LATEST)
+
+
+def refresh_booking_gauges():
+    """Bookings by status and the oldest refund ages, read from the database (contract section 10).
+
+    If the database cannot be read, the scrape still succeeds with every other
+    metric: the error is logged and counted, and these gauges keep their last values.
+    """
+    try:
+        summary = db.booking_status_summary()
+    except psycopg2.Error as error:
+        metrics.STATUS_REFRESH_ERRORS.inc()
+        log.warning("Bookings by status not refreshed (database unavailable): %s", error)
+        return
+    for status in metrics.BOOKING_STATUSES:
+        metrics.BOOKINGS.labels(status).set(summary.get(status, (0, 0.0))[0])
+    for status in metrics.REFUND_STATUSES:
+        metrics.REFUND_OLDEST_AGE.labels(status).set(summary.get(status, (0, 0.0))[1])
 
 
 @router.post("/holds")

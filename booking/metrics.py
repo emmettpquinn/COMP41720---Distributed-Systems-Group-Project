@@ -57,6 +57,23 @@ for _reason in ("hold_expired", "event_cancelled"):
 # Sweeper errors: one per event whose release failed, plus one per failed sweep (expiry.py).
 EXPIRY_ERRORS = Counter("booking_expiry_sweep_errors_total", "Expiry sweeper errors (the sweeper keeps running)")
 
+# Bookings by status and stuck refunds (contract section 10). Read from the database each
+# time /metrics is scraped (api.py). Every status is shown, 0 when it has no bookings.
+BOOKING_STATUSES = ("held", "payment_pending", "confirmed", "released",
+                    "refund_required", "refund_pending", "refunded")
+REFUND_STATUSES = ("refund_required", "refund_pending")
+BOOKINGS = Gauge("booking_bookings", "Bookings by status (from the database at scrape time)", ["status"])
+for _status in BOOKING_STATUSES:
+    BOOKINGS.labels(_status)
+# Seconds since the oldest booking in this status entered it (0 when there is none).
+REFUND_OLDEST_AGE = Gauge("booking_refund_oldest_age_seconds",
+                          "Age of the oldest booking in refund_required / refund_pending", ["status"])
+for _status in REFUND_STATUSES:
+    REFUND_OLDEST_AGE.labels(_status)
+# Scrapes where the database could not be read: the two gauges above keep their last values.
+STATUS_REFRESH_ERRORS = Counter("booking_status_refresh_errors_total",
+                                "Scrapes where bookings by status could not be read from the database")
+
 # db.hold_seat's outcome -> the label to show on the dashboard.
 HOLD_LABELS = {"held": "held", "already_yours": "retry", "taken": "taken", "not_found": "not_found",
                "event_cancelled": "event_cancelled"}

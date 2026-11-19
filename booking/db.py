@@ -628,6 +628,87 @@ def apply_refund_message(message_id, booking_id, message_type):
         conn.close()
 
 
+# --- Refund recovery (contract section 4 row 12, section 10) ---------------------
+
+REFUND_REQUESTED_AGAIN = "requested"
+BOOKING_ID_MAX = 64     # contract section 1
+
+
+def request_refund_again(booking_id):
+    """Row 12: send a NEW refund.requested for a booking in refund_pending.
+
+    One transaction, booking row only (section 4a): ONE conditional UPDATE that
+    adds 1 to refund_attempts, then one refund.requested outbox row (write_outbox
+    gives it a new message_id). Status and updated_at are NOT changed: the booking
+    stays refund_pending until refund.completed arrives (row 10).
+    Returns (outcome, details):
+    - ('requested', {payment_id, attempt, message_id})
+    - ('unknown_booking', {}), ('wrong_status', {status}), ('no_payment_id', {status}):
+      nothing is written.
+    """
+    if not booking_id or len(booking_id) > BOOKING_ID_MAX:
+        return "unknown_booking", {}       # no such ID can exist (section 1)
+    conn = connect_once()
+    try:
+        with conn, conn.cursor() as cur:
+            cur.execute(
+                """UPDATE bookings SET refund_attempts = refund_attempts + 1
+                   WHERE booking_id = %s AND status = 'refund_pending' AND payment_id IS NOT NULL
+                   RETURNING payment_id, customer_email, refund_attempts""",
+                (booking_id,),
+            )
+            row = cur.fetchone()
+            if row is not None:
+                payment_id, email, attempt = row
+                message_id = write_outbox(cur, REFUND_REQUESTED, {
+                    "booking_id": booking_id,
+                    "payment_id": payment_id,
+                    "customer_email": email,
+                })
+                return REFUND_REQUESTED_AGAIN, {"payment_id": payment_id, "attempt": attempt,
+                                                "message_id": message_id}
+            # Nothing changed. Look up ONLY to explain why (nothing is written).
+            cur.execute("SELECT status, payment_id FROM bookings WHERE booking_id = %s", (booking_id,))
+            found = cur.fetchone()
+            if found is None:
+                return "unknown_booking", {}
+            status, payment_id = found
+            if status == "refund_pending" and payment_id is None:
+                return "no_payment_id", {"status": status}
+            return "wrong_status", {"status": status}
+    finally:
+        conn.close()
+
+
+def refund_pending_ids():
+    """booking_ids in refund_pending, longest waiting first (for the command's --all)."""
+    conn = connect_once()
+    try:
+        with conn, conn.cursor() as cur:
+            cur.execute("SELECT booking_id FROM bookings WHERE status = 'refund_pending' "
+                        "ORDER BY updated_at, booking_id")
+            return [row[0] for row in cur.fetchall()]
+    finally:
+        conn.close()
+
+
+def booking_status_summary():
+    """{status: (count, age in seconds of the oldest booking)} for statuses that have bookings.
+
+    One GROUP BY, database clock. Age is measured from updated_at, which every
+    status change sets (row 12 does not touch it), so it is "how long the oldest
+    booking has been in this status". Used by GET /metrics (contract section 10).
+    """
+    conn = connect_once()
+    try:
+        with conn, conn.cursor() as cur:
+            cur.execute("SELECT status, count(*), EXTRACT(EPOCH FROM now() - min(updated_at))::float8 "
+                        "FROM bookings GROUP BY status")
+            return {status: (count, max(age, 0.0)) for status, count, age in cur.fetchall()}
+    finally:
+        conn.close()
+
+
 # --- Releasing held bookings: hold expiry (row 4) and event cancelled (row 13) ---
 
 def _release_held(cur, event_id, reason, title, expired_only):

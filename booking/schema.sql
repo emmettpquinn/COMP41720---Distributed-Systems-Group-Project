@@ -90,3 +90,8 @@ CREATE INDEX IF NOT EXISTS bookings_event_status ON bookings (event_id, status);
 -- The safety net (contract section 4, row 8) looks every 0.5 s for payment_pending
 -- bookings whose checkout_started_at + S has passed.
 CREATE INDEX IF NOT EXISTS bookings_status_checkout_started ON bookings (status, checkout_started_at);
+-- Refund recovery command (contract section 4 row 12, section 10): how many times
+-- refund.requested was sent again for this booking. Safe on an existing database:
+-- existing rows get 0. Row 12 changes only this column, never status or updated_at,
+-- so updated_at stays "when the booking entered its current status".
+ALTER TABLE bookings ADD COLUMN IF NOT EXISTS refund_attempts INTEGER NOT NULL DEFAULT 0;
