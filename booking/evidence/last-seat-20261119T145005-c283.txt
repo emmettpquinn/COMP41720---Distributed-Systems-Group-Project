@@ -1,0 +1,16 @@
+Last-seat test  run 20261119T145005-c283  event evt-test-lastseat-20261119T145005-c283  seat A1
+Attempts 500 | warm connections 500 | send spread 0.123 s | in flight at first reply 500
+Replies: 201 x1, 409 seat_taken x499, other 0, 5xx 0, transport errors 0
+Client latency p50 2.704 s  p95 7.014 s  max 7.623 s | wall 7.744 s
+Booking's own /holds latency (its /metrics histogram): 500 requests, mean 1.494 s, p50 <= 2.5 s, p95 <= 5.0 s | client mean 3.237 s
+Winner: cust-test-20261119T145005-c283-000  booking_id bb0db568-8c0d-492f-a69d-b1c703a5d3e3
+Booking DB (sampled every 50 ms, informational): peak connections 42, peak lock waiters 39, longest lock wait 0.462 s
+headroom: longest lock wait 0.462 s of the 2 s limit
+[PASS] replies: 201 x1, 409 seat_taken x499 of 500
+[PASS] booking: 1 booking(s) [('bb0db568-8c0d-492f-a69d-b1c703a5d3e3', 'cust-test-20261119T145005-c283-000', 'held')]; winner booking_id=bb0db568-8c0d-492f-a69d-b1c703a5d3e3 customer=cust-test-20261119T145005-c283-000
+[PASS] seat: seat A1 = ('held', 'bb0db568-8c0d-492f-a69d-b1c703a5d3e3', 'cust-test-20261119T145005-c283-000')
+[PASS] sequence: sequence 1 -> 2
+[PASS] outbox: availability rows 1 -> 2; new: [{'sequence': 2, 'seats_remaining': 0, 'published': True}]
+[PASS] catalogue: Catalogue availability {'sequence': 2, 'seats_remaining': 0, 'available_seat_ids': [], 'occurred_at': '2026-11-19T14:50:12.563630+00:00', 'applied_at': '2026-11-19T14:50:12.682576+00:00'}
+[PASS] dlq: all 6 DLQs = 0
+OVERALL: PASS

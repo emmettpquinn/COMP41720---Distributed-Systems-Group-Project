@@ -1,0 +1,18 @@
+Last-seat test  run 20261119T150115-bbcd  event evt-test-lastseat-20261119T150115-bbcd  seat A1
+Attempts 500 (each on its own new connection) | release-to-send spread 0.163 s (p50 0.587 s, max 0.635 s) | in flight at first reply 500
+Replies: 201 x1, 409 seat_taken x499, other 0, 5xx 0, transport errors 0
+Client latency p50 3.034 s  p95 4.567 s  max 4.842 s | wall 4.930 s
+Throughput: 101.4 holds/s over the wall time (informational)
+Replies slower than the gateway's 3 s limit: 254 of 500 (informational)
+Booking's own /holds latency (its /metrics histogram): 500 requests, mean 2.289 s, p50 <= 2.5 s, p95 <= 5.0 s | client mean 2.873 s
+Winner: cust-test-20261119T150115-bbcd-003  booking_id c6770f05-cea9-4e5a-a10a-1f620ee0ddb7
+Booking DB (sampled every 50 ms, informational): peak connections 42, peak lock waiters 39, longest lock wait 0.443 s
+headroom: longest lock wait 0.443 s of the 2 s limit
+[PASS] replies: 201 x1, 409 seat_taken x499 of 500
+[PASS] booking: 1 booking(s) [('c6770f05-cea9-4e5a-a10a-1f620ee0ddb7', 'cust-test-20261119T150115-bbcd-003', 'held')]; winner booking_id=c6770f05-cea9-4e5a-a10a-1f620ee0ddb7 customer=cust-test-20261119T150115-bbcd-003
+[PASS] seat: seat A1 = ('held', 'c6770f05-cea9-4e5a-a10a-1f620ee0ddb7', 'cust-test-20261119T150115-bbcd-003')
+[PASS] sequence: sequence 1 -> 2
+[PASS] outbox: availability rows 1 -> 2; new: [{'sequence': 2, 'seats_remaining': 0, 'published': True}]
+[PASS] catalogue: Catalogue availability {'sequence': 2, 'seats_remaining': 0, 'available_seat_ids': [], 'occurred_at': '2026-11-19T15:01:17.492387+00:00', 'applied_at': '2026-11-19T15:01:17.784552+00:00'}
+[PASS] dlq: all 6 DLQs = 0
+OVERALL: PASS

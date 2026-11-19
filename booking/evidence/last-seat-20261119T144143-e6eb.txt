@@ -1,0 +1,3 @@
+Last-seat test  run 20261119T144143-e6eb  event evt-test-lastseat-20261119T144143-e6eb  seat A1
+COULD NOT FINISH: DLQs not 0 before the run: {'ticketing.booking-updates.dlq': 5}; nothing was created
+OVERALL: FAIL (the test did not run to the end)
