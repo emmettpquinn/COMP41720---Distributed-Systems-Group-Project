@@ -1895,6 +1895,26 @@ class BookingIntegrationTests(unittest.TestCase):
         self.assertEqual([e['payload']['sequence'] for e in found],list(range(1,len(found)+1)))
         self.assertEqual(found[-1]['payload']['available_seat_ids'],self.free_seats('event-test-many'))
 
+    def test_checkout_waiting_for_a_cancellation_replies_event_cancelled(self):               # R5b (section 6)
+        # Deterministic version of the race above. A separate connection does what row 13
+        # does (event -> cancelled, booking -> released) and holds the booking row's lock;
+        # checkout waits on that lock. After the commit, check 3 must see the cancellation.
+        db.apply_event_changed(str(uuid.uuid4()),self.big_event())
+        booking_id=db.hold_seat('event-test-many','T01','buyer-test-1')[1]
+        lock=self.connect()
+        try:
+            cur=lock.cursor()
+            cur.execute("UPDATE events SET status='cancelled' WHERE event_id='event-test-many'")   # test schema only
+            cur.execute("UPDATE bookings SET status='released',updated_at=now() WHERE booking_id=%s",(booking_id,))
+            with ThreadPoolExecutor(1) as pool:
+                checkout=pool.submit(db.start_checkout,booking_id,'buyer-test-1',True)
+                self.wait_for_lock_waiters(1)
+                lock.commit()
+                self.assertEqual(checkout.result(timeout=5),'event_cancelled')
+        finally:
+            lock.close()
+        self.assertEqual(self.booking_status(booking_id),'released')       # checkout changed nothing
+
     # --- Safety net (row 8) and late success (row 9) (step 7b; contract sections 4, 4a, 9, 12) ---
 
     def make_due(self,*booking_ids):

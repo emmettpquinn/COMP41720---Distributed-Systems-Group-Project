@@ -268,17 +268,24 @@ def start_checkout(booking_id, customer_id, breaker_accepts):
     try:
         with conn, conn.cursor() as cur:
             cur.execute(
-                """SELECT b.status, b.held_until > now(), e.status
-                   FROM bookings b LEFT JOIN events e ON e.event_id = b.event_id
-                   WHERE b.booking_id = %s AND b.customer_id = %s
-                   FOR UPDATE OF b""",
+                """SELECT status, held_until > now(), event_id
+                   FROM bookings
+                   WHERE booking_id = %s AND customer_id = %s
+                   FOR UPDATE""",
                 (booking_id, customer_id),
             )
             row = cur.fetchone()
             # The checks, in the contract's order (section 6).
             if row is None:
                 return "not_found"
-            status, not_expired, event_status = row
+            status, not_expired, event_id = row
+            # Read the event's status AFTER the booking lock, in its own statement.
+            # If the SELECT above had to wait (e.g. for row 13 cancelling the event),
+            # a row joined into it would be the copy from before the wait, and the
+            # cancellation would be missed. A new statement sees the latest commit.
+            cur.execute("SELECT status FROM events WHERE event_id = %s", (event_id,))
+            event = cur.fetchone()
+            event_status = event[0] if event else None
             if status == "payment_pending":
                 return "repeat"
             if event_status == "cancelled":
