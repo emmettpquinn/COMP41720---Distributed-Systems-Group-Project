@@ -26,6 +26,7 @@ import expiry
 import outbox
 import payment_updates
 import payments
+import safety_net
 from main import app
 
 # Catalogue's real message examples: <repo>/catalogue/examples/contracts. In the
@@ -48,6 +49,11 @@ def example(name):
 
 async def idle_sweeper():
     """Stands in for expiry.run in HTTP tests: never sweeps, stops when cancelled."""
+    await asyncio.Future()
+
+
+async def idle_safety_net(self):
+    """Stands in for SafetyNet.run in HTTP tests: never checks, stops when cancelled."""
     await asyncio.Future()
 
 
@@ -110,7 +116,7 @@ class BookingIntegrationTests(unittest.TestCase):
     def processed(self):
         return {row[0] for row in self.query('SELECT message_id FROM processed_messages')}
 
-    def client(self,sweeper=False):
+    def client(self,sweeper=False,safety=False):
         env=patch('config.BOOKING_DEMO_SEED',False)
         env.start();self.addCleanup(env.stop)
         # Never consume the real queue from a test: no RabbitMQ consumer here.
@@ -121,6 +127,10 @@ class BookingIntegrationTests(unittest.TestCase):
         # real loop, every 0.05 s.
         loop=patch('expiry.SWEEP_SECONDS',0.05) if sweeper else patch('expiry.run',idle_sweeper)
         loop.start();self.addCleanup(loop.stop)
+        # The same for the safety net (step 7b): tests drive SafetyNet.check_once()
+        # directly; safety=True runs the real loop, every 0.05 s.
+        net=patch('safety_net.CHECK_SECONDS',0.05) if safety else patch('safety_net.SafetyNet.run',idle_safety_net)
+        net.start();self.addCleanup(net.stop)
         client=TestClient(app)
         client.__enter__();self.addCleanup(client.__exit__,None,None,None)
         return client
@@ -944,7 +954,7 @@ class BookingIntegrationTests(unittest.TestCase):
 
     # --- Checkout and Payment's HTTP answer (step 6b-2; contract sections 4, 6, 9, 12) ---
 
-    def checkout_client(self,reply=None,gate=None,hang=False):
+    def checkout_client(self,reply=None,gate=None,hang=False,safety=False):
         """A TestClient whose Payment is a fake (httpx.MockTransport), with no real pauses.
 
         reply(body) -> httpx.Response (default: paid). If gate (a threading.Event) is
@@ -978,7 +988,7 @@ class BookingIntegrationTests(unittest.TestCase):
             return payments.CheckoutRunner(payments.PaymentClient(self.http,url,breaker,sleep=no_pause))
         factory=patch('payments.create_runner',create_runner)
         factory.start();self.addCleanup(factory.stop)
-        return self.client()
+        return self.client(safety=safety)
 
     def hold(self,client,seat='A1',customer='buyer-test',event_id='event-demo-001'):
         result=client.post('/holds',json={'event_id':event_id,'seat_id':seat,'customer_id':customer})
@@ -1884,6 +1894,362 @@ class BookingIntegrationTests(unittest.TestCase):
         found=self.snapshots('event-test-many')
         self.assertEqual([e['payload']['sequence'] for e in found],list(range(1,len(found)+1)))
         self.assertEqual(found[-1]['payload']['available_seat_ids'],self.free_seats('event-test-many'))
+
+    # --- Safety net (row 8) and late success (row 9) (step 7b; contract sections 4, 4a, 9, 12) ---
+
+    def make_due(self,*booking_ids):
+        """As if S (60 s) had passed since checkout (database clock)."""
+        self.query("UPDATE bookings SET checkout_started_at=now()-interval '61 seconds' WHERE booking_id = ANY(%s)",
+                   (list(booking_ids),))
+
+    def net_outcome(self,outcome):
+        return self.counter('booking_safety_net_calls_total',outcome=outcome)
+
+    def late_count(self):
+        return self.counter('booking_late_successes_total')
+
+    def payment_id(self,booking_id):
+        return self.query('SELECT payment_id FROM bookings WHERE booking_id=%s',(booking_id,))[0][0]
+
+    def event_title(self,event_id='event-test-many'):
+        return self.event_row(event_id)[2]
+
+    def safety_check(self,reply=None,breaker=None,checks=1,clock=None,between=None):
+        """Run SafetyNet.check_once(wait=True) `checks` times (S = 60) against a fake Payment.
+
+        reply(body) -> httpx.Response (default: paid); it may raise (see down()).
+        between(i) runs after check i. Returns the booking_ids each check started.
+        self.net_calls lists the request bodies Payment received.
+        """
+        self.net_calls=[]
+        reply=reply or (lambda body:payment_reply('paid',body))
+
+        async def handler(request):
+            body=json.loads(request.content)
+            self.net_calls.append(body)
+            return reply(body)
+
+        async def go():
+            async with httpx.AsyncClient(transport=httpx.MockTransport(handler)) as http:
+                client=payments.PaymentClient(http,'http://payment-test',
+                                              breaker or payments.CircuitBreaker(clock=lambda:0.0))
+                net=safety_net.SafetyNet(client,60,**({'clock':clock} if clock else {}))
+                started=[]
+                for i in range(checks):
+                    started.append(await net.check_once(wait=True))
+                    if between:
+                        between(i)
+                return started
+        return asyncio.run(go())
+
+    def released_by_safety_net(self,seat='T01',customer='buyer-test'):
+        """A booking released by row 8 (Payment gave the safety net no answer)."""
+        booking_id=self.pending_booking(seat,customer)
+        self.make_due(booking_id)
+        self.assertEqual(self.safety_check(reply=down),[[booking_id]])
+        self.assertEqual(self.booking_status(booking_id),'released')
+        return booking_id
+
+    def test_safety_net_ignores_bookings_not_yet_due(self):                                       # N1 (D1)
+        booking_id=self.pending_booking()
+        held=self.pending_booking('T02','buyer-test-2')
+        self.query("UPDATE bookings SET status='held', checkout_started_at=now()-interval '1 hour' WHERE booking_id=%s",
+                   (held,))                                                       # not payment_pending: never due
+        self.assertEqual(self.safety_check(),[[]])
+        self.query("UPDATE bookings SET checkout_started_at=now()-interval '59 seconds' WHERE booking_id=%s",(booking_id,))
+        self.assertEqual(self.safety_check(),[[]])
+        self.assertEqual(self.net_calls,[])
+        self.assertEqual(self.booking_status(booking_id),'payment_pending')
+        self.make_due(booking_id)
+        self.assertEqual(self.safety_check(),[[booking_id]])
+
+    def test_safety_net_answer_paid_confirms_with_one_call(self):                                # N2 (row 8 -> 5)
+        booking_id=self.pending_booking()
+        self.make_due(booking_id)
+        before=self.net_outcome('confirmed')
+        self.assertEqual(self.safety_check(),[[booking_id]])
+        self.assertEqual(self.net_calls,[{'booking_id':booking_id,'amount':4500,'currency':'EUR',
+                                          'customer_email':'buyer-test@example.test'}])
+        self.assertEqual(self.booking_status(booking_id),'confirmed')
+        self.assertEqual(self.seat('event-test-many','T01')[:2],('booked',booking_id))
+        self.assertEqual(len(self.messages('booking.confirmed')),1)
+        self.assertEqual(self.net_outcome('confirmed'),before+1)
+        self.assertEqual(self.safety_check(),[[]])                    # no longer due: no second call
+        self.assertEqual(self.net_calls,[])
+
+    def test_safety_net_answer_failed_or_refunded_releases_as_row_7(self):                       # N3 (row 8 -> 7)
+        failed=self.pending_booking('T01','buyer-test-1')
+        refunded=self.pending_booking('T02','buyer-test-2')
+        self.make_due(failed,refunded)
+        statuses={failed:'failed',refunded:'refunded'}
+        before=self.net_outcome('released')
+        self.safety_check(reply=lambda body:payment_reply(statuses[body['booking_id']],body))
+        self.assertEqual([self.booking_status(b) for b in (failed,refunded)],['released','released'])
+        self.assertEqual(self.cancelled_payloads(),self.expected_cancelled(
+            'payment_failed',[(failed,'buyer-test-1'),(refunded,'buyer-test-2')],title=self.event_title()))
+        self.assertEqual(self.messages('refund.requested'),[])
+        self.assertEqual(self.net_outcome('released'),before+2)
+
+    def test_safety_net_no_answer_releases_row_8(self):                                          # N4 (row 8)
+        title='Test event with a very long title '+'x'*300
+        db.apply_event_changed(str(uuid.uuid4()),self.big_event()|{'title':title})
+        booking_id=self.pending_booking()
+        self.make_due(booking_id)
+        sequence=self.sequence('event-test-many')
+        before=(self.net_outcome('payments_unavailable'),self.counter('booking_payment_attempts_total',outcome='error'))
+        self.assertEqual(self.safety_check(reply=down),[[booking_id]])
+        self.assertEqual(len(self.net_calls),1)                       # ONE call, no retries
+        self.assertEqual(self.booking_status(booking_id),'released')
+        self.assertIsNone(self.payment_id(booking_id))
+        self.assertEqual(self.seat('event-test-many','T01'),('free',None,None,None))
+        self.assertEqual(self.sequence('event-test-many'),sequence+1)                 # ONE snapshot
+        snapshot=self.snapshots('event-test-many')[-1]['payload']
+        self.assertEqual((snapshot['sequence'],snapshot['available_seat_ids']),(sequence+1,self.free_seats('event-test-many')))
+        self.assertIn('T01',snapshot['available_seat_ids'])
+        self.assertEqual(self.cancelled_payloads(),self.expected_cancelled(
+            'payments_unavailable',[(booking_id,'buyer-test')],title=title[:200]))
+        self.assert_booking_envelope(self.messages('booking.cancelled')[0],'booking.cancelled')
+        self.assertEqual((self.net_outcome('payments_unavailable'),
+                          self.counter('booking_payment_attempts_total',outcome='error')),(before[0]+1,before[1]+1))
+        self.assertEqual(self.safety_check(reply=down),[[]])          # released: never called again
+
+    def test_safety_net_breaker_open_releases_without_a_call(self):                              # N5 (D2)
+        breaker=payments.CircuitBreaker(clock=lambda:0.0)
+        for _ in range(payments.FAILURE_THRESHOLD):
+            breaker.try_acquire();breaker.record_failure()
+        self.assertEqual(breaker.state,payments.OPEN)
+        booking_id=self.pending_booking()
+        self.make_due(booking_id)
+        short=self.counter('booking_payment_attempts_total',outcome='short_circuited')
+        self.safety_check(breaker=breaker)
+        self.assertEqual(self.net_calls,[])
+        self.assertEqual(self.booking_status(booking_id),'released')
+        self.assertEqual(self.cancelled_payloads()[0]['reason'],'payments_unavailable')
+        self.assertEqual(self.counter('booking_payment_attempts_total',outcome='short_circuited'),short+1)
+
+    def test_safety_net_409_is_no_answer_and_releases(self):                                     # N6 (I3)
+        booking_id=self.pending_booking()
+        self.make_due(booking_id)
+        breaker=payments.CircuitBreaker(clock=lambda:0.0)
+        self.safety_check(reply=lambda body:httpx.Response(409,json={'detail':'x'}),breaker=breaker)
+        self.assertEqual(self.booking_status(booking_id),'released')
+        self.assertEqual(self.cancelled_payloads()[0]['reason'],'payments_unavailable')
+        self.assertEqual((breaker.state,breaker.failures),(payments.CLOSED,0))     # counted neither way
+
+    def test_safety_net_skips_a_booking_whose_call_is_in_flight(self):                           # N7 (D2)
+        booking_id=self.pending_booking()
+        self.make_due(booking_id)
+        skipped=self.counter('booking_safety_net_skipped_total')
+        calls=[]
+
+        async def go():
+            gate=asyncio.Event()
+
+            async def handler(request):
+                body=json.loads(request.content)
+                calls.append(body)
+                await gate.wait()
+                return payment_reply('paid',body)
+            async with httpx.AsyncClient(transport=httpx.MockTransport(handler)) as http:
+                net=safety_net.SafetyNet(payments.PaymentClient(http,'http://payment-test',
+                                                                payments.CircuitBreaker(clock=lambda:0.0)),60)
+                first=await net.check_once()
+                while not calls:
+                    await asyncio.sleep(0.01)
+                second=await net.check_once()
+                third=await net.check_once()
+                during=set(net.in_flight)
+                gate.set()
+                await asyncio.gather(*list(net._tasks))
+                return first,second,third,during,set(net.in_flight)
+        first,second,third,during,after=asyncio.run(go())
+        self.assertEqual((first,second,third),([booking_id],[],[]))
+        self.assertEqual(len(calls),1)                                # never a second call
+        self.assertEqual((during,after),({booking_id},set()))
+        self.assertEqual(self.counter('booking_safety_net_skipped_total'),skipped+2)
+        self.assertEqual(self.booking_status(booking_id),'confirmed')
+
+    def test_payment_result_during_the_safety_net_call_wins_and_the_call_does_nothing(self):     # N8 (Q3)
+        no_answer=self.pending_booking('T01','buyer-test-1')
+        answered=self.pending_booking('T02','buyer-test-2')
+        self.make_due(no_answer,answered)
+        sequence=self.sequence('event-test-many')
+        noop=self.net_outcome('noop')
+
+        def message_wins(body):
+            # payment.result is applied while the safety-net call is still waiting.
+            self.assertEqual(db.apply_payment_answer(body['booking_id'],'paid','pay-test-'+body['booking_id'][:8],
+                                                     str(uuid.uuid4())),'confirmed')
+            if body['booking_id']==no_answer:
+                raise httpx.ConnectError('Payment is down')         # then: no answer -> row 8 finds nothing
+            return payment_reply('paid',body)                       # then: the answer -> rows 5-7 find nothing
+        self.safety_check(reply=message_wins)
+        self.assertEqual([self.booking_status(b) for b in (no_answer,answered)],['confirmed','confirmed'])
+        self.assertEqual(self.seat('event-test-many','T01')[:2],('booked',no_answer))
+        self.assertEqual(self.messages('booking.cancelled'),[])
+        self.assertEqual(len(self.messages('booking.confirmed')),2)
+        self.assertEqual(self.sequence('event-test-many'),sequence)    # no snapshot
+        self.assertEqual(self.net_outcome('noop'),noop+2)
+
+    def test_late_paid_message_after_row_8_requests_a_refund(self):                              # N9 (row 9)
+        booking_id=self.released_by_safety_net()
+        rows,sequence=self.outbox_count(),self.sequence('event-test-many')
+        seat=self.seat('event-test-many','T01')
+        late,result=self.late_count(),self.results('payment.result','late_success')
+        envelope=payment_envelope('payment.result',booking_id,'paid',payment_id='pay-test-late')
+        with self.assertLogs('booking.payment_updates','WARNING'):
+            self.consume(envelope)
+        self.assertEqual((self.booking_status(booking_id),self.payment_id(booking_id)),('refund_required','pay-test-late'))
+        [refund]=self.messages('refund.requested')
+        self.assertEqual(refund['payload'],{'booking_id':booking_id,'payment_id':'pay-test-late',
+                                            'customer_email':'buyer-test@example.test'})
+        self.assert_booking_envelope(refund,'refund.requested')
+        self.assertEqual(self.outbox_count(),rows+1)                  # only refund.requested
+        self.assertEqual(self.sequence('event-test-many'),sequence)   # seat untouched: no snapshot
+        self.assertEqual(self.seat('event-test-many','T01'),seat)
+        self.assertEqual(len(self.messages('booking.cancelled')),1)   # no second cancellation
+        self.assertIn(envelope.message_id,self.processed())
+        self.assertEqual((self.late_count(),self.results('payment.result','late_success')),(late+1,result+1))
+
+    def test_duplicate_late_paid_http_and_message_gives_one_refund(self):                       # N10 (Q4)
+        first=self.released_by_safety_net('T01','buyer-test-a')
+        second=self.released_by_safety_net('T02','buyer-test-b')
+        late=self.late_count()
+        # HTTP reply first, then the message, then a redelivery of that message.
+        self.assertEqual(db.apply_payment_answer(first,'paid','pay-test-a'),'late_success')
+        envelope=payment_envelope('payment.result',first,'paid',payment_id='pay-test-a')
+        noop,duplicate=self.results('payment.result','noop'),self.results('payment.result','duplicate')
+        self.consume(envelope);self.consume(envelope)
+        self.assertEqual((self.results('payment.result','noop'),self.results('payment.result','duplicate')),
+                         (noop+1,duplicate+1))
+        # The message first, then the HTTP reply.
+        self.consume(payment_envelope('payment.result',second,'paid',payment_id='pay-test-b'))
+        self.assertEqual(db.apply_payment_answer(second,'paid','pay-test-b'),'noop')
+        self.assertEqual(sorted(e['payload']['booking_id'] for e in self.messages('refund.requested')),
+                         sorted([first,second]))                    # exactly one refund each
+        self.assertEqual([self.booking_status(b) for b in (first,second)],['refund_required','refund_required'])
+        self.assertEqual(self.late_count(),late+2)
+
+    def test_late_failed_or_refunded_for_a_released_booking_is_a_noop(self):                     # N11 (D4)
+        booking_id=self.released_by_safety_net()
+        rows=self.outbox_count()
+        for status in ('failed','refunded'):
+            with self.subTest(status):
+                self.assertEqual(db.apply_payment_answer(booking_id,status,'pay-test-1'),'noop')
+                before=self.results('payment.result','noop')
+                self.consume(payment_envelope('payment.result',booking_id,status))
+                self.assertEqual(self.results('payment.result','noop'),before+1)
+        self.assertEqual((self.booking_status(booking_id),self.payment_id(booking_id)),('released',None))
+        self.assertEqual(self.outbox_count(),rows)
+
+    def test_resold_seat_late_success_never_both_never_neither(self):                            # N12 (row 9)
+        first=self.released_by_safety_net('T01','buyer-test-a')
+        # Someone else buys the freed seat.
+        outcome,second,_=db.hold_seat('event-test-many','T01','buyer-test-b')
+        self.assertEqual(outcome,'held')
+        self.assertEqual(db.start_checkout(second,'buyer-test-b',True),'started')
+        self.assertEqual(db.apply_payment_answer(second,'paid','pay-test-b'),'confirmed')
+        seat=self.seat('event-test-many','T01')
+        self.assertEqual(seat[:3],('booked',second,'buyer-test-b'))
+        sequence,snapshots=self.sequence('event-test-many'),len(self.snapshots('event-test-many'))
+        confirmed=self.messages('booking.confirmed')
+        # The first customer's charge turns up late.
+        self.consume(payment_envelope('payment.result',first,'paid',payment_id='pay-test-a'))
+        # Never both: the first customer does not get the seat; never neither: they are refunded.
+        self.assertEqual((self.booking_status(first),self.payment_id(first)),('refund_required','pay-test-a'))
+        self.assertEqual((self.booking_status(second),self.payment_id(second)),('confirmed','pay-test-b'))
+        self.assertEqual(self.seat('event-test-many','T01'),seat)
+        self.assertEqual((self.sequence('event-test-many'),len(self.snapshots('event-test-many'))),(sequence,snapshots))
+        self.assertEqual(self.messages('booking.confirmed'),confirmed)
+        self.assertEqual([e['payload'] for e in self.messages('refund.requested')],
+                         [{'booking_id':first,'payment_id':'pay-test-a','customer_email':'buyer-test-a@example.test'}])
+
+    def test_row_8_on_a_cancelled_event_says_payments_unavailable(self):                         # N13 (I2)
+        booking_id=self.pending_booking()
+        self.cancel_big_event()
+        self.assertEqual(self.booking_status(booking_id),'payment_pending')     # row 13 leaves it alone
+        self.make_due(booking_id)
+        self.safety_check(reply=down)
+        self.assertEqual(self.booking_status(booking_id),'released')
+        self.assertEqual(self.cancelled_payloads(),self.expected_cancelled(
+            'payments_unavailable',[(booking_id,'buyer-test')],title=self.event_title()))
+        # A late charge is then refunded (row 9), the event being cancelled changes nothing.
+        self.consume(payment_envelope('payment.result',booking_id,'paid'))
+        self.assertEqual(self.booking_status(booking_id),'refund_required')
+
+    def test_expiry_sweeper_never_touches_payment_pending(self):                                 # N14 (Q3)
+        booking_id=self.pending_booking()
+        self.expire(booking_id)
+        self.assertEqual(self.sweep(),(0,0,0))
+        self.assertEqual(self.booking_status(booking_id),'payment_pending')
+        self.assertEqual(self.seat('event-test-many','T01')[:2],('held',booking_id))
+
+    def test_shutdown_cancels_a_safety_net_call_and_the_booking_stays_pending(self):             # N15 (D5)
+        booking_id=self.pending_booking()
+        self.make_due(booking_id)
+        rows=self.outbox_count()
+        counts=[self.counter('booking_payment_attempts_total',outcome=o) for o in ('timeout','error')]
+        client=self.checkout_client(hang=True,safety=True)
+        self.wait_until(lambda:len(self.payment_calls)>=1)
+        breaker=app.state.checkout.breaker
+        client.__exit__(None,None,None)                               # shutdown while the call waits
+        self.assertEqual(self.booking_status(booking_id),'payment_pending')
+        self.assertEqual(self.outbox_count(),rows)
+        self.assertEqual((breaker.state,breaker.failures),(payments.CLOSED,0))
+        self.assertEqual([self.counter('booking_payment_attempts_total',outcome=o) for o in ('timeout','error')],counts)
+        self.assertEqual(len(self.payment_calls),1)
+
+    def test_lifespan_runs_the_safety_net_survives_an_error_and_stops(self):                     # N16 (D1)
+        first=self.pending_booking('T01','buyer-test-1')
+        self.make_due(first)
+        client=self.checkout_client(safety=True)
+        self.wait_for_status(first,'confirmed')
+        real=db.due_safety_net
+        calls=[]
+
+        def fail_once(*args,**kwargs):
+            calls.append(1)
+            if len(calls)==1:
+                raise psycopg2.OperationalError('simulated database outage')
+            return real(*args,**kwargs)
+        with patch('db.due_safety_net',fail_once),self.assertLogs('booking.safety_net','ERROR'):
+            self.wait_until(lambda:len(calls)>=2)
+        second=self.pending_booking('T02','buyer-test-2')
+        self.make_due(second)
+        self.wait_for_status(second,'confirmed')
+        client.__exit__(None,None,None)
+        third=self.pending_booking('T03','buyer-test-3')
+        self.make_due(third)
+        time.sleep(0.3)
+        self.assertEqual(self.booking_status(third),'payment_pending')
+
+    def test_safety_net_error_backs_off_before_trying_again(self):                               # N17
+        booking_id=self.pending_booking()
+        self.make_due(booking_id)
+        now=[1000.0]
+        errors=self.net_outcome('error')
+        real=db.payment_request
+        reads=[]
+
+        def flaky(booking):
+            reads.append(booking)
+            if len(reads)==1:
+                raise psycopg2.OperationalError('simulated outage')
+            return real(booking)
+
+        def between(i):
+            now[0]+=safety_net.ERROR_BACKOFF_S-1 if i==0 else 2       # still backing off, then over
+        with patch('db.payment_request',flaky),self.assertLogs('booking.safety_net','ERROR'):
+            started=self.safety_check(checks=3,clock=lambda:now[0],between=between)
+        self.assertEqual(started,[[booking_id],[],[booking_id]])
+        self.assertEqual(len(self.net_calls),1)                       # no Payment call for the failed try
+        self.assertEqual(self.booking_status(booking_id),'confirmed')
+        self.assertEqual(self.net_outcome('error'),errors+1)
+
+
+def down(body):
+    """A fake Payment that gives no answer (connection refused)."""
+    raise httpx.ConnectError('Payment is down')
 
 
 def payment_reply(status,body):

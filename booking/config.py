@@ -36,9 +36,16 @@ BOOKING_DEMO_SEED = os.getenv("BOOKING_DEMO_SEED", "false").lower() == "true"
 # The default is the compose service name and its internal port.
 PAYMENT_URL = os.getenv("PAYMENT_URL", "http://payment:8000")
 
+# Safety net (contract section 4 row 8, section 9): a booking still payment_pending
+# this many seconds after checkout_started_at gets ONE more Payment call, then is
+# released. It must be above the background call's longest run (about 6.75 s).
+BOOKING_SAFETY_NET_SECONDS = float(os.getenv("BOOKING_SAFETY_NET_SECONDS", "60"))
+SAFETY_NET_MIN_SECONDS = 7
+
 
 def validate():
-    """Refuse to start with a price or currency Payment would reject (422) on every charge.
+    """Refuse to start with a price or currency Payment would reject (422) on every charge,
+    or with a safety-net delay that could overlap the background Payment call.
 
     Called by main.py's lifespan. Reads the values at call time, so tests can patch them.
     """
@@ -46,3 +53,7 @@ def validate():
         raise ValueError(f"BOOKING_CURRENCY must be three capital letters (e.g. EUR), got {BOOKING_CURRENCY!r}")
     if BOOKING_PRICE_MINOR <= 0:
         raise ValueError(f"BOOKING_PRICE_MINOR must be above 0, got {BOOKING_PRICE_MINOR}")
+    # The safety net must never fire while the background call (at most ~6.75 s) may still run.
+    if not BOOKING_SAFETY_NET_SECONDS >= SAFETY_NET_MIN_SECONDS:     # also refuses NaN
+        raise ValueError(f"BOOKING_SAFETY_NET_SECONDS must be at least {SAFETY_NET_MIN_SECONDS}, "
+                         f"got {BOOKING_SAFETY_NET_SECONDS}")

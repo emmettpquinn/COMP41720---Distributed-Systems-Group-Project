@@ -87,3 +87,6 @@ CREATE TABLE IF NOT EXISTS bookings (
 -- held_until has passed; releases (rows 4 and 13) work on one event's held bookings.
 CREATE INDEX IF NOT EXISTS bookings_status_held_until ON bookings (status, held_until);
 CREATE INDEX IF NOT EXISTS bookings_event_status ON bookings (event_id, status);
+-- The safety net (contract section 4, row 8) looks every 0.5 s for payment_pending
+-- bookings whose checkout_started_at + S has passed.
+CREATE INDEX IF NOT EXISTS bookings_status_checkout_started ON bookings (status, checkout_started_at);

@@ -16,6 +16,7 @@ import expiry
 import metrics
 import outbox
 import payments
+import safety_net
 from api import router
 
 logging.basicConfig(level=logging.INFO, format="%(levelname)s %(name)s: %(message)s")
@@ -51,6 +52,10 @@ async def lifespan(app):
     # upgrade rule and the backfill above; it only writes the outbox, so it
     # runs with or without RabbitMQ. Cancelled with the other tasks below.
     tasks = [asyncio.create_task(expiry.run())]
+    # Contract section 4, row 8: the Payment safety net. It shares checkout's
+    # HTTP client and circuit breaker; like the sweeper it needs no RabbitMQ.
+    safety = safety_net.SafetyNet(app.state.checkout.client, config.BOOKING_SAFETY_NET_SECONDS)
+    safety.start()
     if config.AMQP_URL:
         # Fail startup on a missing shared package, rather than hide it in a task.
         import messaging  # noqa: F401
@@ -62,6 +67,9 @@ async def lifespan(app):
     finally:
         # Payment calls still running are abandoned; their bookings stay
         # payment_pending (Payment finishes a started charge anyway).
+        # The safety net stops FIRST, while the HTTP client is still open: its
+        # running calls are cancelled (no release), never failed by a closed client.
+        await safety.shutdown()
         await app.state.checkout.shutdown()
         for task in tasks:
             task.cancel()

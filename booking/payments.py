@@ -7,7 +7,8 @@ starts run() below as a background task. That task:
 3. if Payment answered (HTTP 200 paid / failed / refunded), applies the answer
    in ONE transaction (db.apply_payment_answer: rows 5, 6 or 7).
 If no attempt gets an answer, the booking stays payment_pending; a later
-payment.result message or the safety net moves it (later steps).
+payment.result message or the safety net (safety_net.py, which makes ONE more
+attempt with PaymentClient.charge_once, through the same breaker) moves it.
 
 Timing (all fixed in code):
 - each attempt has a 2 s TOTAL deadline (asyncio.timeout). httpx's own
@@ -137,34 +138,54 @@ class PaymentClient:
         self.rand = rand
         self.attempt_timeout = attempt_timeout
 
-    async def charge(self, booking_id, amount, currency, customer_email):
-        """Returns a PaymentAnswer, or None if Payment gave no answer."""
-        body = {"booking_id": booking_id, "amount": amount, "currency": currency,
+    @staticmethod
+    def _body(booking_id, amount, currency, customer_email):
+        return {"booking_id": booking_id, "amount": amount, "currency": currency,
                 "customer_email": customer_email}
+
+    async def charge(self, booking_id, amount, currency, customer_email):
+        """The background call: up to 3 attempts. Returns a PaymentAnswer, or None if Payment gave no answer."""
+        body = self._body(booking_id, amount, currency, customer_email)
         for attempt in range(ATTEMPTS):
             if attempt:
                 await self.sleep(self.rand(0, PAUSE_CAPS_S[attempt - 1]))
-            if not self.breaker.try_acquire():
-                # No call is made. The booking stays payment_pending.
-                metrics.PAYMENT_ATTEMPTS.labels("short_circuited").inc()
-                return None
-            try:
-                outcome, answer = await self._attempt(body)
-            except asyncio.CancelledError:
-                self.breaker.record_neutral()      # shutdown: free the trial, count nothing
-                raise
-            metrics.PAYMENT_ATTEMPTS.labels(outcome).inc()
-            if answer is not None:
-                self.breaker.record_success()
+            answer, stop = await self._one_attempt(body, f"attempt {attempt + 1}")
+            if stop:
                 return answer
-            if outcome == "rejected":
-                # Should never happen (the price is fixed at hold time): log it, no retry.
-                self.breaker.record_neutral()
-                log.error("Payment rejected booking %s (409/422); it stays payment_pending", booking_id)
-                return None
-            self.breaker.record_failure()
-            log.warning("Payment attempt %d for booking %s: %s", attempt + 1, booking_id, outcome)
         return None
+
+    async def charge_once(self, booking_id, amount, currency, customer_email):
+        """The safety net's call (contract section 9): exactly ONE attempt, same body, same
+        2 s deadline, same breaker. Returns a PaymentAnswer, or None (no answer, including
+        a breaker refusal or a 409/422)."""
+        answer, _ = await self._one_attempt(self._body(booking_id, amount, currency, customer_email),
+                                            "safety-net attempt")
+        return answer
+
+    async def _one_attempt(self, body, name):
+        """One attempt through the breaker. Returns (PaymentAnswer or None, stop retrying?)."""
+        booking_id = body["booking_id"]
+        if not self.breaker.try_acquire():
+            # No call is made. The booking stays payment_pending.
+            metrics.PAYMENT_ATTEMPTS.labels("short_circuited").inc()
+            return None, True
+        try:
+            outcome, answer = await self._attempt(body)
+        except asyncio.CancelledError:
+            self.breaker.record_neutral()      # shutdown: free the trial, count nothing
+            raise
+        metrics.PAYMENT_ATTEMPTS.labels(outcome).inc()
+        if answer is not None:
+            self.breaker.record_success()
+            return answer, True
+        if outcome == "rejected":
+            # Should never happen (the price is fixed at hold time): log it, no retry.
+            self.breaker.record_neutral()
+            log.error("Payment rejected booking %s (409/422) on the %s", booking_id, name)
+            return None, True
+        self.breaker.record_failure()
+        log.warning("Payment %s for booking %s: %s", name, booking_id, outcome)
+        return None, False
 
     async def _attempt(self, body):
         """One HTTP attempt. Returns (outcome label, PaymentAnswer or None)."""

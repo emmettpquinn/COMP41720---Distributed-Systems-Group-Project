@@ -106,8 +106,9 @@ class PaymentClientTests(unittest.TestCase):
         self.sleeps = []
         self.bounds = []
 
-    def charge(self, answer, booking_id=BOOKING, timeout=payments.ATTEMPT_TIMEOUT_S):
-        """Run one PaymentClient.charge against a fake Payment. answer(request) -> Response."""
+    def charge(self, answer, booking_id=BOOKING, timeout=payments.ATTEMPT_TIMEOUT_S, once=False):
+        """Run one PaymentClient.charge (or charge_once, the safety net's call) against a
+        fake Payment. answer(request) -> Response."""
         async def handler(request):
             self.requests.append(request)
             result = answer(request)
@@ -126,7 +127,8 @@ class PaymentClientTests(unittest.TestCase):
             async with httpx.AsyncClient(transport=httpx.MockTransport(handler)) as http:
                 client = payments.PaymentClient(http, 'http://payment-test:8000/', self.breaker,
                                                 sleep=sleep, rand=rand, attempt_timeout=timeout)
-                return await client.charge(booking_id, 4500, 'EUR', 'buyer-test@example.test')
+                call = client.charge_once if once else client.charge
+                return await call(booking_id, 4500, 'EUR', 'buyer-test@example.test')
         return asyncio.run(go())
 
     def test_answers_are_returned_after_one_attempt(self):                                         # P7
@@ -217,8 +219,64 @@ class PaymentClientTests(unittest.TestCase):
         self.assertEqual(self.charge(lambda r: reply()).status, 'paid')
         self.assertEqual(self.breaker.state, payments.CLOSED)
 
+    # --- The safety net's ONE call (step 7b; contract section 9) ---
+
+    def test_charge_once_makes_exactly_one_attempt_with_the_same_body(self):                      # S1
+        for status in ('paid', 'failed', 'refunded'):
+            with self.subTest(status):
+                self.requests.clear()
+                self.assertEqual(self.charge(lambda r, s=status: reply(s), once=True),
+                                 payments.PaymentAnswer(status, 'pay-test-1'))
+                self.assertEqual(len(self.requests), 1)
+        import json
+        self.assertEqual(json.loads(self.requests[0].content), {'booking_id': BOOKING, 'amount': 4500,
+                                                                'currency': 'EUR',
+                                                                'customer_email': 'buyer-test@example.test'})
+        self.assertEqual((self.sleeps, self.bounds), ([], []))            # no jitter pause
+
+    def test_charge_once_failure_is_one_attempt_counted_once_by_the_breaker(self):                # S2
+        async def hang(request):
+            await asyncio.sleep(1)
+            return reply()
+        for outcome, answer, timeout in (('server_error', lambda r: httpx.Response(503), 2.0),
+                                         ('timeout', hang, 0.05)):
+            with self.subTest(outcome):
+                self.breaker = payments.CircuitBreaker(clock=self.clock)
+                self.requests.clear()
+                before = attempts(outcome)
+                self.assertIsNone(self.charge(answer, timeout=timeout, once=True))
+                self.assertEqual(len(self.requests), 1)
+                self.assertEqual(self.breaker.failures, 1)
+                self.assertEqual(attempts(outcome), before + 1)
+        # 3 background failures + 1 safety-net failure stay under the threshold of 5 (section 9 demo).
+        self.breaker = payments.CircuitBreaker(clock=self.clock)
+        self.charge(lambda r: httpx.Response(503))
+        self.charge(lambda r: httpx.Response(503), once=True)
+        self.assertEqual((self.breaker.state, self.breaker.failures), (payments.CLOSED, 4))
+
+    def test_charge_once_open_breaker_is_no_answer_and_no_request(self):                         # S3
+        self.breaker.failures = 4
+        self.breaker.record_failure()
+        before = attempts('short_circuited')
+        self.assertIsNone(self.charge(lambda r: reply(), once=True))
+        self.assertEqual(self.requests, [])
+        self.assertEqual(attempts('short_circuited'), before + 1)
+
+    def test_charge_once_409_is_no_answer_and_neutral(self):                                     # S4 (I3)
+        self.assertIsNone(self.charge(lambda r: httpx.Response(409, json={'detail': 'x'}), once=True))
+        self.assertEqual((len(self.requests), self.breaker.failures), (1, 0))
+
 
 class ConfigTests(unittest.TestCase):
+    def test_startup_refuses_a_safety_net_below_7_seconds(self):                                     # S5 (D1)
+        for seconds in (6.99, 0, -1, float('nan')):
+            with self.subTest(seconds), patch('config.BOOKING_SAFETY_NET_SECONDS', seconds):
+                with self.assertRaises(ValueError):
+                    config.validate()
+        for seconds in (7, 7.0, 60):
+            with self.subTest(seconds), patch('config.BOOKING_SAFETY_NET_SECONDS', seconds):
+                config.validate()
+
     def test_startup_refuses_a_bad_currency_or_price(self):                                          # P11
         for currency in ('eur', 'EURO', 'EU', '', 'E1R'):
             with self.subTest(currency), patch('config.BOOKING_CURRENCY', currency):

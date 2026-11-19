@@ -24,15 +24,30 @@ CHECKOUTS = Counter("booking_checkouts_total", "Checkout requests by outcome", [
 PAYMENT_ATTEMPTS = Counter("booking_payment_attempts_total", "Payment HTTP attempts by outcome", ["outcome"])
 BREAKER_STATE = Gauge("booking_payment_breaker_state", "Payment circuit breaker: 0 closed, 1 open, 2 half-open")
 # What each background call ended with: confirmed, refund_required, released, noop,
-# or no_answer (every attempt failed; the booking stays payment_pending).
+# late_success (row 9), or no_answer (every attempt failed; the booking stays payment_pending).
 PAYMENT_ANSWERS = Counter("booking_payment_answers_total", "Background payment calls by result", ["result"])
 PAYMENT_APPLY_ERRORS = Counter("booking_payment_apply_errors_total",
                                "Background payment calls that stopped on an error (booking stays payment_pending)")
 # Messages on booking.payment-updates (payment_updates.py) by type and what they did:
-# confirmed, refund_required, released, refunded, refund_pending, noop, duplicate,
+# confirmed, refund_required, released, late_success, refunded, refund_pending, noop, duplicate,
 # or unknown_booking (a booking_id Booking does not know: logged, acknowledged).
 PAYMENT_MESSAGES = Counter("booking_payment_messages_total", "Payment messages applied, by type and result",
                            ["type", "result"])
+
+# Safety net (safety_net.py, contract section 4 row 8 and section 9). One per safety-net
+# call, by what it ended with: confirmed, refund_required, released (Payment answered:
+# rows 5, 6, 7), late_success (answered 'paid' after a release: row 9), payments_unavailable
+# (no answer: row 8 released it), noop (the booking had already moved on) or error (it
+# stays payment_pending; tried again after a pause).
+SAFETY_NET = Counter("booking_safety_net_calls_total", "Safety-net Payment calls by outcome", ["outcome"])
+for _outcome in ("confirmed", "refund_required", "released", "late_success", "payments_unavailable",
+                 "noop", "error"):
+    SAFETY_NET.labels(_outcome)           # show every outcome at 0 from the start
+SAFETY_NET_SKIPPED = Counter("booking_safety_net_skipped_total",
+                             "Due bookings skipped because their safety-net call is still in flight")
+# Row 9 (late success): a 'paid' for a booking already released, from the HTTP reply or a
+# payment.result message. Each one requested a refund. Counted after the commit.
+LATE_SUCCESSES = Counter("booking_late_successes_total", "Late successful payments refunded (row 9)")
 
 # Held bookings released (contract section 4): reason hold_expired (row 4, the
 # expiry sweeper) or event_cancelled (row 13). Counted after the commit.

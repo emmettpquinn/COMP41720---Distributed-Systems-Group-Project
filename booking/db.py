@@ -336,7 +336,19 @@ def _record_message(cur, message_id):
     return cur.rowcount == 1
 
 
+LATE_SUCCESS = "late_success"
+
+
 def apply_payment_answer(booking_id, payment_status, payment_id, message_id=None):
+    """Apply Payment's answer: row 5, 6, 7 or 9 (contract section 4). See _apply_payment_answer."""
+    result = _apply_payment_answer(booking_id, payment_status, payment_id, message_id)
+    # Row 9, counted only after its transaction committed.
+    if result == LATE_SUCCESS:
+        metrics.LATE_SUCCESSES.inc()
+    return result
+
+
+def _apply_payment_answer(booking_id, payment_status, payment_id, message_id=None):
     """Apply Payment's answer to a payment_pending booking: row 5, 6 or 7 (contract section 4).
 
     Two callers, same rows (contract section 9): the HTTP reply (message_id
@@ -352,6 +364,13 @@ def apply_payment_answer(booking_id, payment_status, payment_id, message_id=None
     payment_id is stored in every case. Returns 'confirmed', 'refund_required',
     'released', or 'noop' (the booking was no longer payment_pending: nothing
     written). Any error rolls back everything.
+
+    Row 9 (late success): 'paid' for a booking that is 'released' (normally by
+    the safety net, row 8) -> refund_required, payment_id stored, one
+    refund.requested. The seat is NOT touched: it may already belong to someone
+    else. Returns 'late_success'. 'failed'/'refunded' for a released booking,
+    and 'paid' for any other state, stay 'noop'. The event row is locked here
+    too (it is taken before the booking's state is known); it changes nothing.
 
     Message path only (message_id set): the message_id is recorded first, in
     the same transaction, also for a noop. Returns 'duplicate' if it was
@@ -395,6 +414,8 @@ def apply_payment_answer(booking_id, payment_status, payment_id, message_id=None
             )
             won = cur.fetchone()
             if won is None:
+                if payment_status == "paid":
+                    return _late_success(cur, booking_id, payment_id)
                 return "noop"
             customer_email, customer_name = won
 
@@ -446,6 +467,121 @@ def apply_payment_answer(booking_id, payment_status, payment_id, message_id=None
                     "customer_email": customer_email,
                 })
             return new_status
+    finally:
+        conn.close()
+
+
+def _late_success(cur, booking_id, payment_id):
+    """Row 9, inside _apply_payment_answer's transaction: released -> refund_required.
+
+    ONE conditional UPDATE on the booking row (section 4a), then refund.requested
+    in the same transaction. No seat change, no availability snapshot, no second
+    booking.cancelled. Returns 'late_success', or 'noop' if the booking is not
+    'released' (e.g. a second late 'paid' finds it already refund_required).
+    """
+    cur.execute(
+        """UPDATE bookings SET status = 'refund_required', payment_id = %s, updated_at = now()
+           WHERE booking_id = %s AND status = 'released'
+           RETURNING customer_email""",
+        (payment_id, booking_id),
+    )
+    row = cur.fetchone()
+    if row is None:
+        return "noop"
+    write_outbox(cur, REFUND_REQUESTED, {
+        "booking_id": booking_id,
+        "payment_id": payment_id,
+        "customer_email": row[0],
+    })
+    return LATE_SUCCESS
+
+
+# --- Safety net (contract section 4 row 8, section 9) ---------------------------
+
+PAYMENTS_UNAVAILABLE = "payments_unavailable"
+
+
+def due_safety_net(seconds, limit=50):
+    """booking_ids still payment_pending whose checkout_started_at + seconds has passed
+    (database clock), oldest first.
+
+    Polled every 0.5 s, so it runs on the background pollers' shared connection
+    (_relay_query below) instead of opening a new connection each time.
+    """
+    def work(cur):
+        cur.execute(
+            """SELECT booking_id FROM bookings
+               WHERE status = 'payment_pending'
+                 AND checkout_started_at + make_interval(secs => %s) <= now()
+               ORDER BY checkout_started_at, booking_id
+               LIMIT %s""",
+            (seconds, limit),
+        )
+        return [booking_id for (booking_id,) in cur.fetchall()]
+    return _relay_query(work)
+
+
+def release_payment_pending(booking_id, seconds):
+    """Row 8: Payment gave the safety net no answer; release the booking.
+
+    One transaction, lock order event row -> booking row -> seat row (section
+    4a). No creation lock: checkout requires an event record (section 6).
+    - booking payment_pending -> released, ONLY if still payment_pending and
+      checkout_started_at + seconds has passed (database clock). Otherwise
+      (a payment.result won meanwhile) nothing is written: returns 'noop'.
+    - its seat held -> free (keyed on the booking; must change one row);
+    - one availability snapshot;
+    - booking.cancelled with reason payments_unavailable (section 12 fields).
+    Returns 'payments_unavailable' or 'noop'. Any error rolls back everything.
+    The Payment call happened before, outside any transaction.
+    """
+    conn = connect_once()
+    try:
+        with conn, conn.cursor() as cur:
+            cur.execute("SELECT event_id, seat_id FROM bookings WHERE booking_id = %s", (booking_id,))
+            row = cur.fetchone()
+            if row is None:
+                raise LookupError(f"No booking {booking_id!r}")
+            event_id, seat_id = row
+
+            # 1. The event row.
+            if not _lock_event_row(cur, event_id):
+                raise LookupError(f"No event record for {event_id!r}")
+            cur.execute("SELECT title FROM events WHERE event_id = %s", (event_id,))
+            title = cur.fetchone()[0]
+
+            # 2. The booking row: the deciding conditional update.
+            cur.execute(
+                """UPDATE bookings SET status = 'released', updated_at = now()
+                   WHERE booking_id = %s AND status = 'payment_pending'
+                     AND checkout_started_at + make_interval(secs => %s) <= now()
+                   RETURNING customer_email, customer_name""",
+                (booking_id, seconds),
+            )
+            won = cur.fetchone()
+            if won is None:
+                return "noop"
+            customer_email, customer_name = won
+
+            # 3. The seat row, keyed on the booking.
+            cur.execute(
+                """UPDATE seats SET status = 'free', booking_ref = NULL, customer_id = NULL, held_until = NULL
+                   WHERE event_id = %s AND seat_id = %s AND booking_ref = %s AND status = 'held'""",
+                (event_id, seat_id, booking_id),
+            )
+            if cur.rowcount != 1:
+                raise LookupError(f"Seat {seat_id!r} is not held by booking {booking_id!r}")
+
+            # 4. The outbox rows, in the same transaction.
+            write_availability_snapshot(cur, event_id)
+            write_outbox(cur, BOOKING_CANCELLED, {
+                "booking_id": booking_id,
+                "reason": PAYMENTS_UNAVAILABLE,
+                "customer_email": customer_email,
+                "customer_name": customer_name,
+                "event_title": title[:EVENT_TITLE_MAX],
+            })
+            return PAYMENTS_UNAVAILABLE
     finally:
         conn.close()
 
@@ -761,8 +897,9 @@ def backfill_availability():
 #
 # The relay polls about 4 times a second. Opening a new connection for every
 # query made ~8 new Postgres connections a second even when idle, so the relay's
-# queries below share ONE connection, kept open between polls. Request paths
-# (holds, lookup) still use connect_once() per request.
+# queries below share ONE connection, kept open between polls. The safety net's
+# twice-a-second check (due_safety_net above) shares it too. Request paths
+# (holds, lookup) and all writes of bookings still use connect_once().
 # - Same limits as connect_once() (it opens the connection): connect_timeout 2 s,
 #   statement_timeout 2 s.
 # - Each call is its own transaction and commits its own work ('with conn').

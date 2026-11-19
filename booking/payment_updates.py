@@ -1,6 +1,6 @@
 """Consumes Payment's messages from booking.payment-updates (contract sections 3, 4 and 9).
 
-- payment.result   -> rows 5, 6 or 7: the SAME function as Payment's HTTP reply
+- payment.result   -> rows 5, 6, 7 (or 9, late success): the SAME function as Payment's HTTP reply
                       (db.apply_payment_answer); whichever arrives second does nothing.
 - refund.completed -> row 10: refund_required or refund_pending -> refunded.
 - refund.failed    -> row 11: refund_required -> refund_pending.
@@ -69,9 +69,11 @@ async def handle(envelope):
         return
 
     metrics.PAYMENT_MESSAGES.labels(message_type, result).inc()
-    # unknown_booking, and a noop for a paid result (the booking was no longer
-    # payment_pending; late success, row 9, is not built yet) are worth a warning.
-    noteworthy = result == "unknown_booking" or (result == "noop" and detail.startswith("paid"))
+    # Worth a warning: unknown_booking; late_success (row 9: a charge after the
+    # safety net released the booking, now being refunded); and a noop for a
+    # paid result (the booking had already moved on, e.g. a second late 'paid').
+    noteworthy = (result in ("unknown_booking", db.LATE_SUCCESS)
+                  or (result == "noop" and detail.startswith("paid")))
     log.log(logging.WARNING if noteworthy else logging.INFO,
             "%s %s for booking %s %s-> %s", message_type, envelope.message_id, booking_id,
             detail + " " if detail else "", result)
