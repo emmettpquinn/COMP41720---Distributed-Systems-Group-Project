@@ -8,6 +8,7 @@ from pathlib import Path
 import psycopg2
 
 import config
+import metrics
 
 RETRIES = 10          # how many times to try connecting
 WAIT_SECONDS = 2      # pause between tries
@@ -267,17 +268,24 @@ def start_checkout(booking_id, customer_id, breaker_accepts):
     try:
         with conn, conn.cursor() as cur:
             cur.execute(
-                """SELECT b.status, b.held_until > now(), e.status
-                   FROM bookings b LEFT JOIN events e ON e.event_id = b.event_id
-                   WHERE b.booking_id = %s AND b.customer_id = %s
-                   FOR UPDATE OF b""",
+                """SELECT status, held_until > now(), event_id
+                   FROM bookings
+                   WHERE booking_id = %s AND customer_id = %s
+                   FOR UPDATE""",
                 (booking_id, customer_id),
             )
             row = cur.fetchone()
             # The checks, in the contract's order (section 6).
             if row is None:
                 return "not_found"
-            status, not_expired, event_status = row
+            status, not_expired, event_id = row
+            # Read the event's status AFTER the booking lock, in its own statement.
+            # If the SELECT above had to wait (e.g. for row 13 cancelling the event),
+            # a row joined into it would be the copy from before the wait, and the
+            # cancellation would be missed. A new statement sees the latest commit.
+            cur.execute("SELECT status FROM events WHERE event_id = %s", (event_id,))
+            event = cur.fetchone()
+            event_status = event[0] if event else None
             if status == "payment_pending":
                 return "repeat"
             if event_status == "cancelled":
@@ -335,7 +343,19 @@ def _record_message(cur, message_id):
     return cur.rowcount == 1
 
 
+LATE_SUCCESS = "late_success"
+
+
 def apply_payment_answer(booking_id, payment_status, payment_id, message_id=None):
+    """Apply Payment's answer: row 5, 6, 7 or 9 (contract section 4). See _apply_payment_answer."""
+    result = _apply_payment_answer(booking_id, payment_status, payment_id, message_id)
+    # Row 9, counted only after its transaction committed.
+    if result == LATE_SUCCESS:
+        metrics.LATE_SUCCESSES.inc()
+    return result
+
+
+def _apply_payment_answer(booking_id, payment_status, payment_id, message_id=None):
     """Apply Payment's answer to a payment_pending booking: row 5, 6 or 7 (contract section 4).
 
     Two callers, same rows (contract section 9): the HTTP reply (message_id
@@ -351,6 +371,13 @@ def apply_payment_answer(booking_id, payment_status, payment_id, message_id=None
     payment_id is stored in every case. Returns 'confirmed', 'refund_required',
     'released', or 'noop' (the booking was no longer payment_pending: nothing
     written). Any error rolls back everything.
+
+    Row 9 (late success): 'paid' for a booking that is 'released' (normally by
+    the safety net, row 8) -> refund_required, payment_id stored, one
+    refund.requested. The seat is NOT touched: it may already belong to someone
+    else. Returns 'late_success'. 'failed'/'refunded' for a released booking,
+    and 'paid' for any other state, stay 'noop'. The event row is locked here
+    too (it is taken before the booking's state is known); it changes nothing.
 
     Message path only (message_id set): the message_id is recorded first, in
     the same transaction, also for a noop. Returns 'duplicate' if it was
@@ -394,6 +421,8 @@ def apply_payment_answer(booking_id, payment_status, payment_id, message_id=None
             )
             won = cur.fetchone()
             if won is None:
+                if payment_status == "paid":
+                    return _late_success(cur, booking_id, payment_id)
                 return "noop"
             customer_email, customer_name = won
 
@@ -449,6 +478,121 @@ def apply_payment_answer(booking_id, payment_status, payment_id, message_id=None
         conn.close()
 
 
+def _late_success(cur, booking_id, payment_id):
+    """Row 9, inside _apply_payment_answer's transaction: released -> refund_required.
+
+    ONE conditional UPDATE on the booking row (section 4a), then refund.requested
+    in the same transaction. No seat change, no availability snapshot, no second
+    booking.cancelled. Returns 'late_success', or 'noop' if the booking is not
+    'released' (e.g. a second late 'paid' finds it already refund_required).
+    """
+    cur.execute(
+        """UPDATE bookings SET status = 'refund_required', payment_id = %s, updated_at = now()
+           WHERE booking_id = %s AND status = 'released'
+           RETURNING customer_email""",
+        (payment_id, booking_id),
+    )
+    row = cur.fetchone()
+    if row is None:
+        return "noop"
+    write_outbox(cur, REFUND_REQUESTED, {
+        "booking_id": booking_id,
+        "payment_id": payment_id,
+        "customer_email": row[0],
+    })
+    return LATE_SUCCESS
+
+
+# --- Safety net (contract section 4 row 8, section 9) ---------------------------
+
+PAYMENTS_UNAVAILABLE = "payments_unavailable"
+
+
+def due_safety_net(seconds, limit=50):
+    """booking_ids still payment_pending whose checkout_started_at + seconds has passed
+    (database clock), oldest first.
+
+    Polled every 0.5 s, so it runs on the background pollers' shared connection
+    (_relay_query below) instead of opening a new connection each time.
+    """
+    def work(cur):
+        cur.execute(
+            """SELECT booking_id FROM bookings
+               WHERE status = 'payment_pending'
+                 AND checkout_started_at + make_interval(secs => %s) <= now()
+               ORDER BY checkout_started_at, booking_id
+               LIMIT %s""",
+            (seconds, limit),
+        )
+        return [booking_id for (booking_id,) in cur.fetchall()]
+    return _relay_query(work)
+
+
+def release_payment_pending(booking_id, seconds):
+    """Row 8: Payment gave the safety net no answer; release the booking.
+
+    One transaction, lock order event row -> booking row -> seat row (section
+    4a). No creation lock: checkout requires an event record (section 6).
+    - booking payment_pending -> released, ONLY if still payment_pending and
+      checkout_started_at + seconds has passed (database clock). Otherwise
+      (a payment.result won meanwhile) nothing is written: returns 'noop'.
+    - its seat held -> free (keyed on the booking; must change one row);
+    - one availability snapshot;
+    - booking.cancelled with reason payments_unavailable (section 12 fields).
+    Returns 'payments_unavailable' or 'noop'. Any error rolls back everything.
+    The Payment call happened before, outside any transaction.
+    """
+    conn = connect_once()
+    try:
+        with conn, conn.cursor() as cur:
+            cur.execute("SELECT event_id, seat_id FROM bookings WHERE booking_id = %s", (booking_id,))
+            row = cur.fetchone()
+            if row is None:
+                raise LookupError(f"No booking {booking_id!r}")
+            event_id, seat_id = row
+
+            # 1. The event row.
+            if not _lock_event_row(cur, event_id):
+                raise LookupError(f"No event record for {event_id!r}")
+            cur.execute("SELECT title FROM events WHERE event_id = %s", (event_id,))
+            title = cur.fetchone()[0]
+
+            # 2. The booking row: the deciding conditional update.
+            cur.execute(
+                """UPDATE bookings SET status = 'released', updated_at = now()
+                   WHERE booking_id = %s AND status = 'payment_pending'
+                     AND checkout_started_at + make_interval(secs => %s) <= now()
+                   RETURNING customer_email, customer_name""",
+                (booking_id, seconds),
+            )
+            won = cur.fetchone()
+            if won is None:
+                return "noop"
+            customer_email, customer_name = won
+
+            # 3. The seat row, keyed on the booking.
+            cur.execute(
+                """UPDATE seats SET status = 'free', booking_ref = NULL, customer_id = NULL, held_until = NULL
+                   WHERE event_id = %s AND seat_id = %s AND booking_ref = %s AND status = 'held'""",
+                (event_id, seat_id, booking_id),
+            )
+            if cur.rowcount != 1:
+                raise LookupError(f"Seat {seat_id!r} is not held by booking {booking_id!r}")
+
+            # 4. The outbox rows, in the same transaction.
+            write_availability_snapshot(cur, event_id)
+            write_outbox(cur, BOOKING_CANCELLED, {
+                "booking_id": booking_id,
+                "reason": PAYMENTS_UNAVAILABLE,
+                "customer_email": customer_email,
+                "customer_name": customer_name,
+                "event_title": title[:EVENT_TITLE_MAX],
+            })
+            return PAYMENTS_UNAVAILABLE
+    finally:
+        conn.close()
+
+
 # Contract section 4, rows 10 and 11: message type -> (new status, statuses it may come from).
 REFUND_COMPLETED = "refund.completed"
 REFUND_FAILED = "refund.failed"
@@ -491,6 +635,180 @@ def apply_refund_message(message_id, booking_id, message_type):
         conn.close()
 
 
+# --- Refund recovery (contract section 4 row 12, section 10) ---------------------
+
+REFUND_REQUESTED_AGAIN = "requested"
+BOOKING_ID_MAX = 64     # contract section 1
+
+
+def request_refund_again(booking_id):
+    """Row 12: send a NEW refund.requested for a booking in refund_pending.
+
+    One transaction, booking row only (section 4a): ONE conditional UPDATE that
+    adds 1 to refund_attempts, then one refund.requested outbox row (write_outbox
+    gives it a new message_id). Status and updated_at are NOT changed: the booking
+    stays refund_pending until refund.completed arrives (row 10).
+    Returns (outcome, details):
+    - ('requested', {payment_id, attempt, message_id})
+    - ('unknown_booking', {}), ('wrong_status', {status}), ('no_payment_id', {status}):
+      nothing is written.
+    """
+    if not booking_id or len(booking_id) > BOOKING_ID_MAX:
+        return "unknown_booking", {}       # no such ID can exist (section 1)
+    conn = connect_once()
+    try:
+        with conn, conn.cursor() as cur:
+            cur.execute(
+                """UPDATE bookings SET refund_attempts = refund_attempts + 1
+                   WHERE booking_id = %s AND status = 'refund_pending' AND payment_id IS NOT NULL
+                   RETURNING payment_id, customer_email, refund_attempts""",
+                (booking_id,),
+            )
+            row = cur.fetchone()
+            if row is not None:
+                payment_id, email, attempt = row
+                message_id = write_outbox(cur, REFUND_REQUESTED, {
+                    "booking_id": booking_id,
+                    "payment_id": payment_id,
+                    "customer_email": email,
+                })
+                return REFUND_REQUESTED_AGAIN, {"payment_id": payment_id, "attempt": attempt,
+                                                "message_id": message_id}
+            # Nothing changed. Look up ONLY to explain why (nothing is written).
+            cur.execute("SELECT status, payment_id FROM bookings WHERE booking_id = %s", (booking_id,))
+            found = cur.fetchone()
+            if found is None:
+                return "unknown_booking", {}
+            status, payment_id = found
+            if status == "refund_pending" and payment_id is None:
+                return "no_payment_id", {"status": status}
+            return "wrong_status", {"status": status}
+    finally:
+        conn.close()
+
+
+def refund_pending_ids():
+    """booking_ids in refund_pending, longest waiting first (for the command's --all)."""
+    conn = connect_once()
+    try:
+        with conn, conn.cursor() as cur:
+            cur.execute("SELECT booking_id FROM bookings WHERE status = 'refund_pending' "
+                        "ORDER BY updated_at, booking_id")
+            return [row[0] for row in cur.fetchall()]
+    finally:
+        conn.close()
+
+
+def booking_status_summary():
+    """{status: (count, age in seconds of the oldest booking)} for statuses that have bookings.
+
+    One GROUP BY, database clock. Age is measured from updated_at, which every
+    status change sets (row 12 does not touch it), so it is "how long the oldest
+    booking has been in this status". Used by GET /metrics (contract section 10).
+    """
+    conn = connect_once()
+    try:
+        with conn, conn.cursor() as cur:
+            cur.execute("SELECT status, count(*), EXTRACT(EPOCH FROM now() - min(updated_at))::float8 "
+                        "FROM bookings GROUP BY status")
+            return {status: (count, max(age, 0.0)) for status, count, age in cur.fetchall()}
+    finally:
+        conn.close()
+
+
+# --- Releasing held bookings: hold expiry (row 4) and event cancelled (row 13) ---
+
+def _release_held(cur, event_id, reason, title, expired_only):
+    """Release held bookings of one event and free their seats (contract section 4, rows 4 and 13).
+
+    Runs inside the caller's transaction, AFTER the caller took the event lock
+    (lock order, section 4a: event row -> booking rows -> seat rows). Only
+    bookings still 'held' are touched (and, for row 4, only those whose
+    held_until has passed on the database clock), so a booking a checkout has
+    just moved to payment_pending is never released. Writes one
+    booking.cancelled per released booking; event_title is left out when the
+    event has no record (title None). The caller writes the availability
+    snapshot. Returns how many bookings were released (0 is fine).
+    """
+    expired = " AND held_until < now()" if expired_only else ""
+    cur.execute(
+        f"""UPDATE bookings SET status = 'released', updated_at = now()
+            WHERE event_id = %s AND status = 'held'{expired}
+            RETURNING booking_id, customer_email, customer_name""",
+        (event_id,),
+    )
+    released = cur.fetchall()
+    if not released:
+        return 0
+    booking_ids = [booking_id for booking_id, _, _ in released]
+    # Seat updates are keyed on the booking (section 4a); every one must change.
+    cur.execute(
+        """UPDATE seats SET status = 'free', booking_ref = NULL, customer_id = NULL, held_until = NULL
+           WHERE event_id = %s AND booking_ref = ANY(%s) AND status = 'held'""",
+        (event_id, booking_ids),
+    )
+    if cur.rowcount != len(booking_ids):
+        raise LookupError(f"Event {event_id!r}: {len(booking_ids)} booking(s) released but "
+                          f"{cur.rowcount} seat(s) freed; nothing is changed")
+    for booking_id, customer_email, customer_name in released:
+        payload = {
+            "booking_id": booking_id,
+            "reason": reason,
+            "customer_email": customer_email,
+            "customer_name": customer_name,
+        }
+        if title is not None:
+            payload["event_title"] = title[:EVENT_TITLE_MAX]
+        write_outbox(cur, BOOKING_CANCELLED, payload)
+    return len(released)
+
+
+def expired_hold_events():
+    """Event IDs that have at least one held booking whose held_until has passed (database clock)."""
+    conn = connect_once()
+    try:
+        with conn, conn.cursor() as cur:
+            cur.execute(
+                """SELECT DISTINCT event_id FROM bookings
+                   WHERE status = 'held' AND held_until < now() ORDER BY event_id"""
+            )
+            return [event_id for (event_id,) in cur.fetchall()]
+    finally:
+        conn.close()
+
+
+def release_expired_holds(event_id):
+    """Row 4 for ONE event, in ONE transaction: release all its expired held bookings.
+
+    Lock order as a hold takes it (section 4a): the event row, or, while the
+    event has no record, the creation lock and then a second look. Then the
+    booking rows and seats (_release_held), then ONE availability snapshot if
+    the event has a record and anything was released. Any error rolls back
+    this event only. Returns (bookings released, snapshot written).
+    """
+    conn = connect_once()
+    try:
+        with conn, conn.cursor() as cur:
+            has_record = _lock_event_row(cur, event_id)
+            if not has_record:
+                _lock_event_creation(cur, event_id)
+                has_record = _lock_event_row(cur, event_id)
+            title = None
+            if has_record:
+                cur.execute("SELECT title FROM events WHERE event_id = %s", (event_id,))
+                title = cur.fetchone()[0]
+            released = _release_held(cur, event_id, "hold_expired", title, expired_only=True)
+            snapshot = bool(released) and has_record
+            if snapshot:
+                write_availability_snapshot(cur, event_id)
+    finally:
+        conn.close()
+    # Counted only after the commit above succeeded.
+    if released:
+        metrics.HOLDS_RELEASED.labels("hold_expired").inc(released)
+    return released, snapshot
+
+
 # --- event.changed ------------------------------------------------------------
 
 EVENT_STATUSES = ("scheduled", "cancelled")
@@ -504,6 +822,15 @@ def apply_event_changed(message_id, payload):
     caller's exception makes the shared consumer retry. Returns 'duplicate',
     'stale' or 'applied'.
     """
+    result, released = _apply_event_changed(message_id, payload)
+    # Row 13's releases, counted only after the transaction committed.
+    if released:
+        metrics.HOLDS_RELEASED.labels("event_cancelled").inc(released)
+    return result
+
+
+def _apply_event_changed(message_id, payload):
+    """apply_event_changed's transaction. Returns (result, held bookings released by row 13)."""
     event_id = payload["event_id"]
     version = payload["event_version"]
     status = payload["status"]
@@ -522,7 +849,7 @@ def apply_event_changed(message_id, payload):
                 (message_id,),
             )
             if cur.rowcount == 0:
-                return "duplicate"
+                return "duplicate", 0
 
             # Lock order, as in hold_seat: event first, seats after.
             _lock_event_creation(cur, event_id)
@@ -541,9 +868,10 @@ def apply_event_changed(message_id, payload):
                 (event_id, version, status, payload["title"], payload["starts_at"], payload["timezone"]),
             )
             if cur.rowcount == 0:
-                return "stale"
+                return "stale", 0
 
             created_seats = False
+            released = 0
             if status == "scheduled":
                 cur.execute("SELECT seat_id FROM seats WHERE event_id = %s", (event_id,))
                 known = {seat_id for (seat_id,) in cur.fetchall()}
@@ -562,15 +890,21 @@ def apply_event_changed(message_id, payload):
                            WHERE seats.label IS NULL OR seats.section = ''""",
                         (event_id, seat["seat_id"], seat["section"], seat.get("label")),
                     )
-            # 'cancelled' is stored above and creates no seats. Releasing held
-            # seats on cancellation (contract row 13) is a later step.
+            else:
+                # 'cancelled' is stored above and creates no seats. Contract row 13:
+                # release every booking of this event that is still 'held' (any
+                # number, including zero). payment_pending bookings are left to
+                # Payment's answer (rows 5-7); confirmed ones stay (section 13.2).
+                released = _release_held(cur, event_id, "event_cancelled", payload["title"],
+                                         expired_only=False)
 
-            # Contract section 11: one snapshot when the record is first created
-            # (also for a cancelled-first event: 0 seats), and whenever new free
-            # seats appeared.
-            if not existed or created_seats:
+            # Contract section 11: ONE snapshot when the record is first created
+            # (also for a cancelled-first event), whenever new free seats
+            # appeared, and when row 13 freed seats. Written after the release,
+            # so it lists the freed seats.
+            if not existed or created_seats or released:
                 write_availability_snapshot(cur, event_id)
-            return "applied"
+            return "applied", released
     finally:
         conn.close()
 
@@ -651,8 +985,9 @@ def backfill_availability():
 #
 # The relay polls about 4 times a second. Opening a new connection for every
 # query made ~8 new Postgres connections a second even when idle, so the relay's
-# queries below share ONE connection, kept open between polls. Request paths
-# (holds, lookup) still use connect_once() per request.
+# queries below share ONE connection, kept open between polls. The safety net's
+# twice-a-second check (due_safety_net above) shares it too. Request paths
+# (holds, lookup) and all writes of bookings still use connect_once().
 # - Same limits as connect_once() (it opens the connection): connect_timeout 2 s,
 #   statement_timeout 2 s.
 # - Each call is its own transaction and commits its own work ('with conn').

@@ -126,6 +126,8 @@ services:
       DATABASE_URL: postgresql://booking:booking@booking-db:5432/booking
       AMQP_URL: amqp://guest:guest@rabbitmq:5672/
       BOOKING_DEMO_SEED: ${BOOKING_DEMO_SEED:-false}
+      HOLD_MINUTES: ${HOLD_MINUTES:-10}
+      BOOKING_SAFETY_NET_SECONDS: ${BOOKING_SAFETY_NET_SECONDS:-60}
     ports:
       - "8002:8000"
     depends_on:

@@ -121,8 +121,7 @@ Booking status: `held`, `payment_pending`, `confirmed`, `released`,
 "Payment reports" means either Payment's HTTP reply or a `payment.result`
 message; both feed the same rows (§9).
  
-Rows 1, 2, 3, 5, 6, 7, 10 and 11 are IMPLEMENTED. Rows 4, 8, 9, 12 and 13
-are PROPOSED.
+Rows 1-13 are IMPLEMENTED.
  
 Notes:
 - A hold never expires while a payment is in progress (row 4 applies only to
@@ -135,8 +134,10 @@ Notes:
   recorded after the payment was confirmed, the booking stays confirmed, like
   any confirmed booking on a cancelled event (OPEN, §13.2).
 - Rows 5, 6 and 7 all store Payment's `payment_id`.
-- Row 8 also recovers from a Booking crash mid-payment, because
-  `checkout_started_at` is stored.
+- IMPLEMENTED: Row 8 also recovers from a Booking crash mid-payment,
+  because `checkout_started_at` is stored.
+- Row 12 increments `refund_attempts`; it changes neither `status` nor
+  `updated_at`.
 - Final states: `confirmed`, `refunded`; `released` is final unless a late
   charge arrives (row 9).
 ### 4a. Implementation rules — PROPOSED unless labelled
@@ -145,14 +146,30 @@ Notes:
   status = Y [AND condition]"), checking that exactly one row changed;
   otherwise nothing is changed and the trigger is a no-op (on the message
   path the `message_id` is still recorded). Time conditions use the
-  database clock. IMPLEMENTED for rows 2, 5–7, 10 and 11.
-- Exceptions: row 1 is a conditional UPDATE on the seat plus a booking
-  INSERT (IMPLEMENTED); row 13 acts on all held bookings of one event at
-  once (see the table); any number of rows, including zero, is correct.
+  database clock. IMPLEMENTED for rows 2 and 5–12.
+- Exceptions (IMPLEMENTED):
+  - Row 1 is a conditional UPDATE on the seat plus a booking INSERT.
+  - Row 4 is one conditional UPDATE per EVENT (`event_id = E AND status =
+    'held' AND held_until < now()`), changing any number of rows, including
+    zero. The number of seats freed must match the number of bookings
+    released, or the transaction is undone. One transaction per event; one
+    event failing does not stop the others. Row 4 records no `message_id`.
+  - Row 4's sweeper: it first runs at startup, after the upgrade rule
+    (§4b) and the backfill (§11), then every 5 s. It only writes the
+    outbox, so it runs with or without RabbitMQ. One Booking instance is
+    assumed. A hold has expired when `held_until < now()` (strictly, on
+    the database clock). Until the next sweep, for up to about 5 s, a hold
+    retry on an expired hold still gets 200 with `booking_status: "held"`.
+    The hold length is the setting `HOLD_MINUTES` (default 10).
+  - Row 13 releases every booking of the event that is still `held`
+    (including expired ones not yet swept), with reason `event_cancelled`,
+    in the same transaction as recording the cancellation (also for a
+    cancelled-first event). Any number of rows, including zero, is correct.
+    `payment_pending` and `confirmed` bookings are not touched.
 - Seat updates of an existing booking are keyed on the booking
   (`booking_ref = booking_id`) and must change the matching rows.
-  IMPLEMENTED for rows 5–7: if the seat does not change, the whole
-  transaction is rolled back.
+  IMPLEMENTED for rows 4–8 and 13: if the seats do not change, the whole
+  transaction is rolled back. Row 9 never touches the seat.
 - IMPLEMENTED: Row 2 commits BEFORE Payment is called. Payment is never
   called inside a database transaction, and no row lock is held during a
   Payment call.
@@ -173,9 +190,12 @@ Notes:
     Rows 2, 3, 10 and 11 change no seats and lock only the booking row.
   - IMPLEMENTED: on the message path the `message_id` is recorded first, in
     the same transaction, also when the effect is a no-op.
-  - PROPOSED: rows 4, 8 and 13 take event row → booking row → seat rows (and
-    the creation lock while the event has no record, as a hold does). Rows 9
-    and 12 change no seats and lock only the booking row.
+  - IMPLEMENTED: row 4 takes the creation lock (only while the event has no
+    record) → event row → booking rows → seat rows. Row 13 runs inside
+    `event.changed`: creation lock → event row → booking rows → seat rows.
+    Row 8 takes event row → booking row → seat row (no creation lock:
+    checkout requires a record). Row 9 takes event row → booking row (it
+    shares rows 5–7's code path). Row 12 locks only the booking row.
 - What shares one transaction ("processed `message_id`" applies only when a
   message triggered the row, not an HTTP reply or a timer):
 | Row(s) | In one transaction |
@@ -183,23 +203,28 @@ Notes:
 | 1 | seat conditional UPDATE, booking INSERT (price, `held_until`, email, name), event sequence lock + increment, availability outbox row (sequence and outbox row only for an event with a record) |
 | 2 | booking row lock, booking UPDATE + `checkout_started_at` (then commit, then call Payment) |
 | 3 | nothing is written |
-| 4, 8 | booking, seat → free, sequence, availability + `booking.cancelled` outbox rows, processed `message_id` (row 8's Payment call happens before, outside) |
+| 4 | creation lock (only while the event has no record), event row lock; `UPDATE bookings … WHERE event_id = E AND status = 'held' AND held_until < now()` (any count); their seats → free (count must match); sequence + one availability outbox row (only for an event with a record, and only if any booking was released); one `booking.cancelled` (hold_expired) outbox row per released booking; no processed `message_id` |
+| 8 | event row lock, booking conditional UPDATE (`status = 'payment_pending'` and `checkout_started_at` + S passed, database clock), seat → free, sequence, availability + `booking.cancelled` (payments_unavailable) outbox rows (the Payment call happens before, outside) |
 | 5 | processed `message_id`, event row lock, booking (+ `payment_id`), seat → booked, `booking.confirmed` outbox row |
 | 6 | processed `message_id`, event row lock, booking (+ `payment_id`), seat → free, sequence, availability + `booking.cancelled` + `refund.requested` outbox rows |
 | 7 | processed `message_id`, event row lock, booking (+ `payment_id`), seat → free, sequence, availability + `booking.cancelled` outbox rows |
-| 9 | booking (+ `payment_id`), `refund.requested` outbox row, processed `message_id` |
+| 9 | processed `message_id` (message path only), event row lock, booking conditional UPDATE `released` → `refund_required` (+ `payment_id`), `refund.requested` outbox row; no seat change, no availability, no second `booking.cancelled` |
 | 10, 11 | processed `message_id`, booking conditional UPDATE (status only); no outbox row |
-| 12 | booking conditional check (`status = 'refund_pending'`, e.g. increment `refund_attempts`), `refund.requested` outbox row |
-| 13 | event status/version, processed `message_id`; `UPDATE bookings … WHERE event_id = E AND status = 'held'` (any count); their seats → free; sequence; one availability outbox row; one `booking.cancelled` outbox row per released booking |
+| 12 | booking conditional UPDATE (`status = 'refund_pending' AND payment_id IS NOT NULL`; `refund_attempts` + 1; `status` and `updated_at` unchanged), `refund.requested` outbox row with a new `message_id` |
+| 13 | processed `message_id`, creation lock, event row lock, event status/version; `UPDATE bookings … WHERE event_id = E AND status = 'held'` (any count); their seats → free (count must match); sequence + one availability outbox row (only if row 13 freed seats or the record is new: at most one); one `booking.cancelled` (event_cancelled) outbox row per released booking |
  
-- Rows 1, 2, 3, 5, 6, 7, 10 and 11 and their transactions are IMPLEMENTED
-  (row 1 including the booking INSERT). Rows 4, 8, 9, 12 and 13 are
-  PROPOSED.
-- Known risk: the per-event lock on the event row (rows 1, 4–8, 13; it is
+- Rows 1-13 and their transactions are IMPLEMENTED (row 1 including the
+  booking INSERT).
+- Known risk: the per-event lock on the event row (rows 1, 4–9, 13; it is
   also the sequence lock) makes holds on the same event queue behind each
   other, and Payment's answers (rows 5–7) queue on it behind holds too.
   Holds on an event with a record take the event lock even when they lose
   the seat. Measure it in the 500-buyer test before relying on it.
+- Known risk: every Booking database statement has a 2 s limit, waiting
+  for a lock included. A sweep (row 4) or a safety-net release (row 8)
+  that waits more than 2 s for a busy event's lock fails for that event
+  and is counted; nothing is changed. The sweeper retries it on its next
+  run; the safety net retries that booking after its 30 s error pause (§9).
 ### 4b. Upgrade rule — IMPLEMENTED
 On every start, before the startup snapshots (§11), any seat `held` with no
 booking row (a hold made before bookings existed) is set back to `free`.
@@ -277,6 +302,9 @@ Request: `{ customer_id }`. Checked in this order:
 6. Otherwise 202 `{ booking_id, booking_status: "payment_pending" }` (row 2).
    If a cancellation is committed between these checks and the update, the
    reply is check 3's `event_cancelled` and the booking stays `held`.
+   This also covers a cancellation committed while checkout waits for the
+   booking's lock: the event's status is read after the lock, so the reply
+   is `event_cancelled` (check 3), never `not_checkoutable`.
 - 422 Missing, blank or over-long `customer_id` or `booking_id` (FastAPI
   `detail` format).
 - 503 Any database error (FastAPI `detail` format).
@@ -319,14 +347,15 @@ Rules (IMPLEMENTED unless labelled):
 - `updated` changes stored metadata only; held and booked seats keep their
   status. Seat-map changes after publication are out of scope (Catalogue
   excludes them too).
-- Cancelling an event Booking already knows writes no availability snapshot
-  until row 13 is built. An update that adds no seats writes none (§11).
+- A cancellation writes one availability snapshot only if row 13 freed
+  seats. Combined with a first-record snapshot (§11), that is at most one
+  per message. An update that adds no seats writes none (§11).
 - `cancelled` is remembered even if it arrives first, so an older creation
   cannot reopen inventory. Then new holds are refused (409 `event_cancelled`,
   §5).
-- IMPLEMENTED: after `cancelled`, checkouts are refused (§6); a payment in
-  progress that succeeds is refunded (row 6), one that fails is released as
-  usual (row 7). PROPOSED: held bookings are released (row 13).
+- IMPLEMENTED: after `cancelled`, checkouts are refused (§6); held bookings
+  are released (row 13); a payment in progress that succeeds is refunded
+  (row 6), one that fails is released as usual (row 7).
 - OPEN: Confirmed bookings on a cancelled event keep their valid ticket and
   are not refunded (§13.2). The fix, if wanted, is row 6's refund path applied
   to each confirmed booking on that event.
@@ -390,7 +419,7 @@ Background call:
   under 30 s, or while a trial is in flight. A checkout that loses the trial
   to another call in that brief race stays `payment_pending`.
 - If no attempt gets an answer, the booking stays `payment_pending`. It then
-  moves on a `payment.result` message, or (PROPOSED) by the safety net.
+  moves on a `payment.result` message, or by the safety net.
   Calls still running at shutdown are cancelled; their bookings also stay
   `payment_pending`.
 "Answers" (for the background call and the safety net) means HTTP 200 with
@@ -409,47 +438,78 @@ Metrics:
   breaker refused the attempt.
 - `booking_payment_breaker_state` (gauge): 0 closed, 1 open, 2 half-open.
 - `booking_payment_answers_total{result}`, one per background call:
-  `confirmed`, `refund_required`, `released`, `noop`, `no_answer`.
+  `confirmed`, `refund_required`, `released`, `late_success` (row 9),
+  `noop`, `no_answer`.
 - `booking_payment_apply_errors_total`: background calls stopped by an
   error (the booking stays `payment_pending`).
 - `booking_payment_messages_total{type, result}`, messages on
   `booking.payment-updates`: `confirmed`, `refund_required`, `released`,
-  `refunded`, `refund_pending`, `noop`, `duplicate`, `unknown_booking`.
+  `late_success` (row 9), `refunded`, `refund_pending`, `noop`,
+  `duplicate`, `unknown_booking`.
+- `booking_safety_net_calls_total{outcome}`, one per safety-net call:
+  `confirmed`, `refund_required`, `released` (Payment answered: rows 5–7),
+  `late_success` (row 9), `payments_unavailable` (no answer: row 8),
+  `noop` (the booking had already moved on), `error`.
+- `booking_safety_net_skipped_total`: due bookings skipped because their
+  safety-net call is still in flight.
+- `booking_late_successes_total`: late successes refunded (row 9), from
+  either the HTTP reply or a message; counted after the commit.
  
-Safety net (row 8) — PROPOSED:
+Safety net (row 8) — IMPLEMENTED:
 - Starts counting from the stored `checkout_started_at`.
-- S is a setting; default 60 s.
-- Checked at least every 0.5 s (separately from row 4's 5 s sweeper), so it
-  fires within S + 0.5 s.
-- When it fires, Booking makes ONE more POST /payments (same `booking_id`,
-  2 s timeout, through the breaker). No answer → row 8 releases.
+- S is `BOOKING_SAFETY_NET_SECONDS`; default 60, decimals allowed. Startup
+  is refused if S is below 7 (it must exceed the background call's 6.75 s).
+- Checked every 0.5 s on a fixed rhythm (separately from row 4's 5 s
+  sweeper), up to 50 bookings per check, so it fires within about S + 0.5 s.
+- When it fires, Booking makes ONE more POST /payments (same `booking_id`
+  and body, the same HTTP client and breaker, 2 s total deadline). Payment
+  answers → row 5, 6 or 7. No answer → row 8 releases; a breaker refusal
+  (no request sent) or a 409/422 counts as no answer.
+- Row 8's UPDATE re-checks the status and the time condition (database
+  clock), so a `payment.result` that arrives during the call wins.
+- Row 8 on a cancelled event keeps the reason `payments_unavailable`.
 - Booking keeps an in-memory set of bookings whose safety-net call is in
   progress, and skips a booking that is already in it. So the check can run
   every 0.5 s without starting a second call for the same booking.
+- After an error (e.g. the database is down) the booking stays
+  `payment_pending` and is left alone for 30 s before it is tried again.
+- At shutdown, running safety-net calls are cancelled before the HTTP
+  client closes, so those bookings stay `payment_pending` and are picked up
+  after the restart.
 - After a Booking restart the set is empty, so a booking may get one more
   call. That is harmless: Payment returns the stored result for the same
   `booking_id` and never charges twice (§8).
 - This relies on one Booking instance, the same assumption as the outbox
   relay (§3).
 - After a Booking crash this call may be the first charge. That is correct.
-Demonstrating late success — PROPOSED (no teammate code changes; Booking
-settings only). The times are upper bounds, because of the full jitter:
-- `PAYMENT_DELAY=10` (Payment's maximum), Booking safety net S = 7 s.
-- 0 s: attempt 1 takes Payment's per-booking lock; the provider waits 10 s.
-  Attempts 1–3 time out at about 2, 4.25 and 6.75 s (3 failures; the breaker
-  stays closed).
-- About 7–7.5 s: the safety net calls, waits on Payment's lock, times out at
-  about 9–9.5 s → row 8 releases.
-- 10 s: the charge commits; `payment.result` arrives by about 10.5 s → row 9
-  requests a refund. The refund itself also takes about 10 s, because
-  PAYMENT_DELAY applies to refunds too.
-- Valid range with these values: S + 0.5 s + 2 s < 10 s, i.e. S < 7.5 s, and
-  S above about 6.75 s.
-IMPLEMENTED: the `payment.result` path, without the safety net. Measured
-with `PAYMENT_DELAY=10` on a booking whose event was cancelled during the
-charge: the charge commits at about +10.0 s, row 6 is applied at about
-+10.5 s, and the booking is `refunded` at about +20.8 s.
-## 10. Refund recovery — PROPOSED unless labelled
+Late success (row 9) — IMPLEMENTED:
+- `paid` for a released booking → `refund_required` and one
+  `refund.requested`; the seat is never touched (it may already belong to
+  someone else).
+- `failed` or `refunded` for a released booking does nothing.
+- A duplicate late `paid` (HTTP reply and message) produces exactly one
+  `refund.requested`.
+Late success, measured (there is no live demo): with `PAYMENT_DELAY=10`
+(Payment's maximum) and S = 7 s, the booking was released at about +9.1 s,
+the refund was requested at about +10.6 s and the booking was `refunded` at
+about +21.2 s (PAYMENT_DELAY applies to refunds too). Valid range of S with
+these values: the background call's three attempts end by about 6.75 s, so
+S must be above that (startup requires S ≥ 7); the safety net's call must
+time out before the charge commits at 10 s, so S + 0.5 s + 2 s < 10 s, i.e.
+S < 7.5 s.
+Operations notes:
+- Start Payment before Booking. Otherwise old `payment_pending` bookings
+  are released on the first check; still correct, but avoidable.
+- After a late-success run the breaker holds 4 consecutive failures until
+  the next success.
+- The sweeper and the safety net use the database clock. A clock jump in
+  the VM can make them fire early in real time; that is safe, because
+  every transition is conditional.
+Row 6 through `payment.result`, measured with `PAYMENT_DELAY=10` on a
+booking whose event was cancelled during the charge: the charge commits at
+about +10.0 s, row 6 is applied at about +10.5 s, and the booking is
+`refunded` at about +20.8 s.
+## 10. Refund recovery — IMPLEMENTED unless labelled
 IMPLEMENTED: rows 10 and 11 (`refund.completed` → `refunded`;
 `refund.failed` → `refund_pending`). Two ways a refund can stall:
 1. **Temporary error** (Payment's provider unavailable): Payment retries, then
@@ -463,10 +523,29 @@ IMPLEMENTED: rows 10 and 11 (`refund.completed` → `refunded`;
    Booking's refund recovery command (row 12) sends a NEW `refund.requested`.
    Payment sends `refund.failed` only once per payment, so a second rejection
    produces no message.
-PROPOSED: the refund recovery command (row 12), and metrics: count and age
-of bookings in `refund_required` and in
-`refund_pending` (planned dashboard alert when above 0 for more than a few
-minutes).
+Refund recovery command (row 12), run inside the running Booking container:
+`docker compose exec booking python refund_recovery.py <booking_id>`
+`docker compose exec booking python refund_recovery.py --all`
+- It acts only on a booking in `refund_pending` with a stored `payment_id`
+  (`--all`: every such booking, longest waiting first; one transaction
+  each). It writes one `refund.requested` with a NEW `message_id` to the
+  outbox; the running Booking's relay publishes it. The booking stays
+  `refund_pending` until `refund.completed` (row 10).
+- Any other booking is refused and nothing is written. For one in
+  `refund_required` it names the DLQ replay above (case 1).
+- Exit code: 0 every booking asked was requested (or nothing to do); 1 at
+  least one was refused; 2 bad arguments or the database is unavailable.
+Metrics, read from the database each time `/metrics` is scraped:
+- `booking_bookings{status}`: bookings per status, all seven statuses
+  shown, 0 when a status has none.
+- `booking_refund_oldest_age_seconds{status}` (`refund_required`,
+  `refund_pending`): seconds since the oldest booking in that status
+  entered it (database clock), 0 when there is none.
+- `booking_status_refresh_errors_total`: scrapes where the database could
+  not be read; the scrape still succeeds and the two gauges above keep
+  their last values.
+PROPOSED: a dashboard alert when a refund status is above 0 for more than
+a few minutes.
  
 ## 11. seat.availability-changed (published) — ACCEPTED (Catalogue's proposal)
 Payload exactly: `event_id`, `sequence`, `seats_remaining`,
@@ -482,10 +561,10 @@ Rules (IMPLEMENTED unless labelled):
   - when a newer version adds seats;
   - when the upgrade rule (§4b) frees held seats: one per affected event that
     has a record;
-  - when §4 row 6 or 7 frees a seat.
+  - when §4 row 6, 7 or 8 frees a seat;
+  - when §4 row 4 or 13 frees seats: one per event per transaction (row 4
+    only for an event that has a record).
   Until the first snapshot, Catalogue shows availability as unknown.
-- PROPOSED: also whenever an event's free set changes in §4 rows 4, 8 and
-  13.
 - `sequence` starts at 1 per event; 0 means "no snapshot yet". It is
   incremented in the same transaction as the seat change and the outbox row,
   and the snapshot is computed after taking the sequence lock. It is never
@@ -504,15 +583,19 @@ Rules (IMPLEMENTED unless labelled):
   outbox rows, §3), `booking_outbox_published_total{type}` (rows the broker
   confirmed), and `booking_messages_total{type, outcome}` (consumed
   messages; `outcome` is `processed`, `retried` or `dead_lettered`).
-  Checkout and Payment metrics are in §9.
+  `booking_holds_released_total{reason}` (`hold_expired` for row 4,
+  `event_cancelled` for row 13; counted after the commit) and
+  `booking_expiry_sweep_errors_total` (one per event whose release failed,
+  plus one per failed sweep; the sweeper keeps running).
+  Checkout and Payment metrics are in §9; booking-status metrics in §10.
 ## 12. Messages Booking publishes to Ticketing and Payment
 ACCEPTED: fields as Ticketing reads them today (`docs/messaging.md`,
 `notification/app/handlers.py`) and as Payment validates `refund.requested`
 (`payment/app/messages.py`). Lengths capped per §1.
-IMPLEMENTED: `booking.confirmed`, `booking.cancelled` (reasons
-`payment_failed` and `event_cancelled`) and `refund.requested` are sent as
-below. `booking.cancelled` carries only the fields listed. PROPOSED: the
-reasons `hold_expired` and `payments_unavailable` (rows 4 and 8).
+IMPLEMENTED: `booking.confirmed`, `booking.cancelled` (all four reasons
+below) and `refund.requested` are sent as below. `booking.cancelled`
+carries only the fields listed; row 4 on an event without a record leaves
+out `event_title`.
  
 booking.confirmed
 `booking_id`, `customer_email`, `customer_name`, `event_id`, `event_title`,
@@ -565,3 +648,6 @@ refund.requested
   demo seed) if those become required.
 - Done: `/ready` capabilities are now `['holds', 'checkout']`, and the
   test checks them.
+- Done: the test of other hold outcomes and the cancelled-event checkout
+  test were updated for row 13 (a cancellation now releases held bookings
+  and writes one snapshot).
