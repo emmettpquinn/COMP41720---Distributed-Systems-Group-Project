@@ -321,8 +321,26 @@ def payment_request(booking_id):
     return row
 
 
-def apply_payment_answer(booking_id, payment_status, payment_id):
+def _record_message(cur, message_id):
+    """Record a consumed message_id in the caller's transaction (contract section 3).
+
+    True if it is new; False if it was already recorded (a repeat: do nothing).
+    A second transaction inserting the same ID at the same moment waits here
+    until the first one ends, then gets False.
+    """
+    cur.execute(
+        "INSERT INTO processed_messages (message_id) VALUES (%s) ON CONFLICT DO NOTHING",
+        (message_id,),
+    )
+    return cur.rowcount == 1
+
+
+def apply_payment_answer(booking_id, payment_status, payment_id, message_id=None):
     """Apply Payment's answer to a payment_pending booking: row 5, 6 or 7 (contract section 4).
+
+    Two callers, same rows (contract section 9): the HTTP reply (message_id
+    None) and a payment.result message (message_id set). Whichever comes
+    second finds the booking no longer payment_pending and does nothing.
 
     One transaction, lock order event row -> booking row -> seat row:
     - paid, event not cancelled -> confirmed, seat booked, booking.confirmed
@@ -333,15 +351,25 @@ def apply_payment_answer(booking_id, payment_status, payment_id):
     payment_id is stored in every case. Returns 'confirmed', 'refund_required',
     'released', or 'noop' (the booking was no longer payment_pending: nothing
     written). Any error rolls back everything.
+
+    Message path only (message_id set): the message_id is recorded first, in
+    the same transaction, also for a noop. Returns 'duplicate' if it was
+    already recorded, and 'unknown_booking' (recorded, nothing else) for a
+    booking_id Booking does not know. The HTTP path records nothing and still
+    raises LookupError for an unknown booking.
     """
     if payment_status not in PAYMENT_STATUSES:
         raise ValueError(f"Unknown payment status {payment_status!r}")
     conn = connect_once()
     try:
         with conn, conn.cursor() as cur:
+            if message_id is not None and not _record_message(cur, message_id):
+                return "duplicate"
             cur.execute("SELECT event_id, seat_id FROM bookings WHERE booking_id = %s", (booking_id,))
             row = cur.fetchone()
             if row is None:
+                if message_id is not None:
+                    return "unknown_booking"     # commits the processed row only
                 raise LookupError(f"No booking {booking_id!r}")
             event_id, seat_id = row
 
@@ -417,6 +445,48 @@ def apply_payment_answer(booking_id, payment_status, payment_id):
                     "customer_email": customer_email,
                 })
             return new_status
+    finally:
+        conn.close()
+
+
+# Contract section 4, rows 10 and 11: message type -> (new status, statuses it may come from).
+REFUND_COMPLETED = "refund.completed"
+REFUND_FAILED = "refund.failed"
+REFUND_TRANSITIONS = {
+    REFUND_COMPLETED: ("refunded", ("refund_required", "refund_pending")),   # row 10
+    REFUND_FAILED: ("refund_pending", ("refund_required",)),                  # row 11
+}
+
+
+def apply_refund_message(message_id, booking_id, message_type):
+    """Apply refund.completed (row 10) or refund.failed (row 11).
+
+    One transaction: the processed message_id and ONE conditional UPDATE on
+    the booking row (rows 10/11 change no seats, so only the booking row is
+    locked; section 4a). No outbox row. Decided by message_type only, never by
+    the payload's status (refund.failed carries status "paid").
+    Returns 'refunded' or 'refund_pending' (changed), 'noop' (booking in
+    another state: recorded only), 'unknown_booking' (recorded only) or
+    'duplicate' (already recorded: nothing).
+    """
+    if message_type not in REFUND_TRANSITIONS:
+        raise ValueError(f"Not a refund message type: {message_type!r}")
+    new_status, from_statuses = REFUND_TRANSITIONS[message_type]
+    conn = connect_once()
+    try:
+        with conn, conn.cursor() as cur:
+            if not _record_message(cur, message_id):
+                return "duplicate"
+            cur.execute(
+                """UPDATE bookings SET status = %s, updated_at = now()
+                   WHERE booking_id = %s AND status = ANY(%s)""",
+                (new_status, booking_id, list(from_statuses)),
+            )
+            if cur.rowcount == 1:
+                return new_status
+            # Nothing changed. Look up ONLY to choose the result for the log/metric.
+            cur.execute("SELECT 1 FROM bookings WHERE booking_id = %s", (booking_id,))
+            return "noop" if cur.fetchone() is not None else "unknown_booking"
     finally:
         conn.close()
 

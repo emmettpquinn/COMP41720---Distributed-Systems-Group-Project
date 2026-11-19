@@ -28,6 +28,11 @@ BREAKER_STATE = Gauge("booking_payment_breaker_state", "Payment circuit breaker:
 PAYMENT_ANSWERS = Counter("booking_payment_answers_total", "Background payment calls by result", ["result"])
 PAYMENT_APPLY_ERRORS = Counter("booking_payment_apply_errors_total",
                                "Background payment calls that stopped on an error (booking stays payment_pending)")
+# Messages on booking.payment-updates (payment_updates.py) by type and what they did:
+# confirmed, refund_required, released, refunded, refund_pending, noop, duplicate,
+# or unknown_booking (a booking_id Booking does not know: logged, acknowledged).
+PAYMENT_MESSAGES = Counter("booking_payment_messages_total", "Payment messages applied, by type and result",
+                           ["type", "result"])
 
 # db.hold_seat's outcome -> the label to show on the dashboard.
 HOLD_LABELS = {"held": "held", "already_yours": "retry", "taken": "taken", "not_found": "not_found",

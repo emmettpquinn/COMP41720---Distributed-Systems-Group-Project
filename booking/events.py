@@ -1,10 +1,15 @@
-"""Consumes Catalogue's event.changed messages from booking.event-changes.
+"""Booking's message consumers, and the one RabbitMQ connection they share.
 
-Contract sections 3 and 7. The queue, its retry queues and its DLQ are declared
-by topology-init; this module only consumes, through shared/messaging's
+Contract sections 3 and 7. handle() below consumes Catalogue's event.changed
+from booking.event-changes; payment_updates.handle consumes Payment's messages
+from booking.payment-updates. The queues, their retry queues and DLQs are
+declared by topology-init; this module only consumes, through shared/messaging's
 run_consumer, which acks on success and retries (then dead-letters) on error.
-If RabbitMQ is unreachable, holds keep working: run() keeps reconnecting in
-the background and logs each failure, like Payment's worker.
+
+run() opens ONE connection with one channel per queue (run_consumer sets the
+prefetch on its channel and republishes retries on it). If RabbitMQ is
+unreachable, holds and checkout keep working: run() keeps reconnecting in the
+background and logs each failure, like Payment's worker.
 """
 import asyncio
 import contextlib
@@ -12,6 +17,7 @@ import logging
 
 import db
 import metrics
+import payment_updates
 
 log = logging.getLogger("booking.events")
 
@@ -65,8 +71,13 @@ async def _connect(url):
         raise
 
 
+def consumers():
+    """(queue, handler) pairs that run() consumes, one channel each."""
+    return ((QUEUE, handle), (payment_updates.QUEUE, payment_updates.handle))
+
+
 async def run(url):
-    """Connect, consume, and reconnect forever. Cancel the task to stop it."""
+    """Connect, consume every queue in consumers(), and reconnect forever. Cancel the task to stop it."""
     # Imported here so the module imports without the shared package (as Payment does).
     from messaging import run_consumer
 
@@ -74,8 +85,9 @@ async def run(url):
         try:
             connection = await _connect(url)
             async with connection:
-                channel = await connection.channel(publisher_confirms=True)
-                await run_consumer(channel, QUEUE, handle, on_outcome=track_outcome)
+                for queue, handler in consumers():
+                    channel = await connection.channel(publisher_confirms=True)
+                    await run_consumer(channel, queue, handler, on_outcome=track_outcome)
                 # The robust connection re-registers the consumer after a reconnect.
                 await asyncio.Future()
         except asyncio.CancelledError:
