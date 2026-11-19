@@ -12,6 +12,7 @@ from fastapi import FastAPI
 import config
 import db
 import events
+import expiry
 import metrics
 import outbox
 import payments
@@ -46,7 +47,10 @@ async def lifespan(app):
     # Checkout's background Payment calls: one shared HTTP client and circuit
     # breaker for the app's whole life (payments.py).
     app.state.checkout = payments.create_runner(config.PAYMENT_URL)
-    tasks = []
+    # Contract section 4, row 4: the hold expiry sweeper. Started after the
+    # upgrade rule and the backfill above; it only writes the outbox, so it
+    # runs with or without RabbitMQ. Cancelled with the other tasks below.
+    tasks = [asyncio.create_task(expiry.run())]
     if config.AMQP_URL:
         # Fail startup on a missing shared package, rather than hide it in a task.
         import messaging  # noqa: F401

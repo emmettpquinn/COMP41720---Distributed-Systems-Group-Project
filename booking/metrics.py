@@ -34,6 +34,14 @@ PAYMENT_APPLY_ERRORS = Counter("booking_payment_apply_errors_total",
 PAYMENT_MESSAGES = Counter("booking_payment_messages_total", "Payment messages applied, by type and result",
                            ["type", "result"])
 
+# Held bookings released (contract section 4): reason hold_expired (row 4, the
+# expiry sweeper) or event_cancelled (row 13). Counted after the commit.
+HOLDS_RELEASED = Counter("booking_holds_released_total", "Held bookings released, by reason", ["reason"])
+for _reason in ("hold_expired", "event_cancelled"):
+    HOLDS_RELEASED.labels(_reason)        # show both at 0 from the start
+# Sweeper errors: one per event whose release failed, plus one per failed sweep (expiry.py).
+EXPIRY_ERRORS = Counter("booking_expiry_sweep_errors_total", "Expiry sweeper errors (the sweeper keeps running)")
+
 # db.hold_seat's outcome -> the label to show on the dashboard.
 HOLD_LABELS = {"held": "held", "already_yours": "retry", "taken": "taken", "not_found": "not_found",
                "event_cancelled": "event_cancelled"}

@@ -8,6 +8,7 @@ from pathlib import Path
 import psycopg2
 
 import config
+import metrics
 
 RETRIES = 10          # how many times to try connecting
 WAIT_SECONDS = 2      # pause between tries
@@ -491,6 +492,99 @@ def apply_refund_message(message_id, booking_id, message_type):
         conn.close()
 
 
+# --- Releasing held bookings: hold expiry (row 4) and event cancelled (row 13) ---
+
+def _release_held(cur, event_id, reason, title, expired_only):
+    """Release held bookings of one event and free their seats (contract section 4, rows 4 and 13).
+
+    Runs inside the caller's transaction, AFTER the caller took the event lock
+    (lock order, section 4a: event row -> booking rows -> seat rows). Only
+    bookings still 'held' are touched (and, for row 4, only those whose
+    held_until has passed on the database clock), so a booking a checkout has
+    just moved to payment_pending is never released. Writes one
+    booking.cancelled per released booking; event_title is left out when the
+    event has no record (title None). The caller writes the availability
+    snapshot. Returns how many bookings were released (0 is fine).
+    """
+    expired = " AND held_until < now()" if expired_only else ""
+    cur.execute(
+        f"""UPDATE bookings SET status = 'released', updated_at = now()
+            WHERE event_id = %s AND status = 'held'{expired}
+            RETURNING booking_id, customer_email, customer_name""",
+        (event_id,),
+    )
+    released = cur.fetchall()
+    if not released:
+        return 0
+    booking_ids = [booking_id for booking_id, _, _ in released]
+    # Seat updates are keyed on the booking (section 4a); every one must change.
+    cur.execute(
+        """UPDATE seats SET status = 'free', booking_ref = NULL, customer_id = NULL, held_until = NULL
+           WHERE event_id = %s AND booking_ref = ANY(%s) AND status = 'held'""",
+        (event_id, booking_ids),
+    )
+    if cur.rowcount != len(booking_ids):
+        raise LookupError(f"Event {event_id!r}: {len(booking_ids)} booking(s) released but "
+                          f"{cur.rowcount} seat(s) freed; nothing is changed")
+    for booking_id, customer_email, customer_name in released:
+        payload = {
+            "booking_id": booking_id,
+            "reason": reason,
+            "customer_email": customer_email,
+            "customer_name": customer_name,
+        }
+        if title is not None:
+            payload["event_title"] = title[:EVENT_TITLE_MAX]
+        write_outbox(cur, BOOKING_CANCELLED, payload)
+    return len(released)
+
+
+def expired_hold_events():
+    """Event IDs that have at least one held booking whose held_until has passed (database clock)."""
+    conn = connect_once()
+    try:
+        with conn, conn.cursor() as cur:
+            cur.execute(
+                """SELECT DISTINCT event_id FROM bookings
+                   WHERE status = 'held' AND held_until < now() ORDER BY event_id"""
+            )
+            return [event_id for (event_id,) in cur.fetchall()]
+    finally:
+        conn.close()
+
+
+def release_expired_holds(event_id):
+    """Row 4 for ONE event, in ONE transaction: release all its expired held bookings.
+
+    Lock order as a hold takes it (section 4a): the event row, or, while the
+    event has no record, the creation lock and then a second look. Then the
+    booking rows and seats (_release_held), then ONE availability snapshot if
+    the event has a record and anything was released. Any error rolls back
+    this event only. Returns (bookings released, snapshot written).
+    """
+    conn = connect_once()
+    try:
+        with conn, conn.cursor() as cur:
+            has_record = _lock_event_row(cur, event_id)
+            if not has_record:
+                _lock_event_creation(cur, event_id)
+                has_record = _lock_event_row(cur, event_id)
+            title = None
+            if has_record:
+                cur.execute("SELECT title FROM events WHERE event_id = %s", (event_id,))
+                title = cur.fetchone()[0]
+            released = _release_held(cur, event_id, "hold_expired", title, expired_only=True)
+            snapshot = bool(released) and has_record
+            if snapshot:
+                write_availability_snapshot(cur, event_id)
+    finally:
+        conn.close()
+    # Counted only after the commit above succeeded.
+    if released:
+        metrics.HOLDS_RELEASED.labels("hold_expired").inc(released)
+    return released, snapshot
+
+
 # --- event.changed ------------------------------------------------------------
 
 EVENT_STATUSES = ("scheduled", "cancelled")
@@ -504,6 +598,15 @@ def apply_event_changed(message_id, payload):
     caller's exception makes the shared consumer retry. Returns 'duplicate',
     'stale' or 'applied'.
     """
+    result, released = _apply_event_changed(message_id, payload)
+    # Row 13's releases, counted only after the transaction committed.
+    if released:
+        metrics.HOLDS_RELEASED.labels("event_cancelled").inc(released)
+    return result
+
+
+def _apply_event_changed(message_id, payload):
+    """apply_event_changed's transaction. Returns (result, held bookings released by row 13)."""
     event_id = payload["event_id"]
     version = payload["event_version"]
     status = payload["status"]
@@ -522,7 +625,7 @@ def apply_event_changed(message_id, payload):
                 (message_id,),
             )
             if cur.rowcount == 0:
-                return "duplicate"
+                return "duplicate", 0
 
             # Lock order, as in hold_seat: event first, seats after.
             _lock_event_creation(cur, event_id)
@@ -541,9 +644,10 @@ def apply_event_changed(message_id, payload):
                 (event_id, version, status, payload["title"], payload["starts_at"], payload["timezone"]),
             )
             if cur.rowcount == 0:
-                return "stale"
+                return "stale", 0
 
             created_seats = False
+            released = 0
             if status == "scheduled":
                 cur.execute("SELECT seat_id FROM seats WHERE event_id = %s", (event_id,))
                 known = {seat_id for (seat_id,) in cur.fetchall()}
@@ -562,15 +666,21 @@ def apply_event_changed(message_id, payload):
                            WHERE seats.label IS NULL OR seats.section = ''""",
                         (event_id, seat["seat_id"], seat["section"], seat.get("label")),
                     )
-            # 'cancelled' is stored above and creates no seats. Releasing held
-            # seats on cancellation (contract row 13) is a later step.
+            else:
+                # 'cancelled' is stored above and creates no seats. Contract row 13:
+                # release every booking of this event that is still 'held' (any
+                # number, including zero). payment_pending bookings are left to
+                # Payment's answer (rows 5-7); confirmed ones stay (section 13.2).
+                released = _release_held(cur, event_id, "event_cancelled", payload["title"],
+                                         expired_only=False)
 
-            # Contract section 11: one snapshot when the record is first created
-            # (also for a cancelled-first event: 0 seats), and whenever new free
-            # seats appeared.
-            if not existed or created_seats:
+            # Contract section 11: ONE snapshot when the record is first created
+            # (also for a cancelled-first event), whenever new free seats
+            # appeared, and when row 13 freed seats. Written after the release,
+            # so it lists the freed seats.
+            if not existed or created_seats or released:
                 write_availability_snapshot(cur, event_id)
-            return "applied"
+            return "applied", released
     finally:
         conn.close()
 

@@ -22,6 +22,7 @@ from prometheus_client import REGISTRY
 import db
 import demo_seed
 import events
+import expiry
 import outbox
 import payment_updates
 import payments
@@ -43,6 +44,11 @@ OLD_SEATS_TABLE="""CREATE TABLE seats (
 def example(name):
     """One of Catalogue's example envelopes, e.g. example('created')."""
     return json.loads((EXAMPLES/f'event-{name}.json').read_text())
+
+
+async def idle_sweeper():
+    """Stands in for expiry.run in HTTP tests: never sweeps, stops when cancelled."""
+    await asyncio.Future()
 
 
 @unittest.skipUnless(os.getenv('BOOKING_TEST_DB'), 'Set BOOKING_TEST_DB for isolated PostgreSQL checks')
@@ -104,12 +110,17 @@ class BookingIntegrationTests(unittest.TestCase):
     def processed(self):
         return {row[0] for row in self.query('SELECT message_id FROM processed_messages')}
 
-    def client(self):
+    def client(self,sweeper=False):
         env=patch('config.BOOKING_DEMO_SEED',False)
         env.start();self.addCleanup(env.stop)
         # Never consume the real queue from a test: no RabbitMQ consumer here.
         amqp=patch('config.AMQP_URL','')
         amqp.start();self.addCleanup(amqp.stop)
+        # The expiry sweeper would release holds a test made expire on purpose, at a
+        # random moment. Tests sweep with expiry.sweep_once(); sweeper=True runs the
+        # real loop, every 0.05 s.
+        loop=patch('expiry.SWEEP_SECONDS',0.05) if sweeper else patch('expiry.run',idle_sweeper)
+        loop.start();self.addCleanup(loop.stop)
         client=TestClient(app)
         client.__enter__();self.addCleanup(client.__exit__,None,None,None)
         return client
@@ -329,10 +340,11 @@ class BookingIntegrationTests(unittest.TestCase):
         self.seed_seat()  # race-event has no event record
         self.assertEqual(client.post('/holds',json={'event_id':'race-event','seat_id':'A1','customer_id':'buyer-test'}).status_code,201)
         self.assertEqual((self.outbox_count(),self.sequence()),(count,seq))
-        self.apply('cancelled')  # newer version of an existing event: no new free seats, no snapshot
-        self.assertEqual(self.outbox_count(),count)
+        # Row 13: the cancellation releases buyer-test-1's hold on A1: one snapshot, one booking.cancelled.
+        self.apply('cancelled')
+        self.assertEqual((self.outbox_count(),self.sequence()),(count+2,seq+1))
         self.assertEqual(client.post('/holds',json=body|{'seat_id':'A2'}).status_code,409)               # cancelled
-        self.assertEqual((self.outbox_count(),self.sequence()),(count,seq))
+        self.assertEqual((self.outbox_count(),self.sequence()),(count+2,seq+1))
 
     def test_failed_outbox_insert_rolls_back_the_hold(self):
         self.apply('created')
@@ -1069,7 +1081,9 @@ class BookingIntegrationTests(unittest.TestCase):
         no_record=self.hold(client,seat='A1',customer='buyer-test-3',event_id='race-event')
         result=self.checkout(client,no_record,customer='buyer-test-3')
         self.assertEqual((result.status_code,result.json()['error']),(409,'not_checkoutable'))
-        self.assertEqual({status for (status,) in self.query('SELECT status FROM bookings')},{'held'})
+        # Row 13 released both held bookings of the cancelled event (the expired one too);
+        # the booking without an event record is still held (the sweeper is idle here).
+        self.assertEqual([self.booking_status(b) for b in (expired,cancelled,no_record)],['released','released','held'])
         self.assertEqual(self.payment_calls,[])
 
     def test_breaker_open_or_trial_running_refuses_checkout_and_keeps_the_hold(self):          # C5
@@ -1538,6 +1552,338 @@ class BookingIntegrationTests(unittest.TestCase):
         from messaging import QUEUES
         bound={q.name:q.bindings for q in QUEUES}['booking.payment-updates']
         self.assertEqual(set(bound),{'payment.result','refund.completed','refund.failed'})
+
+    # --- Hold expiry (row 4) and event cancelled (row 13) (step 7a; contract sections 4, 4a, 11, 12) ---
+
+    def expire(self,*booking_ids):
+        """Make holds expire now (database clock), as if HOLD_MINUTES had passed."""
+        self.query("UPDATE bookings SET held_until=now()-interval '1 second' WHERE booking_id = ANY(%s)",(list(booking_ids),))
+
+    def sweep(self):
+        return asyncio.run(expiry.sweep_once())
+
+    def released_count(self,reason):
+        return self.counter('booking_holds_released_total',reason=reason)
+
+    def seat(self,event_id,seat_id):
+        """(status, booking_ref, customer_id, held_until) of one seat."""
+        return self.query('SELECT status,booking_ref,customer_id,held_until FROM seats WHERE event_id=%s AND seat_id=%s',
+                          (event_id,seat_id))[0]
+
+    def cancel_big_event(self,version=2):
+        return db.apply_event_changed(str(uuid.uuid4()),self.big_event(version=version)|{'status':'cancelled'})
+
+    def cancelled_payloads(self):
+        return sorted((e['payload'] for e in self.messages('booking.cancelled')),key=lambda p:p['booking_id'])
+
+    def expected_cancelled(self,reason,bookings,title=None):
+        """booking.cancelled payloads for [(booking_id, customer_id)] with the fallback email and name."""
+        found=[]
+        for booking_id,customer in bookings:
+            payload={'booking_id':booking_id,'reason':reason,'customer_email':f'{customer}@example.test',
+                     'customer_name':customer}
+            if title is not None:
+                payload['event_title']=title
+            found.append(payload)
+        return sorted(found,key=lambda p:p['booking_id'])
+
+    def test_sweep_releases_expired_holds_with_one_snapshot_per_event(self):                   # E1, E6 (row 4)
+        db.apply_event_changed(str(uuid.uuid4()),self.big_event())
+        first=db.hold_seat('event-test-many','T01','buyer-test-1')[1]
+        second=db.hold_seat('event-test-many','T02','buyer-test-2')[1]
+        kept=db.hold_seat('event-test-many','T03','buyer-test-3')[1]
+        self.expire(first,second)
+        sequence=self.sequence('event-test-many');before=self.released_count('hold_expired')
+        self.assertEqual(self.sweep(),(2,1,0))                       # 2 released, ONE snapshot, 0 failed
+        self.assertEqual([self.booking_status(b) for b in (first,second,kept)],['released','released','held'])
+        for seat in ('T01','T02'):
+            self.assertEqual(self.seat('event-test-many',seat),('free',None,None,None))
+        self.assertEqual(self.seat('event-test-many','T03')[:2],('held',kept))
+        self.assertEqual(self.sequence('event-test-many'),sequence+1)
+        latest=self.snapshots('event-test-many')[-1]
+        self.assertEqual(latest['payload']['available_seat_ids'],self.free_seats('event-test-many'))
+        self.assertIn('T01',latest['payload']['available_seat_ids'])
+        self.assertNotIn('T03',latest['payload']['available_seat_ids'])
+        self.assertEqual(self.cancelled_payloads(),self.expected_cancelled(
+            'hold_expired',[(first,'buyer-test-1'),(second,'buyer-test-2')],self.big_event()['title']))
+        for envelope in self.messages('booking.cancelled'):
+            self.assert_booking_envelope(envelope,'booking.cancelled')
+        self.assertEqual(self.released_count('hold_expired'),before+2)
+        # A second sweep finds nothing and writes nothing.
+        count=self.outbox_count()
+        self.assertEqual(self.sweep(),(0,0,0))
+        self.assertEqual(self.outbox_count(),count)
+
+    def test_sweep_ignores_unexpired_payment_pending_and_confirmed(self):                       # E2
+        pending=self.pending_booking('T01','buyer-test-1')
+        confirmed=self.pending_booking('T02','buyer-test-2')
+        self.assertEqual(db.apply_payment_answer(confirmed,'paid','pay-test-2'),'confirmed')
+        fresh=db.hold_seat('event-test-many','T03','buyer-test-3')[1]
+        self.expire(pending,confirmed)          # past held_until, but no longer 'held'
+        count=self.outbox_count()
+        self.assertEqual(self.sweep(),(0,0,0))
+        self.assertEqual([self.booking_status(b) for b in (pending,confirmed,fresh)],['payment_pending','confirmed','held'])
+        self.assertEqual([self.seat('event-test-many',s)[0] for s in ('T01','T02','T03')],['held','booked','held'])
+        self.assertEqual(self.outbox_count(),count)
+
+    def test_sweep_on_event_without_record_sends_no_snapshot_and_no_title(self):                # E3 (Q2)
+        self.seed_seat()        # race-event has no event record
+        booking_id=db.hold_seat('race-event','A1','buyer-test')[1]
+        self.expire(booking_id)
+        self.assertEqual(self.sweep(),(1,0,0))
+        self.assertEqual(self.booking_status(booking_id),'released')
+        self.assertEqual(self.seat('race-event','A1'),('free',None,None,None))
+        self.assertEqual(self.cancelled_payloads(),self.expected_cancelled('hold_expired',[(booking_id,'buyer-test')]))
+        self.assertEqual(self.messages('seat.availability-changed'),[])
+        self.assertEqual(self.query("SELECT count(*) FROM events WHERE event_id='race-event'")[0][0],0)
+
+    def test_sweep_cuts_the_event_title_to_200(self):                                          # E4 (section 1)
+        db.apply_event_changed(str(uuid.uuid4()),self.big_event()|{'title':'T'*250})
+        booking_id=db.hold_seat('event-test-many','T01','buyer-test')[1]
+        self.expire(booking_id)
+        self.sweep()
+        [payload]=self.cancelled_payloads()
+        self.assertEqual(payload['event_title'],'T'*200)
+
+    def test_one_events_failure_does_not_stop_the_others(self):                                # E5 (D3)
+        db.apply_event_changed(str(uuid.uuid4()),self.big_event())
+        db.apply_event_changed(str(uuid.uuid4()),self.big_event(event_id='event-test-other'))
+        bad=db.hold_seat('event-test-many','T01','buyer-test-1')[1]
+        good=db.hold_seat('event-test-other','T01','buyer-test-2')[1]
+        self.expire(bad,good)
+        # Swept in event_id order, so the failing event comes first.
+        self.query("""CREATE FUNCTION fail_release() RETURNS trigger LANGUAGE plpgsql AS
+                      $$ BEGIN IF NEW.event_id = 'event-test-many' THEN RAISE EXCEPTION 'simulated failure'; END IF;
+                         RETURN NEW; END $$""")
+        self.query('CREATE TRIGGER fail_release BEFORE UPDATE ON bookings FOR EACH ROW EXECUTE FUNCTION fail_release()')
+        errors=self.counter('booking_expiry_sweep_errors_total');count=self.outbox_count()
+        with self.assertLogs('booking.expiry','ERROR'):
+            self.assertEqual(self.sweep(),(1,1,1))
+        self.assertEqual([self.booking_status(b) for b in (bad,good)],['held','released'])
+        self.assertEqual(self.seat('event-test-many','T01')[:2],('held',bad))      # rolled back completely
+        self.assertEqual(self.outbox_count(),count+2)                              # good: snapshot + booking.cancelled
+        self.assertEqual([p['booking_id'] for p in self.cancelled_payloads()],[good])
+        self.assertEqual(self.counter('booking_expiry_sweep_errors_total'),errors+1)
+
+    def test_sweep_waits_for_a_checkout_in_flight_and_leaves_it_payment_pending(self):         # E7 (Q3)
+        db.apply_event_changed(str(uuid.uuid4()),self.big_event())
+        booking_id=db.hold_seat('event-test-many','T01','buyer-test')[1]
+        self.query("UPDATE bookings SET held_until=now()+interval '0.3 second' WHERE booking_id=%s",(booking_id,))
+        # A checkout transaction, statement by statement as db.start_checkout runs them:
+        # it locks the booking row while the hold is still valid ...
+        checkout=self.connect()
+        self.addCleanup(checkout.close)
+        cur=checkout.cursor()
+        cur.execute("SELECT b.status, b.held_until > now() FROM bookings b WHERE b.booking_id=%s FOR UPDATE OF b",(booking_id,))
+        self.assertEqual(cur.fetchone(),('held',True))
+        time.sleep(0.4)                         # ... and the hold expires before it commits.
+        with ThreadPoolExecutor(max_workers=1) as executor:
+            sweep=executor.submit(self.sweep)
+            # The sweeper has the event lock and now waits for the booking row.
+            self.wait_until(lambda:self.query('SELECT count(*) FROM pg_locks WHERE NOT granted')[0][0]>0)
+            cur.execute("""UPDATE bookings SET status='payment_pending', checkout_started_at=now(), updated_at=now()
+                           WHERE booking_id=%s AND status='held' AND held_until > now()""",(booking_id,))
+            self.assertEqual(cur.rowcount,1)    # now() is the checkout's start time: still valid
+            checkout.commit()
+            self.assertEqual(sweep.result(timeout=10),(0,0,0))      # its conditional UPDATE re-checked 'held'
+        self.assertEqual(self.booking_status(booking_id),'payment_pending')
+        self.assertEqual(self.seat('event-test-many','T01')[:2],('held',booking_id))
+        self.assertEqual(self.messages('booking.cancelled'),[])
+        # The other order: once swept, a checkout is refused.
+        other=db.hold_seat('event-test-many','T02','buyer-test-2')[1]
+        self.expire(other)
+        self.sweep()
+        self.assertEqual(db.start_checkout(other,'buyer-test-2',True),'not_checkoutable')
+        self.assertEqual(self.booking_status(other),'released')
+
+    def test_checkouts_and_sweeps_racing_never_both_win(self):                                # E7 (stress)
+        db.apply_event_changed(str(uuid.uuid4()),self.big_event())
+        bookings=[db.hold_seat('event-test-many',f'T{n:02d}',f'buyer-test-{n}')[1] for n in range(1,11)]
+        self.query("UPDATE bookings SET held_until=now()+interval '0.15 second'")
+        checkouts=[lambda n=n,b=b:db.start_checkout(b,f'buyer-test-{n}',True) for n,b in zip(range(1,11),bookings)]
+        sweeps=[lambda d=d:(time.sleep(d),self.sweep())[1] for d in (0.1,0.15,0.2,0.25)]
+        with ThreadPoolExecutor(max_workers=14) as executor:
+            futures=[executor.submit(lambda j=j,d=d:(time.sleep(d),j())[1]) for j,d in
+                     zip(checkouts,[0.02*n for n in range(10)])]
+            for job in sweeps:
+                futures.append(executor.submit(job))
+            results=[future.result(timeout=30) for future in futures]
+        self.sweep()                            # anything still held has expired by now
+        cancelled={p['booking_id'] for p in self.cancelled_payloads()}
+        for n,(booking_id,result) in enumerate(zip(bookings,results[:10]),start=1):
+            status=self.booking_status(booking_id)
+            seat=self.seat('event-test-many',f'T{n:02d}')
+            if result=='started':
+                self.assertEqual((status,seat[:2]),('payment_pending',('held',booking_id)))
+                self.assertNotIn(booking_id,cancelled)
+            else:
+                self.assertEqual(result,'not_checkoutable')
+                self.assertEqual((status,seat[0]),('released','free'))
+                self.assertIn(booking_id,cancelled)
+        self.assertEqual(len(self.messages('booking.cancelled')),len(cancelled))   # one per released booking
+
+    def test_sweep_and_hold_retries_and_new_holds(self):                                      # E8 (Q3)
+        self.apply('created')
+        mine=db.hold_seat('event-demo-001','A1','buyer-test')[1]
+        self.expire(mine)
+        # Expired but not swept yet: a retry reports the booking as it is (section 5).
+        self.assertEqual(db.hold_seat('event-demo-001','A1','buyer-test'),('already_yours',mine,'held'))
+        self.assertEqual(db.hold_seat('event-demo-001','A1','buyer-test-2'),('taken',None,None))
+        self.sweep()
+        outcome,theirs,_=db.hold_seat('event-demo-001','A1','buyer-test-2')
+        self.assertEqual(outcome,'held')
+        self.assertEqual(db.hold_seat('event-demo-001','A1','buyer-test'),('taken',None,None))
+        # Racing: one sweep against ten new buyers on an expired seat.
+        self.expire(theirs)
+        jobs=[self.sweep]+[lambda n=n:db.hold_seat('event-demo-001','A1',f'buyer-test-r{n}') for n in range(10)]
+        with ThreadPoolExecutor(max_workers=len(jobs)) as executor:
+            results=[f.result(timeout=30) for f in [executor.submit(job) for job in jobs]]
+        winners=[r[1] for r in results[1:] if r[0]=='held']
+        self.assertLessEqual(len(winners),1)    # holds before the sweep got 'taken'; one after it may win
+        self.assertEqual(self.booking_status(theirs),'released')
+        held=self.query("SELECT booking_id FROM bookings WHERE seat_id='A1' AND event_id='event-demo-001' AND status='held'")
+        self.assertEqual([b for (b,) in held],winners)
+        status,ref,_,_=self.seat('event-demo-001','A1')
+        self.assertEqual((status,ref),('held',winners[0]) if winners else ('free',None))
+        found=self.snapshots()
+        self.assertEqual([e['payload']['sequence'] for e in found],list(range(1,len(found)+1)))
+        self.assertEqual(found[-1]['payload']['available_seat_ids'],self.free_seats('event-demo-001'))
+
+    def test_sweeps_holds_answers_and_event_changed_do_not_deadlock(self):                    # E9 (Q3)
+        pending=[self.pending_booking(f'T{n:02d}',f'buyer-test-{n}') for n in range(1,6)]
+        expired=[db.hold_seat('event-test-many',f'T{n:02d}',f'buyer-test-{n}')[1] for n in range(6,11)]
+        self.expire(*expired)
+        answers=[lambda b=b,s=s:db.apply_payment_answer(b,s,'pay-test-'+b[:8])
+                 for b,s in zip(pending,['paid','failed','paid','refunded','paid'])]
+        holds=[lambda n=n:db.hold_seat('event-test-many',f'T{n:02d}',f'buyer-test-{n}') for n in range(11,21)]
+        changes=[lambda v=v:db.apply_event_changed(str(uuid.uuid4()),self.big_event(version=v,extra=[f'X{v}'])) for v in range(2,5)]
+        sweeps=[self.sweep]*3
+        jobs=holds[:5]+sweeps[:1]+answers[:2]+changes+sweeps[1:]+answers[2:]+holds[5:]
+        with ThreadPoolExecutor(max_workers=len(jobs)) as executor:
+            for future in [executor.submit(job) for job in jobs]:
+                future.result(timeout=30)       # a deadlock error would raise here
+        self.assertEqual({self.booking_status(b) for b in expired},{'released'})
+        self.assertEqual([self.booking_status(b) for b in pending],['confirmed','released','confirmed','released','confirmed'])
+        found=self.snapshots('event-test-many')
+        self.assertEqual([e['payload']['sequence'] for e in found],list(range(1,len(found)+1)))
+        self.assertEqual(found[-1]['payload']['available_seat_ids'],self.free_seats('event-test-many'))
+
+    def test_lifespan_runs_the_sweeper_survives_an_error_and_stops(self):                     # E10 (D1)
+        self.apply('created')
+        client=self.client(sweeper=True)
+        first=self.hold(client)
+        self.expire(first)
+        self.wait_for_status(first,'released')
+        # One failing sweep is logged and counted; the loop keeps going.
+        errors=self.counter('booking_expiry_sweep_errors_total')
+        real=db.expired_hold_events
+        calls=[]
+        def fail_once():
+            calls.append(1)
+            if len(calls)==1:
+                raise psycopg2.OperationalError('simulated database outage')
+            return real()
+        with patch('db.expired_hold_events',fail_once),self.assertLogs('booking.expiry','ERROR'):
+            self.wait_until(lambda:len(calls)>=2)
+        self.assertEqual(self.counter('booking_expiry_sweep_errors_total'),errors+1)
+        second=self.hold(client,seat='A2')
+        self.expire(second)
+        self.wait_for_status(second,'released')
+        # After shutdown the sweeper has stopped.
+        client.__exit__(None,None,None)
+        third=db.hold_seat('event-demo-001','A1','buyer-test-3')[1]
+        self.expire(third)
+        time.sleep(0.3)
+        self.assertEqual(self.booking_status(third),'held')
+
+    def test_cancel_releases_only_held_bookings_with_one_snapshot(self):                      # R1 (row 13)
+        pending=self.pending_booking('T01','buyer-test-1')
+        confirmed=self.pending_booking('T02','buyer-test-2')
+        self.assertEqual(db.apply_payment_answer(confirmed,'paid','pay-test-2'),'confirmed')
+        first=db.hold_seat('event-test-many','T03','buyer-test-3')[1]
+        second=db.hold_seat('event-test-many','T04','buyer-test-4')[1]
+        self.expire(second)                     # expired but not swept: released by row 13 too
+        sequence=self.sequence('event-test-many');before=self.released_count('event_cancelled')
+        message_id=str(uuid.uuid4())
+        self.assertEqual(db.apply_event_changed(message_id,self.big_event(version=2)|{'status':'cancelled'}),'applied')
+        self.assertEqual([self.booking_status(b) for b in (pending,confirmed,first,second)],
+                         ['payment_pending','confirmed','released','released'])
+        self.assertEqual([self.seat('event-test-many',s)[0] for s in ('T01','T02','T03','T04')],
+                         ['held','booked','free','free'])
+        self.assertEqual(self.sequence('event-test-many'),sequence+1)             # ONE snapshot
+        latest=self.snapshots('event-test-many')[-1]
+        self.assertEqual(latest['payload']['available_seat_ids'],self.free_seats('event-test-many'))
+        self.assertIn('T03',latest['payload']['available_seat_ids'])
+        self.assertEqual(self.cancelled_payloads(),self.expected_cancelled(
+            'event_cancelled',[(first,'buyer-test-3'),(second,'buyer-test-4')],self.big_event()['title']))
+        self.assertIn(message_id,self.processed())
+        self.assertEqual(self.released_count('event_cancelled'),before+2)
+        # The payment in progress is then refunded as before (row 6).
+        self.assertEqual(db.apply_payment_answer(pending,'paid','pay-test-1'),'refund_required')
+
+    def test_cancelled_first_event_releases_existing_holds_in_its_first_snapshot(self):       # R2 (Q1b)
+        self.seed_seat()        # race-event: seat A1, no event record
+        booking_id=db.hold_seat('race-event','A1','buyer-test')[1]
+        payload=self.big_event(event_id='race-event')|{'status':'cancelled','seats':[]}
+        self.assertEqual(db.apply_event_changed(str(uuid.uuid4()),payload),'applied')
+        self.assertEqual(self.booking_status(booking_id),'released')
+        self.assertEqual(self.seat('race-event','A1'),('free',None,None,None))
+        [snapshot]=self.snapshots('race-event')                                  # one, not two
+        self.assertEqual((snapshot['payload']['sequence'],snapshot['payload']['available_seat_ids']),(1,['A1']))
+        self.assertEqual(self.cancelled_payloads(),self.expected_cancelled(
+            'event_cancelled',[(booking_id,'buyer-test')],payload['title']))
+
+    def test_cancel_with_no_holds_and_a_stale_cancel_change_nothing(self):                    # R3
+        self.apply('created')
+        count=self.outbox_count()
+        self.assertEqual(self.apply('cancelled'),'applied')                     # nothing held: no snapshot
+        self.assertEqual(self.outbox_count(),count)
+        db.apply_event_changed(str(uuid.uuid4()),self.big_event())
+        booking_id=db.hold_seat('event-test-many','T01','buyer-test')[1]
+        count=self.outbox_count()
+        self.assertEqual(self.cancel_big_event(version=1),'stale')              # not newer: nothing happens
+        self.assertEqual(self.booking_status(booking_id),'held')
+        self.assertEqual(self.outbox_count(),count)
+
+    def test_failed_outbox_insert_rolls_back_the_cancellation(self):                         # R4
+        self.apply('created')
+        booking_id=db.hold_seat('event-demo-001','A1','buyer-test')[1]
+        self.query("""CREATE FUNCTION fail_outbox_insert() RETURNS trigger LANGUAGE plpgsql AS
+                      $$ BEGIN RAISE EXCEPTION 'simulated outbox failure'; END $$""")
+        self.query('CREATE TRIGGER fail_outbox BEFORE INSERT ON outbox FOR EACH ROW EXECUTE FUNCTION fail_outbox_insert()')
+        before=self.released_count('event_cancelled')
+        with self.assertRaises(psycopg2.Error):
+            self.apply('cancelled',message_id='msg-test-cancel')
+        self.assertEqual(self.event_row()[:2],(1,'scheduled'))
+        self.assertEqual(self.booking_status(booking_id),'held')
+        self.assertEqual(self.seat_rows()[0][3:5],('held',booking_id))
+        self.assertNotIn('msg-test-cancel',self.processed())
+        self.assertEqual(self.released_count('event_cancelled'),before)
+
+    def test_cancel_racing_checkouts_never_both_win(self):                                   # R5 (Q3)
+        db.apply_event_changed(str(uuid.uuid4()),self.big_event())
+        bookings=[db.hold_seat('event-test-many',f'T{n:02d}',f'buyer-test-{n}')[1] for n in range(1,11)]
+        checkouts=[lambda n=n,b=b:db.start_checkout(b,f'buyer-test-{n}',True) for n,b in zip(range(1,11),bookings)]
+        jobs=checkouts[:5]+[self.cancel_big_event]+checkouts[5:]
+        with ThreadPoolExecutor(max_workers=len(jobs)) as executor:
+            results=[f.result(timeout=30) for f in [executor.submit(job) for job in jobs]]
+        results=results[:5]+results[6:]
+        cancelled={p['booking_id'] for p in self.cancelled_payloads()}
+        for n,(booking_id,result) in enumerate(zip(bookings,results),start=1):
+            status=self.booking_status(booking_id)
+            seat=self.seat('event-test-many',f'T{n:02d}')
+            if result=='started':
+                self.assertEqual((status,seat[:2]),('payment_pending',('held',booking_id)))
+                self.assertNotIn(booking_id,cancelled)
+                # Payment's answer after the cancellation: refunded (row 6), seat freed.
+                self.assertEqual(db.apply_payment_answer(booking_id,'paid','pay-test-'+booking_id[:8]),'refund_required')
+            else:
+                self.assertEqual(result,'event_cancelled')
+                self.assertEqual((status,seat[0]),('released','free'))
+                self.assertIn(booking_id,cancelled)
+        found=self.snapshots('event-test-many')
+        self.assertEqual([e['payload']['sequence'] for e in found],list(range(1,len(found)+1)))
+        self.assertEqual(found[-1]['payload']['available_seat_ids'],self.free_seats('event-test-many'))
 
 
 def payment_reply(status,body):
