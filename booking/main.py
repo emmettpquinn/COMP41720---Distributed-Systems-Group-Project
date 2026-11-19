@@ -4,7 +4,6 @@ from contextlib import asynccontextmanager
 import asyncio
 import contextlib
 import logging
-import os
 import time
 
 import uvicorn
@@ -15,6 +14,7 @@ import db
 import events
 import metrics
 import outbox
+import payments
 from api import router
 
 logging.basicConfig(level=logging.INFO, format="%(levelname)s %(name)s: %(message)s")
@@ -22,8 +22,10 @@ logging.basicConfig(level=logging.INFO, format="%(levelname)s %(name)s: %(messag
 
 @asynccontextmanager
 async def lifespan(app):
+    # Refuse to start with a price or currency Payment would always reject.
+    config.validate()
     db.init_schema()
-    if os.getenv("BOOKING_DEMO_SEED", "false").lower() == "true":
+    if config.BOOKING_DEMO_SEED:
         from demo_seed import seed
         seed()
     # Contract section 4b: seats held by the old hold-only code have no booking;
@@ -38,7 +40,12 @@ async def lifespan(app):
     written = db.backfill_availability()
     if written:
         logging.getLogger("booking").info("Backfilled availability for %d event(s)", written)
+    # Uses the relay's shared database connection (db.py), in a thread, before
+    # the relay task exists; db.py's lock keeps the two from overlapping anyway.
     await outbox.refresh_pending()
+    # Checkout's background Payment calls: one shared HTTP client and circuit
+    # breaker for the app's whole life (payments.py).
+    app.state.checkout = payments.create_runner(config.PAYMENT_URL)
     tasks = []
     if config.AMQP_URL:
         # Fail startup on a missing shared package, rather than hide it in a task.
@@ -49,11 +56,16 @@ async def lifespan(app):
     try:
         yield
     finally:
+        # Payment calls still running are abandoned; their bookings stay
+        # payment_pending (Payment finishes a started charge anyway).
+        await app.state.checkout.shutdown()
         for task in tasks:
             task.cancel()
         for task in tasks:
             with contextlib.suppress(asyncio.CancelledError):
                 await task
+        # The relay has stopped; close its shared database connection.
+        await asyncio.to_thread(db.close_relay_connection)
 
 
 app = FastAPI(title="Booking", lifespan=lifespan)

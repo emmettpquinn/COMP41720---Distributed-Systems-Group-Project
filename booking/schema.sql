@@ -51,6 +51,13 @@ CREATE TABLE IF NOT EXISTS outbox (
 );
 -- The relay only ever looks for unpublished rows, oldest first.
 CREATE INDEX IF NOT EXISTS outbox_unpublished ON outbox (created_at) WHERE published_at IS NULL;
+-- Permanent publish failures (contract section 3): a row the broker returned as
+-- unroutable is "set aside": failed_at and error are set, published_at stays
+-- NULL, and the relay never tries it again. Pending = published_at IS NULL AND
+-- failed_at IS NULL. Safe on an existing database: nullable, so existing rows
+-- keep failed_at NULL (not set aside).
+ALTER TABLE outbox ADD COLUMN IF NOT EXISTS failed_at TIMESTAMPTZ;   -- NULL = not set aside
+ALTER TABLE outbox ADD COLUMN IF NOT EXISTS error TEXT;              -- why it was set aside (max 500 characters)
 
 -- One row per booking (contract sections 4 and 5). Created by a successful hold,
 -- in the same transaction as the seat update (section 4a, row 1). booking_id is

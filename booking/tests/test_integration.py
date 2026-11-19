@@ -7,10 +7,13 @@ from datetime import datetime, timedelta
 import json
 import os
 from pathlib import Path
+import threading
+import time
 import unittest
 from unittest.mock import patch
 import uuid
 
+import httpx
 import psycopg2
 from psycopg2 import sql
 from fastapi.testclient import TestClient
@@ -20,6 +23,8 @@ import db
 import demo_seed
 import events
 import outbox
+import payment_updates
+import payments
 from main import app
 
 # Catalogue's real message examples: <repo>/catalogue/examples/contracts. In the
@@ -52,6 +57,8 @@ class BookingIntegrationTests(unittest.TestCase):
         factory=patch('db.connect_once',self.connect)
         factory.start()
         self.addCleanup(factory.stop)
+        # The relay keeps one shared connection (db.py); never let it outlive this test's schema.
+        self.addCleanup(db.close_relay_connection)
         db.init_schema()
 
     def connect(self):
@@ -98,7 +105,7 @@ class BookingIntegrationTests(unittest.TestCase):
         return {row[0] for row in self.query('SELECT message_id FROM processed_messages')}
 
     def client(self):
-        env=patch.dict(os.environ,{'BOOKING_DEMO_SEED':'false'})
+        env=patch('config.BOOKING_DEMO_SEED',False)
         env.start();self.addCleanup(env.stop)
         # Never consume the real queue from a test: no RabbitMQ consumer here.
         amqp=patch('config.AMQP_URL','')
@@ -150,10 +157,12 @@ class BookingIntegrationTests(unittest.TestCase):
             self.assertEqual(result.status_code,503)
             self.assertNotIn('private',result.text)
 
-    def test_readiness_identifies_hold_only_capability(self):
-        result=self.client().get('/ready')
+    def test_readiness_reports_holds_and_checkout_without_calling_payment(self):               # C13
+        client=self.checkout_client()
+        result=client.get('/ready')
         self.assertEqual(result.status_code,200)
-        self.assertEqual(result.json()['capabilities'],['holds'])
+        self.assertEqual(result.json()['capabilities'],['holds','checkout'])
+        self.assertEqual(self.payment_calls,[])
         self.assertEqual(self.client().post('/checkout',json={}).status_code,404)
 
     # --- event.changed (contract sections 3 and 7) ---
@@ -587,7 +596,7 @@ class BookingIntegrationTests(unittest.TestCase):
         self.assertEqual(client.get(f'/bookings/{booking_id}',params={'customer_id':'c'*65}).status_code,422)
         self.assertEqual(client.get('/bookings/'+'b'*65,params={'customer_id':'buyer-test'}).status_code,422)
         self.assertEqual(client.get('/bookings/'+'b'*64,params={'customer_id':'buyer-test'}).status_code,404)
-        self.assertEqual(client.get('/ready').json()['capabilities'],['holds'])
+        self.assertEqual(client.get('/ready').json()['capabilities'],['holds','checkout'])
 
     def test_lookup_database_failure_is_safe_503(self):
         client=self.client()
@@ -656,6 +665,918 @@ class BookingIntegrationTests(unittest.TestCase):
         # Exactly one snapshot (from the upgrade; the backfill then skips it), showing A1 free again.
         self.assertEqual([e['payload'] for e in found],
                          [{'event_id':'event-test-start','sequence':1,'seats_remaining':2,'available_seat_ids':['A1','A2']}])
+
+    # --- Step 6b-1: relay batch, temporary vs permanent failures, write_outbox, relay connection ---
+
+    def add_outbox_rows(self,count,message_type='booking.test-relay'):
+        """count outbox rows, created_at one second apart, INSERTED NEWEST FIRST
+        (so only created_at can give the right order). Returns message_ids, oldest first."""
+        from messaging import Envelope
+        envelopes=[Envelope.new(message_type,{'n':n},producer='booking') for n in range(count)]
+        connection=self.connect()
+        try:
+            with connection,connection.cursor() as cursor:
+                for n in reversed(range(count)):
+                    cursor.execute("INSERT INTO outbox (message_id,type,envelope,created_at) VALUES (%s,%s,%s,"
+                                   "timestamptz '2026-01-01 00:00:00+00' + make_interval(secs => %s))",
+                                   (envelopes[n].message_id,message_type,envelopes[n].to_json().decode(),n))
+        finally:
+            connection.close()
+        return [e.message_id for e in envelopes]
+
+    def recorder(self,fail=None):
+        """A fake publish. fail(message_id) may return an exception to raise instead."""
+        sent=[]
+        async def publish(text):
+            message_id=json.loads(text)['message_id']
+            error=fail(message_id) if fail else None
+            if error is not None:
+                raise error
+            sent.append(message_id)
+        return publish,sent
+
+    def outbox_state(self,message_id):
+        """(published?, set aside?, error) for one outbox row."""
+        published,failed,error=self.query('SELECT published_at,failed_at,error FROM outbox WHERE message_id=%s',(message_id,))[0]
+        return (published is not None,failed is not None,error)
+
+    def gauges(self):
+        """booking_outbox_pending and booking_outbox_failed, after a refresh from the database."""
+        asyncio.run(outbox.refresh_pending())
+        return (REGISTRY.get_sample_value('booking_outbox_pending'),REGISTRY.get_sample_value('booking_outbox_failed'))
+
+    def test_relay_publishes_oldest_fifty_then_the_rest(self):                                   # T1
+        ids=self.add_outbox_rows(60)
+        publish,sent=self.recorder()
+        self.assertEqual(asyncio.run(outbox.dispatch_once(publish)),50)
+        self.assertEqual(sent,ids[:50])
+        self.assertEqual(asyncio.run(outbox.dispatch_once(publish)),10)
+        self.assertEqual(sent,ids)
+        self.assertEqual(self.gauges(),(0,0))
+
+    def test_temporary_failure_keeps_the_row_and_later_rows_pending(self):                       # T2
+        ids=self.add_outbox_rows(3)
+        # A confirm timeout: aiormq's publish raises TimeoutError (asyncio.timeout).
+        publish,sent=self.recorder(lambda m:TimeoutError('no confirm within 5 s') if m==ids[1] else None)
+        with self.assertRaises(outbox.PublishFailed) as caught:
+            asyncio.run(outbox.dispatch_once(publish))
+        self.assertIsInstance(caught.exception.__cause__,TimeoutError)
+        self.assertEqual(sent,[ids[0]])
+        self.assertEqual([self.outbox_state(m) for m in ids],[(True,False,None),(False,False,None),(False,False,None)])
+        self.assertEqual(self.gauges(),(2,0))
+        # A lost connection is temporary too; once the broker is back the rows go out in order.
+        publish,sent=self.recorder(lambda m:ConnectionError('connection lost') if m==ids[1] else None)
+        with self.assertRaises(outbox.PublishFailed):
+            asyncio.run(outbox.dispatch_once(publish))
+        publish,sent=self.recorder()
+        self.assertEqual(asyncio.run(outbox.dispatch_once(publish)),2)
+        self.assertEqual(sent,ids[1:])
+        self.assertEqual(self.gauges(),(0,0))
+
+    def test_permanent_failure_sets_the_row_aside_and_the_relay_moves_on(self):                 # T3
+        ids=self.add_outbox_rows(3)
+        tried=[]
+        def fail(message_id):
+            tried.append(message_id)
+            return unroutable_error() if message_id==ids[1] else None
+        publish,sent=self.recorder(fail)
+        with self.assertLogs('booking.outbox','WARNING') as logs:
+            self.assertEqual(asyncio.run(outbox.dispatch_once(publish)),2)
+        self.assertEqual(sent,[ids[0],ids[2]])                       # row 3 went out in the same run
+        published,set_aside,error=self.outbox_state(ids[1])
+        self.assertEqual((published,set_aside),(False,True))
+        for part in ('PublishError','312','NO_ROUTE'):
+            self.assertIn(part,error)
+        self.assertTrue(any(ids[1] in line and 'booking.test-relay' in line for line in logs.output))
+        self.assertEqual((db.count_pending_outbox(),db.count_failed_outbox()),(0,1))
+        self.assertEqual(self.gauges(),(0,1))
+        tried.clear()
+        self.assertEqual(asyncio.run(outbox.dispatch_once(publish)),0)
+        self.assertEqual(tried,[])                                    # never retried
+        # Only an unpublished, not-yet-set-aside row can be set aside; the error is cut to 500.
+        self.assertFalse(db.set_aside_outbox(ids[1],'again'))
+        self.assertEqual(self.outbox_state(ids[1])[2],error)
+        self.assertFalse(db.set_aside_outbox(ids[0],'published already'))
+        (extra,)=self.add_outbox_rows(1)
+        self.assertTrue(db.set_aside_outbox(extra,'x'*600))
+        self.assertEqual(len(self.outbox_state(extra)[2]),500)
+
+    def test_broker_nack_is_temporary(self):                                                    # T4
+        ids=self.add_outbox_rows(3)
+        publish,sent=self.recorder(lambda m:nack_error() if m==ids[1] else None)
+        with self.assertRaises(outbox.PublishFailed) as caught:
+            asyncio.run(outbox.dispatch_once(publish))
+        from aio_pika.exceptions import DeliveryError,PublishError
+        self.assertIsInstance(caught.exception.__cause__,DeliveryError)
+        self.assertNotIsInstance(caught.exception.__cause__,PublishError)
+        self.assertEqual(sent,[ids[0]])
+        self.assertEqual(self.outbox_state(ids[1]),(False,False,None))
+        self.assertEqual(self.gauges(),(2,0))
+        self.assertFalse(outbox.is_permanent(nack_error()))
+        self.assertTrue(outbox.is_permanent(unroutable_error()))
+
+    def test_write_outbox_inside_the_callers_transaction(self):                                 # T5
+        from messaging import Envelope
+        payload={'booking_id':'booking-test-1','count':1,'items':['a','b']}
+        connection=self.connect()
+        try:
+            with connection,connection.cursor() as cursor:
+                message_id=db.write_outbox(cursor,'booking.test-type',payload)
+                self.assertEqual(self.outbox_count(),0)   # not committed: another connection cannot see it
+        finally:
+            connection.close()
+        row_type,text,published_at,failed_at=self.query(
+            'SELECT type,envelope,published_at,failed_at FROM outbox WHERE message_id=%s',(message_id,))[0]
+        envelope=Envelope.from_json(text.encode())
+        self.assertEqual((row_type,envelope.type),('booking.test-type','booking.test-type'))
+        self.assertEqual(envelope.message_id,message_id)
+        self.assertEqual(str(uuid.UUID(message_id)),message_id)
+        self.assertEqual((envelope.producer,envelope.version,envelope.payload),('booking',1,payload))
+        self.assertEqual((published_at,failed_at),(None,None))
+        # A rolled-back transaction leaves no row.
+        connection=self.connect()
+        try:
+            cursor=connection.cursor()
+            other=db.write_outbox(cursor,'booking.test-type',payload)
+            connection.rollback()
+        finally:
+            connection.close()
+        self.assertEqual(self.query('SELECT count(*) FROM outbox WHERE message_id=%s',(other,))[0][0],0)
+        self.assertEqual(self.outbox_count(),1)
+
+    def test_snapshot_envelope_is_unchanged(self):                                              # T6
+        self.apply('created')
+        connection=self.connect()
+        try:
+            with connection,connection.cursor() as cursor:
+                db._lock_event_row(cursor,'event-demo-001')
+                self.assertEqual(db.write_availability_snapshot(cursor,'event-demo-001'),2)  # returns the sequence
+        finally:
+            connection.close()
+        found=self.snapshots()
+        self.assertEqual(len(found),2)
+        for envelope in found:
+            self.assert_valid_envelope(envelope)   # exactly event_id, sequence, seats_remaining, available_seat_ids
+        self.assertEqual(found[-1]['payload'],{'event_id':'event-demo-001','sequence':2,'seats_remaining':2,
+                                               'available_seat_ids':['A1','A2']})
+        self.assertEqual(self.query('SELECT type FROM outbox WHERE message_id=%s',(found[-1]['message_id'],)),
+                         [('seat.availability-changed',)])
+
+    def test_relay_reuses_one_connection_and_reconnects_after_an_error(self):                   # T7
+        ids=self.add_outbox_rows(2)
+        opened=[]
+        def counting_connect():
+            connection=self.connect();opened.append(connection);return connection
+        def backend_pid():
+            def work(cursor):
+                cursor.execute('SELECT pg_backend_pid()');return cursor.fetchone()[0]
+            return db._relay_query(work)
+        with patch('db.connect_once',counting_connect):
+            db.close_relay_connection()
+            first=backend_pid()
+            db.pending_outbox();db.mark_published(ids[0]);db.set_aside_outbox(ids[1],'test error')
+            db.count_pending_outbox();db.count_failed_outbox()
+            asyncio.run(outbox.refresh_pending())
+            asyncio.run(outbox.dispatch_once(self.recorder()[0]))
+            with ThreadPoolExecutor(max_workers=10) as executor:       # the lock: never two at once
+                self.assertEqual(list(executor.map(lambda _:db.count_failed_outbox(),range(20))),[1]*20)
+            self.assertEqual(backend_pid(),first)
+            self.assertEqual(len(opened),1)
+            # Each call committed its own work: another connection already sees it.
+            self.assertEqual(self.outbox_state(ids[0])[:2],(True,False))
+            self.assertEqual(self.outbox_state(ids[1]),(False,True,'test error'))
+            # A forced connection error: the server ends the relay's session.
+            self.query('SELECT pg_terminate_backend(%s)',(first,))
+            for _ in range(50):
+                if not self.query('SELECT 1 FROM pg_stat_activity WHERE pid=%s',(first,)):
+                    break
+                asyncio.run(asyncio.sleep(0.1))
+            with self.assertRaises(psycopg2.Error):
+                db.count_pending_outbox()
+            self.assertEqual(db.count_pending_outbox(),0)              # the next call reconnects and works
+            self.assertEqual(len(opened),2)
+            second=backend_pid()
+            self.assertNotEqual(second,first)
+            # Any other database error also closes it; the next call opens a new one.
+            with self.assertRaises(psycopg2.Error):
+                db._relay_query(lambda cursor:cursor.execute('SELECT 1/0'))
+            self.assertEqual(db.count_failed_outbox(),1)
+            self.assertEqual(len(opened),3)
+            self.assertNotEqual(backend_pid(),second)
+
+    def test_bad_event_changed_raises_and_records_nothing(self):                                # T8
+        base=events_envelope('created')
+        without=lambda field:{k:v for k,v in base.payload.items() if k!=field}
+        bad={'unknown status':base.payload|{'status':'postponed'},
+             'event_version 0':base.payload|{'event_version':0},
+             'event_version text':base.payload|{'event_version':'1'},
+             'event_version bool':base.payload|{'event_version':True},
+             'missing event_id':without('event_id'),
+             'missing status':without('status'),
+             'missing title':without('title'),
+             'missing timezone':without('timezone')}
+        for name,payload in bad.items():
+            with self.subTest(name):
+                envelope=dataclasses.replace(base,message_id=str(uuid.uuid4()),payload=payload)
+                with self.assertRaises((ValueError,KeyError)):
+                    asyncio.run(events.handle(envelope))
+                self.assertEqual(self.processed(),set())
+                self.assertIsNone(self.event_row())
+                self.assertEqual(self.seat_rows(),[])
+                self.assertEqual(self.outbox_count(),0)
+
+    def test_http_metrics_use_the_route_template(self):                                         # T9
+        client=self.client()
+        raw='booking-test-metrics-'+uuid.uuid4().hex[:12]
+        self.assertEqual(client.get(f'/bookings/{raw}',params={'customer_id':'test-buyer-metrics'}).status_code,404)
+        text=client.get('/metrics').text
+        self.assertIn('path="/bookings/{booking_id}"',text)
+        self.assertNotIn(raw,text)
+        self.assertNotIn('test-buyer-metrics',text)
+
+    def test_cancelled_event_beats_seat_taken_and_seat_not_found(self):                         # T10
+        self.apply('created')
+        self.assertEqual(db.hold_seat('event-demo-001','A1','buyer-test-1')[0],'held')
+        self.apply('cancelled')
+        client=self.client()
+        for seat in ('A1','Z9'):        # A1: held by someone else; Z9: no such seat
+            with self.subTest(seat):
+                result=client.post('/holds',json={'event_id':'event-demo-001','seat_id':seat,'customer_id':'buyer-test-2'})
+                self.assertEqual(result.status_code,409)
+                self.assertEqual(result.json()['error'],'event_cancelled')
+                self.assertEqual(db.hold_seat('event-demo-001',seat,'buyer-test-2'),('event_cancelled',None,None))
+
+    def test_newer_event_changed_fills_only_an_empty_section(self):                             # T11
+        self.apply('created')
+        self.query("UPDATE seats SET section='' WHERE event_id='event-demo-001' AND seat_id='A1'")
+        self.query("UPDATE seats SET section='Kept section' WHERE event_id='event-demo-001' AND seat_id='A2'")
+        self.assertEqual(self.apply('updated'),'applied')     # version 2, scheduled, seats A1 and A2 in section A
+        a1,a2=self.seat_rows()
+        self.assertEqual(a1[:4],('A1','A','A1','free'))
+        self.assertEqual(a2[:4],('A2','Kept section','A2','free'))
+
+    def test_demo_seed_off_by_default_and_runs_only_when_config_is_true(self):                 # T12
+        import subprocess,sys
+        def config_value(env):
+            return subprocess.run([sys.executable,'-c','import config; print(config.BOOKING_DEMO_SEED)'],
+                                  env=env,cwd=Path(db.__file__).parent,capture_output=True,text=True,check=True).stdout.strip()
+        unset={k:v for k,v in os.environ.items() if k!='BOOKING_DEMO_SEED'}
+        self.assertEqual(config_value(unset),'False')
+        self.assertEqual(config_value(unset|{'BOOKING_DEMO_SEED':'true'}),'True')
+        self.client()                                          # config value False
+        self.assertEqual(self.query('SELECT count(*) FROM seats')[0][0],0)
+        with patch('config.BOOKING_DEMO_SEED',True):
+            with TestClient(app):
+                pass
+        self.assertGreater(self.query('SELECT count(*) FROM seats')[0][0],0)
+
+    # --- Checkout and Payment's HTTP answer (step 6b-2; contract sections 4, 6, 9, 12) ---
+
+    def checkout_client(self,reply=None,gate=None,hang=False):
+        """A TestClient whose Payment is a fake (httpx.MockTransport), with no real pauses.
+
+        reply(body) -> httpx.Response (default: paid). If gate (a threading.Event) is
+        given, the fake waits for it before answering, without blocking the event
+        loop. hang=True: the fake never answers (cancelled at shutdown).
+        self.payment_calls lists (request body, booking status in the database at
+        the moment Payment was called).
+        """
+        self.payment_calls=[]
+        self.fake_now=0.0
+        reply=reply or (lambda body:payment_reply('paid',body))
+        if gate is not None:
+            self.addCleanup(gate.set)       # never leave a waiting fake behind
+
+        async def handler(request):
+            body=json.loads(request.content)
+            rows=await asyncio.to_thread(self.query,'SELECT status FROM bookings WHERE booking_id=%s',(body['booking_id'],))
+            self.payment_calls.append((body,rows[0][0]))
+            if hang:
+                await asyncio.sleep(60)
+            if gate is not None:
+                await asyncio.to_thread(gate.wait,10)
+            return reply(body)
+
+        async def no_pause(seconds):
+            pass
+
+        def create_runner(url):
+            self.http=httpx.AsyncClient(transport=httpx.MockTransport(handler))
+            breaker=payments.CircuitBreaker(clock=lambda:self.fake_now)
+            return payments.CheckoutRunner(payments.PaymentClient(self.http,url,breaker,sleep=no_pause))
+        factory=patch('payments.create_runner',create_runner)
+        factory.start();self.addCleanup(factory.stop)
+        return self.client()
+
+    def hold(self,client,seat='A1',customer='buyer-test',event_id='event-demo-001'):
+        result=client.post('/holds',json={'event_id':event_id,'seat_id':seat,'customer_id':customer})
+        self.assertEqual(result.status_code,201)
+        return result.json()['booking_id']
+
+    def checkout(self,client,booking_id,customer='buyer-test'):
+        return client.post(f'/bookings/{booking_id}/checkout',json={'customer_id':customer})
+
+    def wait_until(self,condition,timeout=5):
+        deadline=time.monotonic()+timeout
+        while time.monotonic()<deadline:
+            if condition():
+                return
+            time.sleep(0.02)
+        self.fail('condition not reached in time')
+
+    def booking_status(self,booking_id):
+        return self.query('SELECT status FROM bookings WHERE booking_id=%s',(booking_id,))[0][0]
+
+    def wait_for_status(self,booking_id,wanted):
+        self.wait_until(lambda:self.booking_status(booking_id)==wanted)
+
+    def background_idle(self):
+        return not app.state.checkout._tasks
+
+    def messages(self,message_type):
+        """Outbox envelopes of one type, oldest first."""
+        rows=self.query('SELECT envelope FROM outbox WHERE type=%s ORDER BY created_at',(message_type,))
+        return [json.loads(text) for (text,) in rows]
+
+    def assert_booking_envelope(self,envelope,message_type):
+        """Parses as the shared consumer does, and its type is bound to a queue (never set aside)."""
+        from messaging import QUEUES, Envelope
+        parsed=Envelope.from_json(json.dumps(envelope).encode())
+        uuid.UUID(parsed.message_id)
+        self.assertEqual((parsed.type,parsed.version,parsed.producer),(message_type,1,'booking'))
+        self.assertTrue(any(message_type in queue.bindings for queue in QUEUES))
+
+    def counter(self,name,**labels):
+        return REGISTRY.get_sample_value(name,labels) or 0
+
+    def test_checkout_commits_then_replies_202_before_payment_answers(self):                   # C1, C2, C16
+        self.apply('created')
+        gate=threading.Event()
+        client=self.checkout_client(gate=gate)
+        booking_id=self.hold(client)
+        started=self.counter('booking_checkouts_total',outcome='started')
+        confirmed=self.counter('booking_payment_answers_total',result='confirmed')
+        result=self.checkout(client,booking_id)
+        # The 202 arrived while the fake Payment was still waiting for the gate.
+        self.assertEqual(result.status_code,202)
+        self.assertEqual(result.json(),{'booking_id':booking_id,'booking_status':'payment_pending'})
+        self.assertEqual(self.query('SELECT status,checkout_started_at IS NOT NULL FROM bookings')[0],('payment_pending',True))
+        self.wait_until(lambda:len(self.payment_calls)==1)
+        body,status_when_called=self.payment_calls[0]
+        self.assertEqual(status_when_called,'payment_pending')    # committed BEFORE Payment was called
+        self.assertEqual(body,{'booking_id':booking_id,'amount':4500,'currency':'EUR',
+                               'customer_email':'buyer-test@example.test'})
+        # A repeat while the payment is in progress: 202 again, no second call.
+        repeat=self.checkout(client,booking_id)
+        self.assertEqual((repeat.status_code,repeat.json()['booking_status']),(202,'payment_pending'))
+        gate.set()
+        self.wait_for_status(booking_id,'confirmed')
+        self.wait_until(self.background_idle)
+        self.assertEqual(len(self.payment_calls),1)
+        self.assertEqual(self.counter('booking_checkouts_total',outcome='started'),started+1)
+        self.assertEqual(self.counter('booking_payment_answers_total',result='confirmed'),confirmed+1)
+        # Confirmed is final: a later checkout is refused.
+        late=self.checkout(client,booking_id)
+        self.assertEqual((late.status_code,late.json()['error']),(409,'not_checkoutable'))
+
+    def test_checkout_unknown_booking_wrong_customer_and_bad_input(self):                       # C3
+        self.apply('created')
+        client=self.checkout_client()
+        booking_id=self.hold(client)
+        unknown=self.checkout(client,'booking-test-unknown')
+        wrong=self.checkout(client,booking_id,customer='someone-else-test')
+        self.assertEqual((unknown.status_code,wrong.status_code),(404,404))
+        self.assertEqual(unknown.json(),wrong.json())
+        self.assertEqual(unknown.json()['error'],'booking_not_found')
+        self.assertEqual(client.post(f'/bookings/{booking_id}/checkout',json={'customer_id':' '}).status_code,422)
+        self.assertEqual(client.post(f'/bookings/{booking_id}/checkout',json={}).status_code,422)
+        self.assertEqual(self.checkout(client,'b'*65).status_code,422)
+        self.assertEqual(self.booking_status(booking_id),'held')
+        self.assertEqual(self.payment_calls,[])
+
+    def test_checkout_refusals_cancelled_expired_and_no_event_record(self):                    # C4
+        self.apply('created')
+        client=self.checkout_client()
+        expired=self.hold(client,seat='A2',customer='buyer-test-2')
+        self.query("UPDATE bookings SET held_until=now()-interval '1 second' WHERE booking_id=%s",(expired,))
+        result=self.checkout(client,expired,customer='buyer-test-2')
+        self.assertEqual((result.status_code,result.json()['error']),(409,'not_checkoutable'))
+        cancelled=self.hold(client)
+        self.apply('cancelled')
+        result=self.checkout(client,cancelled)
+        self.assertEqual((result.status_code,result.json()['error']),(409,'event_cancelled'))
+        self.seed_seat()     # race-event has no event record
+        no_record=self.hold(client,seat='A1',customer='buyer-test-3',event_id='race-event')
+        result=self.checkout(client,no_record,customer='buyer-test-3')
+        self.assertEqual((result.status_code,result.json()['error']),(409,'not_checkoutable'))
+        self.assertEqual({status for (status,) in self.query('SELECT status FROM bookings')},{'held'})
+        self.assertEqual(self.payment_calls,[])
+
+    def test_breaker_open_or_trial_running_refuses_checkout_and_keeps_the_hold(self):          # C5
+        self.apply('created')
+        client=self.checkout_client()
+        booking_id=self.hold(client)
+        breaker=app.state.checkout.breaker
+        for _ in range(5):
+            breaker.record_failure()
+        outbox_rows=self.outbox_count()
+        result=self.checkout(client,booking_id)
+        self.assertEqual((result.status_code,result.json()['error']),(503,'payment_service_unavailable'))
+        self.assertEqual(self.query('SELECT status,checkout_started_at FROM bookings')[0],('held',None))
+        self.assertEqual(self.outbox_count(),outbox_rows)
+        self.assertEqual(client.get('/metrics').text.count('booking_payment_breaker_state 1.0'),1)
+        # 30 s later, but the one trial is already running: still 503.
+        self.fake_now+=30
+        self.assertTrue(breaker.try_acquire())
+        self.assertEqual(self.checkout(client,booking_id).status_code,503)
+        # The trial ends without an answer either way (409/422): a checkout may become the next trial.
+        breaker.record_neutral()
+        self.assertEqual(self.checkout(client,booking_id).status_code,202)
+        self.wait_for_status(booking_id,'confirmed')
+        self.assertEqual(breaker.state,payments.CLOSED)
+        self.assertEqual(len(self.payment_calls),1)
+
+    def test_cancelled_event_beats_the_open_breaker(self):                                      # C5 (order)
+        self.apply('created')
+        client=self.checkout_client()
+        booking_id=self.hold(client)
+        self.apply('cancelled')
+        for _ in range(5):
+            app.state.checkout.breaker.record_failure()
+        result=self.checkout(client,booking_id)
+        self.assertEqual((result.status_code,result.json()['error']),(409,'event_cancelled'))
+
+    def test_paid_confirms_books_the_seat_and_writes_booking_confirmed(self):                 # C6, C15 (row 5)
+        long_title='T'*300
+        self.apply('created',title=long_title,seats=[{'seat_id':'A1','section':'A','label':'L'*100},
+                                                      {'seat_id':'A2','section':'A'}])   # A2: no label
+        client=self.checkout_client()
+        first=self.hold(client)
+        second=self.hold(client,seat='A2',customer='buyer-test-2')
+        snapshots=len(self.snapshots())
+        self.assertEqual(self.checkout(client,first).status_code,202)
+        self.assertEqual(self.checkout(client,second,customer='buyer-test-2').status_code,202)
+        self.wait_for_status(first,'confirmed');self.wait_for_status(second,'confirmed')
+        self.assertEqual(self.query('SELECT payment_id FROM bookings WHERE booking_id=%s',(first,))[0][0],'pay-test-'+first[:8])
+        self.assertEqual([row[3] for row in self.seat_rows()],['booked','booked'])
+        self.assertEqual(len(self.snapshots()),snapshots)        # row 5 changes no free seats
+        found={e['payload']['booking_id']:e for e in self.messages('booking.confirmed')}
+        self.assertEqual(set(found),{first,second})
+        for envelope in found.values():
+            self.assert_booking_envelope(envelope,'booking.confirmed')
+        self.assertEqual(found[first]['payload'],{
+            'booking_id':first,'customer_email':'buyer-test@example.test','customer_name':'buyer-test',
+            'event_id':'event-demo-001','event_title':'T'*200,'event_starts_at':'2026-11-27T19:30:00+00:00',
+            'seat_label':'L'*64})
+        self.assertEqual(found[second]['payload']['seat_label'],'A2')   # falls back to the seat ID
+
+    def test_paid_after_the_event_was_cancelled_requests_a_refund(self):                      # C7 (row 6)
+        self.apply('created')
+        gate=threading.Event()
+        client=self.checkout_client(gate=gate)
+        booking_id=self.hold(client)
+        self.assertEqual(self.checkout(client,booking_id).status_code,202)
+        self.wait_until(lambda:len(self.payment_calls)==1)
+        # The event is cancelled while the payment is in progress.
+        self.assertEqual(self.apply('cancelled'),'applied')
+        sequence=self.sequence()
+        gate.set()
+        self.wait_for_status(booking_id,'refund_required')
+        payment_id='pay-test-'+booking_id[:8]
+        self.assertEqual(self.query('SELECT payment_id FROM bookings')[0][0],payment_id)
+        self.assertEqual(self.seat_rows()[0][3:7],('free',None,None,None))
+        latest=self.snapshots()[-1]
+        self.assertEqual(latest['payload']['sequence'],sequence+1)
+        self.assertIn('A1',latest['payload']['available_seat_ids'])
+        [cancelled]=self.messages('booking.cancelled')
+        [refund]=self.messages('refund.requested')
+        self.assert_booking_envelope(cancelled,'booking.cancelled')
+        self.assert_booking_envelope(refund,'refund.requested')
+        self.assertEqual(cancelled['payload'],{'booking_id':booking_id,'reason':'event_cancelled',
+                                               'customer_email':'buyer-test@example.test','customer_name':'buyer-test',
+                                               'event_title':'Evening Performance - revised'})
+        self.assertEqual(refund['payload'],{'booking_id':booking_id,'payment_id':payment_id,
+                                            'customer_email':'buyer-test@example.test'})
+        self.assertEqual(self.messages('booking.confirmed'),[])
+
+    def test_failed_or_refunded_releases_the_seat(self):                                        # C8 (row 7)
+        self.apply('created')
+        statuses={}
+        client=self.checkout_client(reply=lambda body:payment_reply(statuses[body['booking_id']],body))
+        failed=self.hold(client)
+        refunded=self.hold(client,seat='A2',customer='buyer-test-2')
+        statuses.update({failed:'failed',refunded:'refunded'})
+        sequence=self.sequence()
+        self.assertEqual(self.checkout(client,failed).status_code,202)
+        self.assertEqual(self.checkout(client,refunded,customer='buyer-test-2').status_code,202)
+        self.wait_for_status(failed,'released');self.wait_for_status(refunded,'released')
+        self.assertEqual(self.query('SELECT count(*) FROM bookings WHERE payment_id IS NOT NULL')[0][0],2)
+        self.assertEqual(self.free_seats('event-demo-001'),['A1','A2'])
+        self.assertEqual(self.sequence(),sequence+2)
+        self.assertEqual(self.snapshots()[-1]['payload']['available_seat_ids'],['A1','A2'])
+        cancelled=self.messages('booking.cancelled')
+        self.assertEqual(sorted(e['payload']['booking_id'] for e in cancelled),sorted([failed,refunded]))
+        self.assertEqual({e['payload']['reason'] for e in cancelled},{'payment_failed'})
+        self.assertEqual(self.messages('refund.requested'),[])
+
+    def test_answer_for_a_booking_not_payment_pending_changes_nothing(self):                    # C9
+        self.apply('created')
+        booking_id=db.hold_seat('event-demo-001','A1','buyer-test')[1]
+        rows=self.outbox_count()
+        self.assertEqual(db.apply_payment_answer(booking_id,'paid','pay-test-1'),'noop')      # still held
+        self.assertEqual(db.start_checkout(booking_id,'buyer-test',True),'started')
+        self.assertEqual(db.apply_payment_answer(booking_id,'paid','pay-test-1'),'confirmed')
+        self.assertEqual(db.apply_payment_answer(booking_id,'failed','pay-test-1'),'noop')    # second answer
+        self.assertEqual(self.booking_status(booking_id),'confirmed')
+        self.assertEqual(self.seat_rows()[0][3],'booked')
+        self.assertEqual(self.outbox_count(),rows+1)                                          # one booking.confirmed
+
+    def test_no_answer_leaves_the_booking_payment_pending(self):                                # C10
+        self.apply('created')
+        client=self.checkout_client(reply=lambda body:httpx.Response(503,json={'detail':'down'}))
+        booking_id=self.hold(client)
+        rows=self.outbox_count()
+        no_answer=self.counter('booking_payment_answers_total',result='no_answer')
+        self.assertEqual(self.checkout(client,booking_id).status_code,202)
+        self.wait_until(lambda:len(self.payment_calls)==3)
+        self.wait_until(self.background_idle)
+        self.assertEqual(self.booking_status(booking_id),'payment_pending')
+        self.assertEqual(self.seat_rows()[0][3],'held')
+        self.assertEqual(self.outbox_count(),rows)
+        self.assertEqual(self.counter('booking_payment_answers_total',result='no_answer'),no_answer+1)
+
+    def test_payment_answers_holds_and_event_changed_do_not_deadlock(self):                     # C11
+        db.apply_event_changed(str(uuid.uuid4()),self.big_event())
+        pending=[]
+        for n in range(1,6):
+            booking_id=db.hold_seat('event-test-many',f'T{n:02d}',f'buyer-test-{n}')[1]
+            self.assertEqual(db.start_checkout(booking_id,f'buyer-test-{n}',True),'started')
+            pending.append(booking_id)
+        answers=[lambda b=b,s=s:db.apply_payment_answer(b,s,'pay-test-'+b[:8])
+                 for b,s in zip(pending,['paid','failed','paid','refunded','paid'])]
+        holds=[lambda n=n:db.hold_seat('event-test-many',f'T{n:02d}',f'buyer-test-{n}') for n in range(6,16)]
+        changes=[lambda v=v:db.apply_event_changed(str(uuid.uuid4()),self.big_event(version=v,extra=[f'X{v}'])) for v in range(2,5)]
+        jobs=holds[:5]+answers[:2]+changes+answers[2:]+holds[5:]
+        with ThreadPoolExecutor(max_workers=len(jobs)) as executor:
+            futures=[executor.submit(job) for job in jobs]
+            for future in futures:
+                future.result(timeout=30)       # a deadlock error would raise here
+        statuses=dict(self.query('SELECT booking_id,status FROM bookings WHERE booking_id = ANY(%s)',(pending,)))
+        self.assertEqual([statuses[b] for b in pending],['confirmed','released','confirmed','released','confirmed'])
+        found=self.snapshots('event-test-many')
+        self.assertEqual([e['payload']['sequence'] for e in found],list(range(1,len(found)+1)))
+        self.assertEqual(found[-1]['payload']['available_seat_ids'],self.free_seats('event-test-many'))
+
+    def test_failed_outbox_insert_rolls_back_the_whole_answer(self):                            # C12
+        self.apply('created')
+        booking_id=db.hold_seat('event-demo-001','A1','buyer-test')[1]
+        self.assertEqual(db.start_checkout(booking_id,'buyer-test',True),'started')
+        self.query("""CREATE FUNCTION fail_outbox_insert() RETURNS trigger LANGUAGE plpgsql AS
+                      $$ BEGIN RAISE EXCEPTION 'simulated outbox failure'; END $$""")
+        self.query('CREATE TRIGGER fail_outbox BEFORE INSERT ON outbox FOR EACH ROW EXECUTE FUNCTION fail_outbox_insert()')
+        for status in ('paid','failed'):
+            with self.subTest(status),self.assertRaises(psycopg2.Error):
+                db.apply_payment_answer(booking_id,status,'pay-test-1')
+        self.assertEqual(self.query('SELECT status,payment_id FROM bookings')[0],('payment_pending',None))
+        self.assertEqual(self.seat_rows()[0][3:5],('held',booking_id))
+        self.assertEqual(self.sequence(),2)      # creation snapshot + the hold's snapshot only
+
+    def test_shutdown_cancels_a_call_in_flight(self):                                          # C14
+        self.apply('created')
+        client=self.checkout_client(hang=True)
+        booking_id=self.hold(client)
+        self.assertEqual(self.checkout(client,booking_id).status_code,202)
+        self.wait_until(lambda:len(self.payment_calls)==1)
+        client.__exit__(None,None,None)          # the app shuts down while Payment has not answered
+        self.assertEqual(self.booking_status(booking_id),'payment_pending')
+        self.assertTrue(self.http.is_closed)
+
+    def test_startup_refuses_a_bad_currency(self):                                              # P11 (lifespan)
+        with patch('config.BOOKING_CURRENCY','eur'):
+            with self.assertRaises(ValueError):
+                with TestClient(app):
+                    pass
+
+    # --- booking.payment-updates (step 6b-3; contract sections 3, 4 rows 5-7, 10, 11, and 9) ---
+
+    def pending_booking(self,seat='T01',customer='buyer-test'):
+        """A payment_pending booking on event-test-many (created on first use)."""
+        if not self.query("SELECT 1 FROM events WHERE event_id='event-test-many'"):
+            db.apply_event_changed(str(uuid.uuid4()),self.big_event())
+        booking_id=db.hold_seat('event-test-many',seat,customer)[1]
+        self.assertEqual(db.start_checkout(booking_id,customer,True),'started')
+        return booking_id
+
+    def refund_required_booking(self,seat='T01',customer='buyer-test'):
+        """A booking in refund_required: paid after its event was cancelled (row 6)."""
+        booking_id=self.pending_booking(seat,customer)
+        db.apply_event_changed(str(uuid.uuid4()),self.big_event(version=2)|{'status':'cancelled'})
+        self.assertEqual(db.apply_payment_answer(booking_id,'paid','pay-test-'+booking_id[:8]),'refund_required')
+        return booking_id
+
+    def consume(self,envelope):
+        """What run_consumer does with a parsed message: await the handler."""
+        return asyncio.run(payment_updates.handle(envelope))
+
+    def results(self,message_type,result):
+        return self.counter('booking_payment_messages_total',type=message_type,result=result)
+
+    def test_payment_result_paid_confirms_and_records_the_message(self):                       # M1 (row 5)
+        booking_id=self.pending_booking()
+        envelope=payment_envelope('payment.result',booking_id,'paid')
+        before=self.results('payment.result','confirmed')
+        self.consume(envelope)
+        self.assertEqual(self.booking_status(booking_id),'confirmed')
+        self.assertEqual(self.query('SELECT payment_id FROM bookings WHERE booking_id=%s',(booking_id,))[0][0],
+                         'pay-test-'+booking_id[:8])
+        self.assertEqual(self.query("SELECT status FROM seats WHERE seat_id='T01'")[0][0],'booked')
+        self.assertIn(envelope.message_id,self.processed())
+        [confirmed]=self.messages('booking.confirmed')
+        self.assertEqual(confirmed['payload']['booking_id'],booking_id)
+        self.assertEqual(self.results('payment.result','confirmed'),before+1)
+
+    def test_payment_result_after_cancellation_requests_a_refund(self):                        # M2 (row 6)
+        booking_id=self.pending_booking()
+        db.apply_event_changed(str(uuid.uuid4()),self.big_event(version=2)|{'status':'cancelled'})
+        sequence=self.sequence('event-test-many')
+        self.consume(payment_envelope('payment.result',booking_id,'paid'))
+        self.assertEqual(self.booking_status(booking_id),'refund_required')
+        self.assertIn('T01',self.free_seats('event-test-many'))
+        self.assertEqual(self.sequence('event-test-many'),sequence+1)
+        [cancelled]=self.messages('booking.cancelled')
+        [refund]=self.messages('refund.requested')
+        self.assertEqual(cancelled['payload']['reason'],'event_cancelled')
+        self.assertEqual(refund['payload'],{'booking_id':booking_id,'payment_id':'pay-test-'+booking_id[:8],
+                                            'customer_email':'buyer-test@example.test'})
+
+    def test_payment_result_failed_or_refunded_releases(self):                                 # M3 (row 7)
+        for n,status in enumerate(('failed','refunded'),start=1):
+            with self.subTest(status):
+                booking_id=self.pending_booking(seat=f'T0{n}',customer=f'buyer-test-{n}')
+                self.consume(payment_envelope('payment.result',booking_id,status))
+                self.assertEqual(self.booking_status(booking_id),'released')
+                self.assertIn(f'T0{n}',self.free_seats('event-test-many'))
+        self.assertEqual({e['payload']['reason'] for e in self.messages('booking.cancelled')},{'payment_failed'})
+        self.assertEqual(self.messages('refund.requested'),[])
+
+    def test_repeated_payment_message_id_does_nothing(self):                                   # M4 (D2)
+        booking_id=self.pending_booking()
+        envelope=payment_envelope('payment.result',booking_id,'paid')
+        self.consume(envelope)
+        rows,processed=self.outbox_count(),self.processed()
+        before=self.results('payment.result','duplicate')
+        self.consume(envelope)                                       # redelivered: same message_id
+        self.assertEqual(db.apply_payment_answer(booking_id,'failed','pay-test-x',envelope.message_id),'duplicate')
+        self.assertEqual(self.booking_status(booking_id),'confirmed')
+        self.assertEqual((self.outbox_count(),self.processed()),(rows,processed))
+        self.assertEqual(self.results('payment.result','duplicate'),before+1)
+
+    def test_message_after_the_http_answer_is_a_recorded_noop(self):                           # M5 (second arrival)
+        booking_id=self.pending_booking()
+        self.assertEqual(db.apply_payment_answer(booking_id,'paid','pay-test-1'),'confirmed')   # HTTP first
+        rows=self.outbox_count()
+        envelope=payment_envelope('payment.result',booking_id,'paid',payment_id='pay-test-1')
+        before=self.results('payment.result','noop')
+        self.consume(envelope)
+        self.assertEqual(self.booking_status(booking_id),'confirmed')
+        self.assertEqual(self.outbox_count(),rows)
+        self.assertIn(envelope.message_id,self.processed())          # recorded although nothing changed
+        self.assertEqual(self.results('payment.result','noop'),before+1)
+        # And the other way round: message first, then the HTTP reply does nothing.
+        other=self.pending_booking(seat='T02',customer='buyer-test-2')
+        self.consume(payment_envelope('payment.result',other,'failed'))
+        self.assertEqual(db.apply_payment_answer(other,'failed','pay-test-'+other[:8]),'noop')
+        self.assertEqual(self.booking_status(other),'released')
+
+    def waiting_on_event_lock(self):
+        """Sessions blocked on 'SELECT 1 FROM events ... FOR UPDATE' (the event row lock)."""
+        return self.query("""SELECT count(*) FROM pg_stat_activity
+                             WHERE wait_event_type = 'Lock'
+                               AND strpos(query, 'SELECT 1 FROM events WHERE event_id') = 1
+                               AND strpos(query, 'FOR UPDATE') > 0""")[0][0]
+
+    def test_http_reply_and_message_race_has_one_winner(self):                                 # M6 (race)
+        for n,first in enumerate(('http','message'),start=1):
+            with self.subTest(first=first):
+                booking_id=self.pending_booking(seat=f'T0{n}',customer=f'buyer-test-{n}')
+                payment_id='pay-test-'+booking_id[:8]
+                message_id=str(uuid.uuid4())
+                callers={'http':lambda:db.apply_payment_answer(booking_id,'paid',payment_id),
+                         'message':lambda:db.apply_payment_answer(booking_id,'paid',payment_id,message_id)}
+                order=[first]+[name for name in callers if name!=first]
+                confirmed=len(self.messages('booking.confirmed'))
+                # Hold the event row lock, so both callers queue behind it at the same point.
+                holder=self.connect()
+                try:
+                    with holder.cursor() as cursor:
+                        cursor.execute("SELECT 1 FROM events WHERE event_id='event-test-many' FOR UPDATE")
+                    with ThreadPoolExecutor(max_workers=2) as executor:
+                        futures={}
+                        for waiting,name in enumerate(order,start=1):
+                            futures[name]=executor.submit(callers[name])
+                            self.wait_until(lambda w=waiting:self.waiting_on_event_lock()==w)
+                        holder.commit()                      # release: both run, one after the other
+                        results={name:future.result(timeout=10) for name,future in futures.items()}
+                finally:
+                    holder.close()
+                self.assertEqual(sorted(results.values()),['confirmed','noop'])
+                self.assertEqual(self.booking_status(booking_id),'confirmed')
+                self.assertEqual(len(self.messages('booking.confirmed')),confirmed+1)    # exactly one
+                self.assertIn(message_id,self.processed())   # recorded whether it won or not
+
+    def test_unknown_booking_is_recorded_counted_and_acknowledged(self):                      # M7 (D4)
+        for message_type in ('payment.result','refund.completed','refund.failed'):
+            with self.subTest(message_type):
+                envelope=payment_envelope(message_type,'booking-test-unknown','paid')
+                rows=self.outbox_count()
+                before=self.results(message_type,'unknown_booking')
+                self.consume(envelope)                       # returns: run_consumer acks it
+                self.assertIn(envelope.message_id,self.processed())
+                self.assertEqual(self.outbox_count(),rows)
+                self.assertEqual(self.results(message_type,'unknown_booking'),before+1)
+                self.consume(envelope)                       # a redelivery is a duplicate, not counted again
+                self.assertEqual(self.results(message_type,'unknown_booking'),before+1)
+
+    def test_malformed_payment_messages_raise_and_record_nothing(self):                       # M8 (D4)
+        from messaging import Envelope
+        booking_id=self.pending_booking()
+        good=payment_envelope('payment.result',booking_id,'paid').payload
+        bad=[('payment.result',{k:v for k,v in good.items() if k!='booking_id'}),
+             ('payment.result',good|{'booking_id':''}),
+             ('payment.result',good|{'booking_id':'b'*65}),
+             ('payment.result',good|{'status':'pending'}),
+             ('payment.result',{k:v for k,v in good.items() if k!='status'}),
+             ('payment.result',good|{'payment_id':' '}),
+             ('payment.result',good|{'payment_id':7}),
+             ('payment.result',['not','an','object']),
+             ('refund.completed',{k:v for k,v in good.items() if k!='booking_id'}),
+             ('refund.failed',good|{'booking_id':None})]
+        processed=self.processed()
+        for message_type,payload in bad:
+            with self.subTest(message_type=message_type,payload=payload):
+                envelope=Envelope.new(message_type,payload,producer='payment')
+                with self.assertRaises(ValueError):          # run_consumer retries, then dead-letters
+                    self.consume(envelope)
+        self.assertEqual(self.processed(),processed)
+        self.assertEqual(self.booking_status(booking_id),'payment_pending')
+
+    def test_refund_completed_from_refund_required_or_refund_pending(self):                   # M9 (row 10)
+        pending=self.pending_booking(seat='T02',customer='buyer-test-2')    # before the event is cancelled
+        required=self.refund_required_booking()
+        self.assertEqual(db.apply_payment_answer(pending,'paid','pay-test-'+pending[:8]),'refund_required')
+        self.consume(payment_envelope('refund.failed',pending,'paid'))
+        self.assertEqual(self.booking_status(pending),'refund_pending')
+        rows,seats=self.outbox_count(),self.seat_rows('event-test-many')
+        for booking_id in (required,pending):
+            envelope=payment_envelope('refund.completed',booking_id,'refunded')
+            self.consume(envelope)
+            self.assertEqual(self.booking_status(booking_id),'refunded')
+            self.assertIn(envelope.message_id,self.processed())
+        self.assertEqual(self.outbox_count(),rows)          # row 10 publishes nothing
+        self.assertEqual(self.seat_rows('event-test-many'),seats)   # and changes no seats
+
+    def test_refund_failed_only_from_refund_required_then_completed(self):                    # M10 (row 11)
+        booking_id=self.refund_required_booking()
+        before=self.results('refund.failed','refund_pending')
+        self.consume(payment_envelope('refund.failed',booking_id,'paid'))
+        self.assertEqual(self.booking_status(booking_id),'refund_pending')
+        self.assertEqual(self.results('refund.failed','refund_pending'),before+1)
+        second=payment_envelope('refund.failed',booking_id,'paid')    # a new message_id
+        self.consume(second)
+        self.assertEqual(self.booking_status(booking_id),'refund_pending')   # noop
+        self.assertIn(second.message_id,self.processed())
+        self.consume(payment_envelope('refund.completed',booking_id,'refunded'))
+        self.assertEqual(self.booking_status(booking_id),'refunded')
+        self.consume(payment_envelope('refund.failed',booking_id,'paid'))    # never moves back
+        self.assertEqual(self.booking_status(booking_id),'refunded')
+
+    def test_refund_messages_on_other_states_are_recorded_noops(self):                        # M11
+        confirmed=self.pending_booking()
+        db.apply_payment_answer(confirmed,'paid','pay-test-1')
+        released=self.pending_booking(seat='T02',customer='buyer-test-2')
+        db.apply_payment_answer(released,'failed','pay-test-2')
+        pending=self.pending_booking(seat='T03',customer='buyer-test-3')
+        held=db.hold_seat('event-test-many','T04','buyer-test-4')[1]
+        expected={confirmed:'confirmed',released:'released',pending:'payment_pending',held:'held'}
+        for message_type in ('refund.completed','refund.failed'):
+            for booking_id,status in expected.items():
+                with self.subTest(message_type=message_type,status=status):
+                    envelope=payment_envelope(message_type,booking_id,'refunded')
+                    self.assertEqual(db.apply_refund_message(envelope.message_id,booking_id,message_type),'noop')
+                    self.assertEqual(self.booking_status(booking_id),status)
+                    self.assertIn(envelope.message_id,self.processed())
+
+    def test_dispatch_by_type_not_status(self):                                                # M12 (section 3)
+        booking_id=self.refund_required_booking()
+        # refund.failed carries status "paid": it must NOT be read as a payment result.
+        self.consume(payment_envelope('refund.failed',booking_id,'paid'))
+        self.assertEqual(self.booking_status(booking_id),'refund_pending')
+        processed=self.processed()
+        other=payment_envelope('booking.confirmed',booking_id,'paid')      # not bound to this queue
+        self.consume(other)                                                # logged and acknowledged
+        self.assertEqual(self.processed(),processed)
+        self.assertEqual(self.booking_status(booking_id),'refund_pending')
+
+    def test_database_failure_rolls_back_the_message_id_too(self):                            # M13
+        booking_id=self.pending_booking()
+        self.query("""CREATE FUNCTION fail_outbox_insert() RETURNS trigger LANGUAGE plpgsql AS
+                      $$ BEGIN RAISE EXCEPTION 'simulated outbox failure'; END $$""")
+        self.query('CREATE TRIGGER fail_outbox BEFORE INSERT ON outbox FOR EACH ROW EXECUTE FUNCTION fail_outbox_insert()')
+        envelope=payment_envelope('payment.result',booking_id,'paid')
+        processed=self.processed()
+        with self.assertRaises(psycopg2.Error):                 # run_consumer retries it
+            self.consume(envelope)
+        self.assertEqual(self.processed(),processed)
+        self.assertEqual(self.booking_status(booking_id),'payment_pending')
+        self.query('DROP TRIGGER fail_outbox ON outbox')
+        self.consume(envelope)                                  # the retry then applies cleanly
+        self.assertEqual(self.booking_status(booking_id),'confirmed')
+        self.assertIn(envelope.message_id,self.processed())
+
+    def test_http_path_records_no_message_id_and_still_raises_on_unknown_booking(self):       # M14
+        booking_id=self.pending_booking()
+        processed=self.processed()
+        self.assertEqual(db.apply_payment_answer(booking_id,'paid','pay-test-1'),'confirmed')
+        self.assertEqual(db.apply_payment_answer(booking_id,'paid','pay-test-1'),'noop')
+        self.assertEqual(self.processed(),processed)
+        with self.assertRaises(LookupError):
+            db.apply_payment_answer('booking-test-unknown','paid','pay-test-1')
+        self.assertEqual(self.processed(),processed)
+
+    def test_listener_consumes_both_queues_on_one_connection(self):                           # M15 (D1)
+        calls,opened=[],[]
+
+        class FakeConnection:
+            async def __aenter__(self):
+                return self
+            async def __aexit__(self,*exc):
+                return False
+            async def channel(self,**kwargs):
+                opened.append(object())
+                return opened[-1]
+
+        async def fake_connect(url):
+            return FakeConnection()
+
+        async def fake_run_consumer(channel,queue,handler,on_outcome=None):
+            calls.append((channel,queue,handler,on_outcome))
+
+        async def scenario():
+            task=asyncio.create_task(events.run('amqp://test'))
+            while len(calls)<2:
+                await asyncio.sleep(0.01)
+            task.cancel()
+            with self.assertRaises(asyncio.CancelledError):
+                await task
+
+        with patch('events._connect',fake_connect),patch('messaging.run_consumer',fake_run_consumer):
+            asyncio.run(asyncio.wait_for(scenario(),5))
+        self.assertEqual([(queue,handler) for _,queue,handler,_ in calls],
+                         [('booking.event-changes',events.handle),('booking.payment-updates',payment_updates.handle)])
+        self.assertEqual(len({id(channel) for channel,*_ in calls}),2)        # one channel per queue
+        self.assertTrue(all(hook is events.track_outcome for *_,hook in calls))
+        from messaging import QUEUES
+        bound={q.name:q.bindings for q in QUEUES}['booking.payment-updates']
+        self.assertEqual(set(bound),{'payment.result','refund.completed','refund.failed'})
+
+
+def payment_reply(status,body):
+    """Payment's 200 body (payment/app/store.py format_payment) for a fake Payment."""
+    return httpx.Response(200,json={'payment_id':'pay-test-'+body['booking_id'][:8],'booking_id':body['booking_id'],
+                                    'amount':body['amount'],'currency':body['currency'],'status':status,
+                                    'refund_id':None,'created_at':'2026-11-18T12:00:00+00:00'})
+
+
+def payment_envelope(message_type,booking_id,status,payment_id=None):
+    """A Payment message shaped exactly like payment/app/store.py save_event, parsed as the consumer does."""
+    from messaging import Envelope
+    payload={'booking_id':booking_id,'payment_id':payment_id or 'pay-test-'+booking_id[:8],
+             'amount':'45.00','currency':'EUR','status':status,'customer_email':'buyer-test@example.test'}
+    if message_type=='refund.completed':
+        payload['refund_id']='refund-test-1'
+    if message_type=='refund.failed':
+        payload['reason']='provider_rejected'
+    body={'message_id':str(uuid.uuid4()),'type':message_type,'occurred_at':'2026-11-19T12:00:00+00:00',
+          'version':1,'producer':'payment','payload':payload}
+    return Envelope.from_json(json.dumps(body).encode())
+
+
+def unroutable_error(routing_key='booking.test-unroutable'):
+    """Exactly what aiormq 7.2.5 raises for a basic.return with on_return_raises=True
+    (aiormq/channel.py, _on_return_frame: PublishError(message, frame))."""
+    from aio_pika.exceptions import PublishError
+    from aiormq.abc import DeliveredMessage
+    from pamqp.commands import Basic
+    from pamqp.header import ContentHeader
+    frame=Basic.Return(reply_code=312,reply_text='NO_ROUTE',exchange='events',routing_key=routing_key)
+    return PublishError(DeliveredMessage(delivery=frame,header=ContentHeader(),body=b'',channel=None),frame)
+
+
+def nack_error():
+    """What aiormq 7.2.5 raises for a broker nack (aiormq/channel.py, _confirm_delivery: DeliveryError(None, frame))."""
+    from aio_pika.exceptions import DeliveryError
+    from pamqp.commands import Basic
+    return DeliveryError(None,Basic.Nack(delivery_tag=1))
 
 
 def events_envelope(name):

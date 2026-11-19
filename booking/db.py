@@ -1,5 +1,6 @@
 """All Postgres connection code for the Booking service."""
 import hashlib
+import threading
 import time
 import uuid
 from pathlib import Path
@@ -68,6 +69,23 @@ def _lock_event_creation(cur, event_id):
     cur.execute("SELECT pg_advisory_xact_lock(%s)", (int.from_bytes(digest[:8], "big", signed=True),))
 
 
+def write_outbox(cur, message_type, payload):
+    """Write one outgoing message as an outbox row (contract section 3).
+
+    Runs inside the caller's transaction and never commits: the row is saved
+    only if the caller's state change is saved too. The complete envelope is
+    stored once and never changed. Returns the envelope's message_id.
+    """
+    from messaging import Envelope  # imported here, like events.py does
+
+    envelope = Envelope.new(message_type, payload, producer=PRODUCER)
+    cur.execute(
+        "INSERT INTO outbox (message_id, type, envelope) VALUES (%s, %s, %s)",
+        (envelope.message_id, envelope.type, envelope.to_json().decode()),
+    )
+    return envelope.message_id
+
+
 def write_availability_snapshot(cur, event_id):
     """Write one seat.availability-changed outbox row (contract section 11).
 
@@ -76,8 +94,6 @@ def write_availability_snapshot(cur, event_id):
     the free seats AFTER the lock, and stores the complete envelope. Returns
     the new sequence.
     """
-    from messaging import Envelope  # imported here, like events.py does
-
     cur.execute(
         "UPDATE events SET sequence = sequence + 1 WHERE event_id = %s RETURNING sequence",
         (event_id,),
@@ -88,7 +104,8 @@ def write_availability_snapshot(cur, event_id):
     sequence = row[0]
     cur.execute("SELECT seat_id FROM seats WHERE event_id = %s AND status = 'free'", (event_id,))
     free = sorted(seat_id for (seat_id,) in cur.fetchall())
-    envelope = Envelope.new(
+    write_outbox(
+        cur,
         AVAILABILITY_CHANGED,
         {
             "event_id": event_id,
@@ -96,11 +113,6 @@ def write_availability_snapshot(cur, event_id):
             "seats_remaining": len(free),
             "available_seat_ids": free,
         },
-        producer=PRODUCER,
-    )
-    cur.execute(
-        "INSERT INTO outbox (message_id, type, envelope) VALUES (%s, %s, %s)",
-        (envelope.message_id, envelope.type, envelope.to_json().decode()),
     )
     return sequence
 
@@ -224,6 +236,259 @@ def get_booking(booking_id, customer_id):
         "held_until": held_until.isoformat(),   # TIMESTAMPTZ: offset-aware
         "payment_id": payment_id,
     }
+
+
+# --- Checkout and Payment's answer (contract sections 4, 6, 9 and 12) -----------
+
+BOOKING_CONFIRMED = "booking.confirmed"
+BOOKING_CANCELLED = "booking.cancelled"
+REFUND_REQUESTED = "refund.requested"
+
+# Payment's HTTP 200 answers (contract section 9). 'refunded' is handled like 'failed' (section 8).
+PAYMENT_STATUSES = ("paid", "failed", "refunded")
+
+# Length caps for every message Booking publishes (contract section 1).
+EVENT_TITLE_MAX = 200
+SEAT_LABEL_MAX = 64
+
+
+def start_checkout(booking_id, customer_id, breaker_accepts):
+    """Contract section 6 (rows 2 and 3). Returns the outcome:
+
+    'not_found', 'repeat' (already payment_pending), 'event_cancelled',
+    'not_checkoutable', 'breaker_open' (nothing written), or 'started'
+    (now payment_pending and committed; only then may Payment be called).
+
+    Locks ONLY the booking row (lock order, section 4a). The event's status is
+    read without a lock; a cancellation that lands after this commit is caught
+    when Payment's answer is applied (row 6).
+    """
+    conn = connect_once()
+    try:
+        with conn, conn.cursor() as cur:
+            cur.execute(
+                """SELECT b.status, b.held_until > now(), e.status
+                   FROM bookings b LEFT JOIN events e ON e.event_id = b.event_id
+                   WHERE b.booking_id = %s AND b.customer_id = %s
+                   FOR UPDATE OF b""",
+                (booking_id, customer_id),
+            )
+            row = cur.fetchone()
+            # The checks, in the contract's order (section 6).
+            if row is None:
+                return "not_found"
+            status, not_expired, event_status = row
+            if status == "payment_pending":
+                return "repeat"
+            if event_status == "cancelled":
+                return "event_cancelled"
+            if status != "held" or not not_expired or event_status is None:
+                return "not_checkoutable"
+            if not breaker_accepts:
+                return "breaker_open"      # row 3: the booking stays held
+            # Row 2: the ONE conditional update (section 4a).
+            cur.execute(
+                """UPDATE bookings
+                   SET status = 'payment_pending', checkout_started_at = now(), updated_at = now()
+                   WHERE booking_id = %s AND status = 'held' AND held_until > now()
+                     AND EXISTS (SELECT 1 FROM events
+                                 WHERE events.event_id = bookings.event_id
+                                   AND events.status <> 'cancelled')""",
+                (booking_id,),
+            )
+            if cur.rowcount != 1:
+                # The booking row is locked and now() is fixed for the
+                # transaction, so only a cancellation committed between the two
+                # statements can get here.
+                return "event_cancelled"
+            return "started"
+    finally:
+        conn.close()
+
+
+def payment_request(booking_id):
+    """What the background call sends to Payment: (price_minor, currency, customer_email)."""
+    conn = connect_once()
+    try:
+        with conn, conn.cursor() as cur:
+            cur.execute("SELECT price_minor, currency, customer_email FROM bookings WHERE booking_id = %s",
+                        (booking_id,))
+            row = cur.fetchone()
+    finally:
+        conn.close()
+    if row is None:
+        raise LookupError(f"No booking {booking_id!r}")
+    return row
+
+
+def _record_message(cur, message_id):
+    """Record a consumed message_id in the caller's transaction (contract section 3).
+
+    True if it is new; False if it was already recorded (a repeat: do nothing).
+    A second transaction inserting the same ID at the same moment waits here
+    until the first one ends, then gets False.
+    """
+    cur.execute(
+        "INSERT INTO processed_messages (message_id) VALUES (%s) ON CONFLICT DO NOTHING",
+        (message_id,),
+    )
+    return cur.rowcount == 1
+
+
+def apply_payment_answer(booking_id, payment_status, payment_id, message_id=None):
+    """Apply Payment's answer to a payment_pending booking: row 5, 6 or 7 (contract section 4).
+
+    Two callers, same rows (contract section 9): the HTTP reply (message_id
+    None) and a payment.result message (message_id set). Whichever comes
+    second finds the booking no longer payment_pending and does nothing.
+
+    One transaction, lock order event row -> booking row -> seat row:
+    - paid, event not cancelled -> confirmed, seat booked, booking.confirmed
+    - paid, event cancelled -> refund_required, seat free, availability,
+      booking.cancelled (event_cancelled), refund.requested
+    - failed or refunded -> released, seat free, availability,
+      booking.cancelled (payment_failed)
+    payment_id is stored in every case. Returns 'confirmed', 'refund_required',
+    'released', or 'noop' (the booking was no longer payment_pending: nothing
+    written). Any error rolls back everything.
+
+    Message path only (message_id set): the message_id is recorded first, in
+    the same transaction, also for a noop. Returns 'duplicate' if it was
+    already recorded, and 'unknown_booking' (recorded, nothing else) for a
+    booking_id Booking does not know. The HTTP path records nothing and still
+    raises LookupError for an unknown booking.
+    """
+    if payment_status not in PAYMENT_STATUSES:
+        raise ValueError(f"Unknown payment status {payment_status!r}")
+    conn = connect_once()
+    try:
+        with conn, conn.cursor() as cur:
+            if message_id is not None and not _record_message(cur, message_id):
+                return "duplicate"
+            cur.execute("SELECT event_id, seat_id FROM bookings WHERE booking_id = %s", (booking_id,))
+            row = cur.fetchone()
+            if row is None:
+                if message_id is not None:
+                    return "unknown_booking"     # commits the processed row only
+                raise LookupError(f"No booking {booking_id!r}")
+            event_id, seat_id = row
+
+            # 1. The event row. Checkout refuses a booking without an event
+            # record, so the record must exist (no creation lock is needed).
+            if not _lock_event_row(cur, event_id):
+                raise LookupError(f"No event record for {event_id!r}")
+            cur.execute("SELECT status, title, starts_at FROM events WHERE event_id = %s", (event_id,))
+            event_status, title, starts_at = cur.fetchone()
+
+            if payment_status == "paid":
+                new_status = "refund_required" if event_status == "cancelled" else "confirmed"
+            else:
+                new_status = "released"
+
+            # 2. The booking row: the deciding conditional update (section 4a).
+            cur.execute(
+                """UPDATE bookings SET status = %s, payment_id = %s, updated_at = now()
+                   WHERE booking_id = %s AND status = 'payment_pending'
+                   RETURNING customer_email, customer_name""",
+                (new_status, payment_id, booking_id),
+            )
+            won = cur.fetchone()
+            if won is None:
+                return "noop"
+            customer_email, customer_name = won
+
+            # 3. The seat row, keyed on the booking; exactly one must change.
+            if new_status == "confirmed":
+                cur.execute(
+                    """UPDATE seats SET status = 'booked'
+                       WHERE event_id = %s AND seat_id = %s AND booking_ref = %s AND status = 'held'
+                       RETURNING label""",
+                    (event_id, seat_id, booking_id),
+                )
+            else:
+                cur.execute(
+                    """UPDATE seats SET status = 'free', booking_ref = NULL, customer_id = NULL, held_until = NULL
+                       WHERE event_id = %s AND seat_id = %s AND booking_ref = %s AND status = 'held'
+                       RETURNING label""",
+                    (event_id, seat_id, booking_id),
+                )
+            seat = cur.fetchone()
+            if seat is None:
+                raise LookupError(f"Seat {seat_id!r} is not held by booking {booking_id!r}")
+            event_title = title[:EVENT_TITLE_MAX]
+
+            # 4. The outbox rows, in the same transaction.
+            if new_status == "confirmed":
+                write_outbox(cur, BOOKING_CONFIRMED, {
+                    "booking_id": booking_id,
+                    "customer_email": customer_email,
+                    "customer_name": customer_name,
+                    "event_id": event_id,
+                    "event_title": event_title,
+                    "event_starts_at": starts_at,
+                    "seat_label": (seat[0] or seat_id)[:SEAT_LABEL_MAX],   # no label: use the seat ID
+                })
+                return new_status
+
+            write_availability_snapshot(cur, event_id)
+            write_outbox(cur, BOOKING_CANCELLED, {
+                "booking_id": booking_id,
+                "reason": "event_cancelled" if new_status == "refund_required" else "payment_failed",
+                "customer_email": customer_email,
+                "customer_name": customer_name,
+                "event_title": event_title,
+            })
+            if new_status == "refund_required":
+                write_outbox(cur, REFUND_REQUESTED, {
+                    "booking_id": booking_id,
+                    "payment_id": payment_id,
+                    "customer_email": customer_email,
+                })
+            return new_status
+    finally:
+        conn.close()
+
+
+# Contract section 4, rows 10 and 11: message type -> (new status, statuses it may come from).
+REFUND_COMPLETED = "refund.completed"
+REFUND_FAILED = "refund.failed"
+REFUND_TRANSITIONS = {
+    REFUND_COMPLETED: ("refunded", ("refund_required", "refund_pending")),   # row 10
+    REFUND_FAILED: ("refund_pending", ("refund_required",)),                  # row 11
+}
+
+
+def apply_refund_message(message_id, booking_id, message_type):
+    """Apply refund.completed (row 10) or refund.failed (row 11).
+
+    One transaction: the processed message_id and ONE conditional UPDATE on
+    the booking row (rows 10/11 change no seats, so only the booking row is
+    locked; section 4a). No outbox row. Decided by message_type only, never by
+    the payload's status (refund.failed carries status "paid").
+    Returns 'refunded' or 'refund_pending' (changed), 'noop' (booking in
+    another state: recorded only), 'unknown_booking' (recorded only) or
+    'duplicate' (already recorded: nothing).
+    """
+    if message_type not in REFUND_TRANSITIONS:
+        raise ValueError(f"Not a refund message type: {message_type!r}")
+    new_status, from_statuses = REFUND_TRANSITIONS[message_type]
+    conn = connect_once()
+    try:
+        with conn, conn.cursor() as cur:
+            if not _record_message(cur, message_id):
+                return "duplicate"
+            cur.execute(
+                """UPDATE bookings SET status = %s, updated_at = now()
+                   WHERE booking_id = %s AND status = ANY(%s)""",
+                (new_status, booking_id, list(from_statuses)),
+            )
+            if cur.rowcount == 1:
+                return new_status
+            # Nothing changed. Look up ONLY to choose the result for the log/metric.
+            cur.execute("SELECT 1 FROM bookings WHERE booking_id = %s", (booking_id,))
+            return "noop" if cur.fetchone() is not None else "unknown_booking"
+    finally:
+        conn.close()
 
 
 # --- event.changed ------------------------------------------------------------
@@ -383,43 +648,112 @@ def backfill_availability():
 
 
 # --- Outbox relay queries (used by outbox.py) -----------------------------------
+#
+# The relay polls about 4 times a second. Opening a new connection for every
+# query made ~8 new Postgres connections a second even when idle, so the relay's
+# queries below share ONE connection, kept open between polls. Request paths
+# (holds, lookup) still use connect_once() per request.
+# - Same limits as connect_once() (it opens the connection): connect_timeout 2 s,
+#   statement_timeout 2 s.
+# - Each call is its own transaction and commits its own work ('with conn').
+# - On any error the connection is closed; the next call opens a new one.
+# - The lock makes sure two threads never use the connection at the same time.
+
+_relay_lock = threading.Lock()
+_relay_conn = None
+
+# The longest error text stored on a set-aside outbox row (contract section 3).
+OUTBOX_ERROR_MAX = 500
+
+# Pending = not yet published and not set aside (contract section 3).
+_PENDING = "published_at IS NULL AND failed_at IS NULL"
+
+
+def _relay_query(work):
+    """Run work(cur) on the relay's shared connection, in one committed transaction."""
+    global _relay_conn
+    with _relay_lock:
+        if _relay_conn is None or _relay_conn.closed:
+            _relay_conn = connect_once()
+        try:
+            with _relay_conn, _relay_conn.cursor() as cur:   # commits on success, rolls back on error
+                return work(cur)
+        except Exception:
+            # The connection may be broken (database restarted, network lost).
+            # Close it; the next call opens a fresh one.
+            _close_relay_conn()
+            raise
+
+
+def _close_relay_conn():
+    """Close the shared connection, ignoring errors. Caller holds _relay_lock."""
+    global _relay_conn
+    if _relay_conn is not None:
+        try:
+            _relay_conn.close()
+        except Exception:  # noqa: BLE001 - it may already be broken
+            pass
+        _relay_conn = None
+
+
+def close_relay_connection():
+    """Close the relay's shared connection (on shutdown). Safe to call any time."""
+    with _relay_lock:
+        _close_relay_conn()
+
 
 def pending_outbox(limit=50):
-    """Unpublished outbox rows, oldest first: [(message_id, envelope_text), ...]."""
-    conn = connect_once()
-    try:
-        with conn, conn.cursor() as cur:
-            cur.execute(
-                """SELECT message_id, envelope FROM outbox
-                   WHERE published_at IS NULL
-                   ORDER BY created_at, message_id
-                   LIMIT %s""",
-                (limit,),
-            )
-            return cur.fetchall()
-    finally:
-        conn.close()
+    """Pending outbox rows, oldest first: [(message_id, type, envelope_text), ...]."""
+    def work(cur):
+        cur.execute(
+            f"""SELECT message_id, type, envelope FROM outbox
+                WHERE {_PENDING}
+                ORDER BY created_at, message_id
+                LIMIT %s""",
+            (limit,),
+        )
+        return cur.fetchall()
+    return _relay_query(work)
 
 
 def mark_published(message_id):
     """Called only after the broker confirmed the message."""
-    conn = connect_once()
-    try:
-        with conn, conn.cursor() as cur:
-            cur.execute(
-                "UPDATE outbox SET published_at = clock_timestamp() "
-                "WHERE message_id = %s AND published_at IS NULL",
-                (message_id,),
-            )
-    finally:
-        conn.close()
+    def work(cur):
+        cur.execute(
+            "UPDATE outbox SET published_at = clock_timestamp() "
+            "WHERE message_id = %s AND published_at IS NULL",
+            (message_id,),
+        )
+    _relay_query(work)
+
+
+def set_aside_outbox(message_id, error):
+    """Contract section 3: a permanent publish failure. The relay will not retry the row.
+
+    One UPDATE, only if the row is still unpublished and not already set aside.
+    `error` is cut to OUTBOX_ERROR_MAX characters. True if the row was set aside.
+    """
+    def work(cur):
+        cur.execute(
+            "UPDATE outbox SET failed_at = clock_timestamp(), error = %s "
+            "WHERE message_id = %s AND published_at IS NULL AND failed_at IS NULL",
+            (error[:OUTBOX_ERROR_MAX], message_id),
+        )
+        return cur.rowcount == 1
+    return _relay_query(work)
 
 
 def count_pending_outbox():
-    conn = connect_once()
-    try:
-        with conn, conn.cursor() as cur:
-            cur.execute("SELECT count(*) FROM outbox WHERE published_at IS NULL")
-            return cur.fetchone()[0]
-    finally:
-        conn.close()
+    """Rows the relay will still try to publish (set-aside rows do not count)."""
+    def work(cur):
+        cur.execute(f"SELECT count(*) FROM outbox WHERE {_PENDING}")
+        return cur.fetchone()[0]
+    return _relay_query(work)
+
+
+def count_failed_outbox():
+    """Rows set aside after a permanent publish failure."""
+    def work(cur):
+        cur.execute("SELECT count(*) FROM outbox WHERE failed_at IS NOT NULL")
+        return cur.fetchone()[0]
+    return _relay_query(work)
