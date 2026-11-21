@@ -1,143 +1,110 @@
 # Payment service
 
-Owns payment records, makes charge retries safe using the booking ID, and performs full refunds. The fake provider lives in `app/provider.py`. The service owns its ledger and outbox in PostgreSQL, separate from Notification's database.
+This service pretends to take payments and give full refunds. It saves the results in PostgreSQL so retrying the same booking does not charge it twice. No real money is used.
 
-## Run locally
+Booking handles seats, reservations and checkout. Payment handles payment records and refunds. The services talk through HTTP requests and RabbitMQ messages.
 
-On this integration branch the database has no host port. Prefer the Docker
-commands below; for host Python, explicitly configure a privately accessible
-`DATABASE_URL`. The original standalone commands were:
+More detail is in the [integration guide](../docs/contracts/payment-integration.md), [Payment ADR](../docs/adr/ADR-004-idempotent-payments.md) and [demo guide](../docs/payment-demo.md).
 
-```powershell
-docker compose up -d payment-db
-cd payment
-python -m pip install -r requirements.txt
-python -m uvicorn app.main:app --port 8004
-```
+## Start the project
 
-The default local database URL is `postgresql://payment:payment@127.0.0.1:5434/payment`. Set `DATABASE_URL` to use another PostgreSQL server. Compose uses its internal `payment-db:5432` address automatically. No `.env` file is required, and PostgreSQL is provided by Docker.
-
-Open http://localhost:8004/docs. With no `AMQP_URL`, HTTP works and new events stay in the outbox until messaging is enabled. For local RabbitMQ support, run from the repository root instead:
+Open a terminal in the main Group folder and run:
 
 ```powershell
-$env:AMQP_URL = "amqp://guest:guest@localhost:5672/"
-$env:PYTHONPATH = "$PWD\shared"
-python -m uvicorn app.main:app --app-dir payment --port 8004
+docker compose up -d --build
 ```
 
-## Docker and dashboard
-
-From the repository root, stop any local Payment server on port 8004 first:
+To include the monitoring dashboard:
 
 ```powershell
 docker compose -f docker-compose.yml -f docker-compose.monitoring.yml up -d --build
 ```
 
-To run only Payment and monitoring (and their broker dependencies):
+| Page | Address |
+|---|---|
+| Booking website | http://localhost:8080 |
+| Try Payment requests | http://localhost:8004/docs |
+| Try Booking requests | http://localhost:8002/docs |
+| View test emails | http://localhost:8025 |
+| Prometheus, with monitoring running | http://localhost:9090 |
+| Grafana dashboard, with monitoring running | http://localhost:3000 |
 
-```powershell
-docker compose -f docker-compose.yml -f docker-compose.monitoring.yml up -d --build payment prometheus grafana
-```
+The default Grafana login is `admin` / `stagedoor-demo`.
 
-- Payment API: http://localhost:8004/docs
-- Metrics: http://localhost:8004/metrics
-- Prometheus: http://localhost:9090
-- Grafana: http://localhost:3000, login `admin` / `stagedoor-demo`
-- Dashboard: Grafana > Dashboards > Stagedoor > Stagedoor Payment
+Docker sets the database and RabbitMQ addresses. You do not need a `.env` file or a separate PostgreSQL download. In the shared project, the Payment database is only reachable inside Docker. The Python default address on port 5434 will not connect to it from your computer. Use the Docker commands in this README.
 
-Set `GRAFANA_PASSWORD` before first startup to change the demo password. Payment has a `/ready` check for its database and, when enabled, broker connection. `/health` only checks the process.
+## Payment requests
 
-The `payment-db` named volume stores PostgreSQL data across container restarts. Monitoring has named volumes. The integration branch defers the upstream broker-volume change;
-broker persistence across container recreation is not established here. Normal `docker compose down` preserves volumes; `down -v` deletes them. Payment no longer uses the old SQLite files or `payment-data` volume. Legacy SQLite files are backed up outside the project before cleanup; no records are automatically imported from them. Existing Docker volumes are not deleted by this code update.
+| Request | What it does |
+|---|---|
+| `POST /payments` | Takes a simulated payment or returns its saved result |
+| `GET /payments/{payment_id}` | Looks up a payment; returns 404 if it does not exist |
+| `POST /payments/{payment_id}/refunds` | Gives a full refund or returns the existing refund |
 
-## Proposed Booking HTTP contract
-
-These fields are a proposed version 1 contract to review with the Booking owner. The existing shared routing keys are used unchanged.
-
-- `POST /payments`: `{"booking_id":"bk-1","amount":4500,"currency":"EUR","customer_email":"buyer@example.com"}`.
-- `GET /payments/{payment_id}`: read the saved result.
-- `POST /payments/{payment_id}/refunds`: request a full refund, no body.
-
-Amounts in HTTP are integer minor units: 4500 means EUR 45.00. Use EUR/two-decimal currencies only in this version. Results contain `payment_id`, `booking_id`, `amount`, `currency`, `status`, `refund_id`, `created_at`. Status is `paid`, `failed` or `refunded`. A provider decline returns 200 with status `failed`: Booking must inspect the status. A timeout is an unknown outcome, not a decline.
-
-After a timeout or 503, Booking retries the same booking ID, amount and currency. It gets the saved result without calling the provider again. A changed amount/currency gives 409. A declined booking stays declined; a new purchase needs a new booking ID. Payment never allocates seats or confirms bookings. Booking must make cancellation/refund decisions for expired holds.
-
-Errors: 404 unknown payment, 409 conflicting request/non-refundable payment/terminal refund rejection, 422 bad input, 503 temporary provider/database unavailability. A rejected refund leaves the payment paid and adds a `refund.failed` event. A temporary refund failure leaves no completed result and must be retried.
-
-## Simulator controls
-
-Set variables before starting or restarting the process:
-
-```powershell
-$env:PAYMENT_MODE = "ok"       # ok, decline, down
-$env:PAYMENT_DELAY = "5"       # seconds, 0 to 10
-$env:PAYMENT_ERROR_RATE = "0.5" # probability, 0 to 1; 0.5 means 50%
-```
-
-Compose reads the same environment variables. After changing them:
-
-```powershell
-docker compose up -d --force-recreate payment
-```
-
-`ok` normally succeeds; `decline` declines new payments and terminally rejects refunds; `down` makes new provider calls temporarily unavailable. The error rate injects temporary errors in both payment and refund calls, after the delay. Use 0 or 1 for deterministic tests. Duplicate completed operations bypass the provider and all injected errors. An error rate of 0.5 is probabilistic, not a guarantee that exactly half of requests fail.
-
-## RabbitMQ and durable publication
-
-Uses the existing `shared/messaging` package, `events` exchange and shared 1/2/4-second retry/DLQ mechanism. Consumers only acknowledge after the refund transaction commits. The outbox publisher uses persistent messages, publisher confirms and mandatory routing. It marks a message sent only after confirmation. A crash before that update may republish the SAME message ID; consumers must deduplicate.
-
-Each new payment creates `payment.result`. Each first successful refund creates `refund.completed`. A terminal provider refund rejection creates `refund.failed` (once per payment). State and outgoing messages commit together. Imports preserve existing outbox IDs and sent flags rather than creating new historical events.
-
-Consumes `refund.requested` from `payment.refund-requests`. Payload:
+Example payment:
 
 ```json
-{"booking_id":"bk-1","payment_id":"payment UUID","customer_email":"buyer@example.com"}
+{"booking_id":"booking UUID","amount":4500,"currency":"EUR","customer_email":"buyer@example.test"}
 ```
 
-`booking_id` must match the saved payment. Email is optional; the original charge's email is used as a fallback. Include it on charge/refund requests so Notification can send emails even when cancellation precedes ticket creation.
+Amounts in HTTP requests are in cents: `4500` means EUR 45.00. RabbitMQ messages send the same amount as `"45.00"`. This version is intended for currencies with two decimal places.
 
-Publishes the shared envelope (`message_id`, `type`, `occurred_at`, `version: 1`, `producer: payment`, `payload`). Result payloads have `booking_id`, `payment_id`, `amount`, `currency`, `status`; refunds add `refund_id` when successful, and rejection adds `reason: provider_rejected`. `customer_email` is included when known. For Notification compatibility, event `amount` is a DECIMAL STRING, e.g. `"45.00"`; HTTP remains integer cents. For `refund.failed`, status is the payment's current state (`paid`); the message type describes the failed refund. Agree these payload choices with the Booking owner before connecting Booking.
+Booking sets the price, currently EUR 45.00 per seat. It saves the price when the seat is held. Payment uses that saved amount and does not choose the price.
 
-A repeated refund message ID is recorded in the same transaction as the state and outbox. A different message ID for an already-refunded payment also cannot refund twice. A terminal rejection is acknowledged and emits `refund.failed`; after the cause is resolved, recovery requires a NEW request ID (or a new HTTP refund call). Replaying the same processed message is a no-op. Temporary errors raise and follow shared retries; exhaustion parks the request in `payment.refund-requests.dlq`, without pretending the refund is permanently rejected. Fix the simulator then replay:
+The response includes the payment ID, booking ID, amount, currency, status, refund ID and creation time. Status is `paid`, `failed` or `refunded`.
 
-```powershell
-docker compose exec payment python -m messaging.replay payment.refund-requests --list
-docker compose exec payment python -m messaging.replay payment.refund-requests
-```
+- **200:** the request was handled. Check the status: a declined payment returns `failed` even though the HTTP code is 200.
+- **409:** details conflict with an existing payment, the payment cannot be refunded, or the provider rejected the refund.
+- **422:** the request contains invalid or missing fields.
+- **503 or a timeout:** the result is uncertain. The payment might still finish.
 
-A successful publisher confirm means broker acceptance, not that Booking or Notification has handled the event.
+Retry using the same booking ID, amount and currency. If the result is already saved, it is returned without taking payment again. Changing the amount or currency for that booking returns 409. After a declined payment, a new purchase needs a new booking ID.
 
-## Metrics
+If you never received the payment ID, repeat `POST /payments` with the same details. There is no separate lookup by booking ID.
 
-The provisioned dashboard shows HTTP rate/errors/p95 latency, payment records by state, actual provider payment/refund calls by outcome, pending outbox events, broker connection, consumer attempts and published events. Duplicate requests do not increase provider call counts. Database record/outbox gauges survive process restarts; counters reset per process. Route templates are used instead of IDs or email labels.
+## How Booking uses Payment
 
-## Tests
+1. Booking receives a checkout request and replies with 202, meaning payment is being processed.
+2. Booking calls Payment in the background. Payment returns its final result.
+3. Booking checks the result and confirms or releases the seat. The client checks the booking status through `GET /bookings/{id}?customer_id=...`.
 
-Start `payment-db` first (`docker compose up -d payment-db` from the root). From `payment`:
+Booking tries Payment up to three times, allowing two seconds per attempt and adding short random waits between retries. After five failed attempts, its circuit breaker pauses calls for 30 seconds before trying again. Payment also sends a `payment.result` message. Booking safely handles receiving both the HTTP result and the message.
 
-```powershell
-python -m unittest discover -s tests -v
-```
+A seat hold does not expire normally while payment is in progress. Booking's safety net waits 60 seconds by default, then makes one more same-ID call. If there is still no answer, it releases the seat. If payment succeeds later, Booking requests a refund instead of taking the seat back. The safety-net setting can be lowered to 7 seconds for the demo. There is no 15-minute payment-checking job.
 
-Every database test uses a uniquely created temporary PostgreSQL schema, removed after that test. Existing application data is not cleared. Set `PAYMENT_TEST_DB` to use a different test database; the default is the same local URL on port 5434. The database user must be allowed to create schemas. The suite covers HTTP duplicate protection, changed requests, refunds, persistence, validation, metrics, failures, concurrent requests, message duplicates, rejected refunds, failed publishes, crash/republication IDs, atomic outbox rollback and automatic three-table migration. It does not substitute for the final Booking saga test.
+If payment finishes after an event is cancelled, it is refunded. A booking confirmed before a later cancellation currently keeps its ticket.
 
-An optional real-broker test is included and skipped by default. Against a running Compose stack:
+The shared Docker setup now supports checkout in the browser at http://localhost:8080. Reserve a seat, choose **Pay and complete booking**, and the page checks Booking until it gets a result. After confirmation, choose **Check ticket**. Booking sends the payment request; the browser does not call Payment directly. The booking-status reply includes `price_minor` and `currency` from the price saved when the hold was created. See the [checkout guide](../docs/contracts/checkout-preview.md).
 
-```powershell
-$env:PAYMENT_TEST_URL = "http://localhost:8004"
-$env:PAYMENT_TEST_AMQP = "amqp://guest:guest@localhost:5672/"
-python -m unittest discover -s tests -v
-```
+## Messages and refunds
 
-Use normal simulator settings (`ok`, zero delay/error rate) for these tests. The broker test creates a uniquely named test booking/refund and a temporary event queue. It does not need the Booking service.
+Payment listens for `refund.requested` messages on `payment.refund-requests`. Each request needs the booking ID and payment ID. Email is optional. The booking must match the saved payment.
 
-Verified on 10 November 2026 against PostgreSQL 16: all 25 tests passed, including live RabbitMQ requests, duplicate provider-call prevention, unrelated-booking concurrency automatic five-to-three-table migration. Separate live checks verified Payment and PostgreSQL restarts with unsent outbox records, broker recovery, Prometheus/Grafana data and the existing Notification refund email.
+Payment sends:
 
-Reliability reference: [RabbitMQ publisher confirms and consumer acknowledgements](https://www.rabbitmq.com/docs/confirms). Metric-label reference: [Prometheus naming guidance](https://prometheus.io/docs/practices/naming/).
+- `payment.result`: a charge succeeded or failed.
+- `refund.completed`: a refund succeeded.
+- `refund.failed`: the provider rejected a refund. The payment itself still has status `paid`.
 
-## Database queries
+Messages use the shared version-1 format and `events` exchange. The payment change and the message to send are saved together. The sender waits for RabbitMQ to confirm receipt before marking a message as sent. A crash can cause another copy to be sent, so the receiving service must ignore duplicates. RabbitMQ accepting a message does not mean another service has finished handling it.
 
-From the repository root, open PostgreSQL's query tool:
+For a temporary refund problem, the request is retried after 1, 2 and 4 seconds. If it keeps failing, it goes to `payment.refund-requests.dlq` for later replay. If the provider rejects the refund, Payment sends `refund.failed` once per payment. Trying again after a rejection needs a new message ID; Booking has a `refund_recovery.py` command for this. The [demo guide](../docs/payment-demo.md) covers both cases.
+
+## Database
+
+There are three tables:
+
+| Table | What it stores |
+|---|---|
+| `payments` | Payments, refunds, optional email and whether a refund rejection was reported |
+| `processed_messages` | Refund-message IDs already handled, so duplicates are ignored |
+| `outbox` | Messages saved for sending and whether RabbitMQ accepted them |
+
+The `refund_failed` flag is a history marker. It can stay true after a later refund succeeds. Check `status` to see the current result.
+
+Old five-table PostgreSQL databases are updated automatically without losing their records. Payment no longer uses SQLite. Sent messages are kept in the outbox; there is no cleanup job yet.
+
+Open the database from the Group folder:
 
 ```powershell
 docker compose exec payment-db psql -U payment -d payment
@@ -146,25 +113,61 @@ docker compose exec payment-db psql -U payment -d payment
 ```sql
 \dt
 SELECT payment_id, booking_id, amount, currency, status, refund_id FROM payments;
-SELECT * FROM payments WHERE booking_id = 'bk-1';
-SELECT * FROM payments WHERE status = 'refunded';
 SELECT message_id, body FROM outbox WHERE NOT sent ORDER BY id;
 SELECT * FROM processed_messages;
 \q
 ```
 
-There are exactly three tables:
+`\dt` lists tables. `\q` exits the database tool.
 
-| Table | Purpose |
+## Test delays and failures
+
+Set these in PowerShell before restarting Payment:
+
+```powershell
+$env:PAYMENT_MODE = "ok"       # ok, decline or down
+$env:PAYMENT_DELAY = "0"       # seconds, 0 to 10
+$env:PAYMENT_ERROR_RATE = "0"  # probability, 0 to 1
+docker compose up -d --no-deps --force-recreate payment
+```
+
+| Setting | Meaning |
 |---|---|
-| `payments` | Payment details, refund ID, optional `customer_email`, and `refund_failed` history flag |
-| `processed_messages` | RabbitMQ message IDs already applied |
-| `outbox` | Outgoing events awaiting broker confirmation |
+| Mode `ok` | New payments and refunds normally succeed |
+| Mode `decline` | New payments are declined and refunds are rejected |
+| Mode `down` | New payment/refund attempts temporarily fail |
+| Delay `10` | Adds ten seconds to each new charge or refund |
+| Error rate `0.5` | Gives each new provider attempt a 50% chance of temporary failure |
 
-`refund_failed` records that a terminal refund-failure event has already been reported; it can stay true after a later successful refund. Use `status` for the current payment state. Existing five-table PostgreSQL databases upgrade automatically on Payment startup: email addresses and failure flags are copied into `payments`, then the two redundant tables are removed in the same transaction. Payment IDs, refunds, message IDs and outbox records are preserved. HTTP amounts remain integer cents and RabbitMQ amounts remain decimal strings. `created_at` is now a timezone-aware PostgreSQL timestamp, returned in ISO format.
+Saved completed results still work when these failure settings are on. For the late-payment demo, use Payment delay 10 and Booking safety net 7, as shown in the demo guide.
 
-## Concurrency and remaining limits
+## Run the tests
 
-Payment takes a PostgreSQL session advisory lock per booking during a new charge, or per payment during a refund. Same-operation duplicates wait and then read the saved result; different bookings can proceed in parallel. Provider delays run with autocommit and no open transaction. Only the final ledger/outbox changes share a short atomic transaction. The dedicated connection closes and releases its locks on success or failure. Use direct PostgreSQL connections; transaction-pooling proxies are not supported by this session-lock design. See [PostgreSQL advisory locks](https://www.postgresql.org/docs/16/explicit-locking.html#ADVISORY-LOCKS) and [Psycopg transaction management](https://www.psycopg.org/psycopg3/docs/basic/transactions.html).
+Start the project first, with normal mode, zero delay and zero error rate. Run this from the Group folder:
 
-The simulator has no external financial side effects. If it crashes before committing, a retry may call the simulator again but no second ledger charge is created. A real provider needs its own durable idempotency and reconciliation: a PostgreSQL rollback cannot undo an external charge. No real money is moved. Keep one outbox publisher process for now; a crash may still cause safe at-least-once redelivery of an event. The 500-buyer scenario and final Booking saga are not yet load-tested. Connection/thread limits and Booking's retry budget must be tuned together. Final Booking integration, timing budget, the late-success demo and a Payment ADR remain.
+```powershell
+docker compose run --rm --no-deps `
+  -e PAYMENT_TEST_DB=postgresql://payment:payment@payment-db:5432/payment `
+  -e PAYMENT_TEST_URL=http://payment:8000 `
+  -e PAYMENT_TEST_AMQP=amqp://guest:guest@rabbitmq:5672/ `
+  -v "${PWD}/payment/tests:/srv/tests:ro" `
+  payment python -m unittest discover -s tests -v
+```
+
+This runs the 25 tests inside Docker, where the database and broker are reachable. Database tests use separate temporary areas called schemas. The live RabbitMQ test creates a test payment and refund. Save your actual test output for the submission.
+
+Booking's 500-buyer test checks seat holds, not 500 completed payments. Demo timings can vary between runs.
+
+## Health checks and dashboard
+
+- `/health`: the Payment process is running.
+- `/ready`: its database and configured RabbitMQ connection are working.
+- `/metrics`: numbers used by Prometheus and Grafana, including requests, errors, response times, payments, refunds and messages waiting to be sent.
+
+## Current limits
+
+PostgreSQL locks stop two requests for the same booking/payment from running that operation at once. Other bookings can still run. The fake provider delay happens before the short database transaction that saves the result and its message. This lock design needs a direct database connection and does not support proxies that swap connections between transactions.
+
+The system currently assumes one Payment message sender and one Booking instance. The fake provider does not move real money. A real provider would need its own duplicate protection and a way to recover uncertain results after a crash.
+
+The current root Compose file has no RabbitMQ data volume. Message survival when the broker container is replaced therefore still needs a shared setup decision. See the ADR for the full design and trade-offs.

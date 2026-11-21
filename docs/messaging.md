@@ -60,4 +60,4 @@ When `handle` returns, the message is acked. When it raises, the message is retr
 | `refund.completed` | `booking_id`, `payment_id`, `amount`, `currency`; `customer_email` optional (taken from the ticket otherwise) |
 | `refund.failed` | `booking_id`, `payment_id`; `customer_email` optional |
 
-`reason` is one of `hold_expired`, `payment_failed`, `payments_unavailable`, `event_cancelled` or `refund_required`. For the late-success case in ADR-001, Booking sends `booking.cancelled` with `refund_required`, and the customer is told a refund is on its way.
+Booking currently sends cancellation `reason` values `hold_expired`, `payment_failed`, `payments_unavailable` or `event_cancelled`. `payments_unavailable` means the outcome could not be confirmed: the customer may have been charged. A later successful payment triggers `refund.requested` without another cancellation or re-holding the seat; Booking no longer sends cancellation reason `refund_required`. Payment then publishes `refund.completed` or a terminal `refund.failed`. See the [Booking contract](contracts/booking.md) and [Payment integration contract](contracts/payment-integration.md).
