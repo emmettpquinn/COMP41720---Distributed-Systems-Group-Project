@@ -1,70 +1,60 @@
-# Payment integration review
+# Payment and Booking integration
 
-Reviewed source: `origin/feature/payment-service` at `63b8b0e` on 2026-11-14.
-The implementation is now imported into `feature/catalogue-integration`; the
-source branch and shared envelope/topology are unchanged. This review closes the
-code-inspection part of INT02. Booking acceptance remains pending.
+Updated 21 November 2026 against the shared Booking and gateway implementation. This replaces the holds-only review and describes the implemented backend and browser checkout flow.
 
-## Integration update (2026-11-19)
+## Ownership
 
-The review above and remaining dated observations below describe the earlier
-import. Booking now implements the accepted asynchronous checkout wrapper,
-Payment result handling, safety net and refunds. Real-service checks passed
-purchase, decline and late-success refund. The current gateway/UI exposes Booking
-checkout/status, not direct Payment routes. See [current Booking contract](booking.md)
-and [integration evidence](../integration-development.md#booking-integration-verification-2026-11-19).
+- Booking owns seats, holds, checkout, confirmation, expiry and compensation decisions.
+- Payment owns its PostgreSQL charge/refund ledger, idempotency and payment events.
+- Downstream uses `booking_id`; Booking retains `booking_ref` with the same UUID for UI compatibility.
+- Hold requests accept optional name/email. Booking falls back to the customer ID and `<customer_id>@example.test`. Payment only needs email.
+- Booking owns the current configured EUR 45.00-per-seat price, fixed at hold time. Payment receives the amount and does not calculate it.
 
-## Implemented interface
+## HTTP
 
-- `POST /payments`: stable `booking_id`, positive integer minor-unit `amount`,
-  three-letter `currency`, optional `customer_email`. A successful HTTP request
-  returns the final simulated `paid` or `failed` result. A decline is HTTP 200
-  with `status: failed`; inspect the body.
-- `GET /payments/{payment_id}` returns the saved result. Repeating a charge with
-  the same booking/amount/currency reuses the result; changed amount/currency is
-  409. Unknown outcome recovery retries the same booking ID.
-- `POST /payments/{payment_id}/refunds` requests a full refund. Refunds and
-  duplicate request IDs are recorded with their outgoing message atomically.
-- Messages use the existing envelope/version 1. `payment.result`,
-  `refund.completed` and `refund.failed` use decimal-string amounts such as
-  `"45.00"`, while HTTP uses `4500`. The refund consumer expects `booking_id` and
-  `payment_id`; email can fall back to the saved charge.
-- `/health` is process liveness; `/ready` checks database and enabled broker.
-  `/metrics` and the imported dashboard report actual Payment activity.
+Payment accepts `POST /payments` with `booking_id`, positive integer minor-unit `amount`, three-letter `currency` and optional `customer_email`. HTTP 200 contains final status `paid`, `failed` or an already-saved `refunded` result. A declined charge is not an HTTP error. HTTP 503 or a timeout is an unknown outcome.
 
-## Fit and decisions still needed
+Repeat the same booking ID/amount/currency to recover the result without charging twice. Changed details return 409. `GET /payments/{payment_id}` reads a known ID; there is no GET by booking ID. `POST /payments/{payment_id}/refunds` is a full idempotent refund.
 
-The team plan's immediate accepted response with asynchronous completion differs
-from the implemented final-result HTTP response. The simulator is in-process;
-there is no separate provider container or durable real-provider reconciliation.
-Booking must agree its timeout/retry budget, unknown-outcome lookup strategy,
-late success/refund path and how a hold reference becomes a booking ID.
+| Booking endpoint | Behaviour |
+|---|---|
+| `POST /holds` | Creates a hold/booking with fixed price and customer details |
+| `POST /bookings/{id}/checkout` with `{customer_id}` | Commits `payment_pending`, returns 202, then calls Payment in the background |
+| `GET /bookings/{id}?customer_id=...` | Returns the booking state, saved `price_minor` and `currency` to its owner |
 
-Catalogue deliberately has no price/amount authority in its candidate contract.
-Pricing ownership must be agreed before checkout. The current Booking source has
-only `POST /holds`, no checkout/status API, expiry worker or payment consumer.
-Consequently this branch exposes no browser payment/checkout route. Payment's
-successful ledger result alone does not mean a booking is confirmed or a ticket
-has been issued.
+Payment should not return 202 to match Booking: Booking provides the asynchronous boundary and its client expects Payment's final result. Booking business errors use `{error, message}`; validation/database errors retain FastAPI's `detail`. Breaker refusal is 503 `payment_service_unavailable` and leaves the seat held.
 
-Payment's refund fields fit Ticketing's existing decimal amount/email handler.
-The live Payment broker test exercises duplicate refund requests and final ledger
-state. Full Booking saga timing and Ticketing email acceptance still need a joint
-test with the real Booking workflow.
+## Retries and late success
 
-## Controlled integration changes
+Booking makes three attempts with two-second total deadlines. Jitter is 0-250 ms before attempt two and 0-500 ms before attempt three: about 6.75 seconds maximum for the initial call. Its breaker opens after five failed attempts and allows a trial after 30 seconds. HTTP 409/422 is not retried or counted as an outage.
 
-- Payment application, SQL, Dockerfile and tests are copied from `63b8b0e`.
-  README references to individuals were replaced with service-role wording.
-- Root Compose adds `payment-db` on the private network, preserves existing
-  Catalogue/Ticketing definitions, and runs the real Payment service on port 8004.
-  No Payment database host port is published.
-- Payment dashboard JSON is unchanged, stored under its own `payment/` directory;
-  the provisioning path is narrowed to avoid scanning Catalogue's dashboard twice.
-- Payment is a fifth monitoring target. Payment failure controls are unchanged.
-- The upstream broker-volume change is deferred: this integration does not migrate
-  or replace any existing broker storage. Container recreation persistence still
-  needs a coordinated broker decision.
+HTTP answers and `payment.result` apply the same conditional Booking transition; whichever arrives second is a no-op. Ordinary hold expiry excludes `payment_pending`. The safety net waits `BOOKING_SAFETY_NET_SECONDS` from checkout start (default 60, minimum 7), then makes one more same-ID call through the same breaker. No answer releases the booking with `payments_unavailable`.
 
-No teammate branch was modified and no merge commit was created. A later merge
-of upstream service work must reconcile these already-imported paths explicitly.
+A later `paid` result moves a released booking to `refund_required` and emits `refund.requested`, without changing the seat or emitting another cancellation. No 15-minute reconciliation task exists. For a shortened demo use `PAYMENT_DELAY=10` and safety net 7; record actual timings.
+
+A payment completing after event cancellation is refunded without a ticket. Already-confirmed bookings on an event cancelled later currently retain their ticket.
+
+## Messages and recovery
+
+Messages use `message_id`, `type`, `occurred_at`, `version: 1`, `producer`, `payload`; routing key equals type on `events`.
+
+| Message | Route | Payload |
+|---|---|---|
+| `payment.result` | Payment -> Booking | `booking_id`, `payment_id`, `amount`, `currency`, `status`; email when known |
+| `refund.requested` | Booking -> Payment | `booking_id`, `payment_id`; optional `customer_email` |
+| `refund.completed` | Payment -> Booking and Ticketing | Payment fields plus `refund_id`, status `refunded` |
+| `refund.failed` | Payment -> Booking and Ticketing | Payment fields plus `reason: provider_rejected`; payment status remains `paid` |
+
+HTTP amount `4500` corresponds to event amount `"45.00"`. Dispatch refund outcomes by message type. Payment validates booking/payment ownership and atomically saves the refund, processed message ID and outgoing event. Both repeated message IDs and new requests for an already-refunded payment are safe.
+
+Temporary errors retry through the shared 1/2/4-second ladder, then park in Payment's DLQ. Booking stays `refund_required`; fix and replay. Terminal rejection emits `refund.failed` once per payment, moving Booking to `refund_pending`. Recovery requires a new request ID through `refund_recovery.py`. Published outbox records are retained; broker confirmation is not consumer acknowledgement.
+
+## Deployment and open boundaries
+
+Root Compose starts Booking, Payment, separate databases, RabbitMQ and topology setup. Catalogue messaging defaults on; Booking demo seeding defaults off. Payment's database has no host port. Monitoring uses `docker-compose.monitoring.yml`, and Booking is already a Prometheus target.
+
+The shared Compose stack now enables Booking holds and checkout in the gateway. The browser sends checkout through `POST /api/booking/bookings/{id}/checkout`, reads status through `GET /api/booking/bookings/{id}?customer_id=...`, and checks tickets through `GET /api/ticketing/tickets/{id}`. It displays Booking's saved EUR price and never sends a price or direct Payment request. Checkout 202 starts polling; a lost response triggers status reads rather than another automatic checkout POST. See the [checkout contract](checkout-preview.md). Ticketing's `payments_unavailable` email still needs its owner's correction because the customer may have been charged. Booking currently ignores direct refunds of confirmed bookings made outside its saga; do not use that as a normal purchase path.
+
+The shared [integration runbook](../integration-development.md#booking-integration-verification-2026-11-19) records real-service purchase, decline and late-success refund checks from 19 November. Those results are previous evidence, not a fresh test run of this documentation update.
+
+See [ADR-004](../adr/ADR-004-idempotent-payments.md), the [Booking contract](booking.md) and [demo guide](../payment-demo.md). The last-seat evidence measures hold correctness, not completed-payment throughput.
