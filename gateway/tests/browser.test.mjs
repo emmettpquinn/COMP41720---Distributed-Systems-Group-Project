@@ -29,7 +29,8 @@ async function setup(t, {search=async()=>({status:200,body:searchResult()}), ena
   checkout=false, hold=async()=>({status:201,body:{status:'held',booking_ref:checkout ? bookingId : 'synthetic-reference',...(checkout ? {booking_id:bookingId} : {})}}),
   status=async()=>({status:200,body:bookingResult()}),
   pay=async()=>({status:202,body:{booking_id:bookingId,booking_status:'payment_pending'}}),
-  ticket=async()=>({status:404,body:{detail:'No ticket'}}), savedBooking=null, pollDelay=2} = {}) {
+  ticket=async()=>({status:404,body:{detail:'No ticket'}}), savedBooking=null, pollDelay=2,
+  detail=()=>({seats:[{seat_id:'A1',section:'A',label:'A1'}],availability:null})} = {}) {
   const dom = new JSDOM(html,{url:'http://localhost',runScripts:'outside-only'});
   t.after(()=>{dom.window.dispatchEvent(new dom.window.Event('pagehide'));dom.window.close();});
   const window=dom.window;
@@ -47,7 +48,7 @@ async function setup(t, {search=async()=>({status:200,body:searchResult()}), ena
     else if(path.startsWith('/api/catalogue/events/')) {
       const id=decodeURIComponent(path.split('/').at(-1));
       response={status:200,body:{...catalogue.find(item=>item.event_id===id),description:'Fictional performance',
-        seats:[{seat_id:'A1',section:'A',label:'A1'}],availability:null}};
+        ...detail(id)}};
     } else if(path.startsWith('/api/discovery/search?')) response=await search(new URL(path,'http://localhost').searchParams.get('q'));
     else if(path==='/api/booking/holds') response=await hold(options);
     else if(/^\/api\/booking\/bookings\/[^/]+\/checkout$/.test(path)) response=await pay(options);
@@ -134,6 +135,68 @@ test('disabled search stays hidden',async t=>{
   assert.equal($('#event-list').children.length,3);
   assert.equal(requests.some(request=>request.path.startsWith('/api/discovery/')),false);
   assert.equal($('#checkout-panel').hidden,true);
+});
+
+const theatreSeats = () => [...'ABCDE'].flatMap(row=>Array.from({length:10},(_,i)=>({seat_id:`${row}${i+1}`,section:'Stalls',label:`${row}${i+1}`})));
+
+test('50 seats keep five labelled rows and natural column order even when the API sorts IDs lexically',async t=>{
+  const seats=theatreSeats().sort((a,b)=>a.seat_id.localeCompare(b.seat_id));
+  const page=await setup(t,{detail:()=>({seats,availability:null})});
+  page.$('#event-list .event-card').click();
+  await until(()=>Boolean(page.$('.seat')));
+  const rows=[...page.window.document.querySelectorAll('.seat-row[data-row]')];
+  assert.deepEqual(rows.map(row=>row.dataset.row),['A','B','C','D','E']);
+  assert.deepEqual([...rows[0].querySelectorAll('.seat')].map(node=>node.textContent),Array.from({length:10},(_,i)=>`A${i+1}`));
+  assert.equal(page.window.document.querySelectorAll('.seat').length,50);
+  assert.equal(page.window.document.querySelectorAll('.seat-column-number').length,10);
+  assert.equal(page.$('.seat-map').tabIndex,0);
+  page.$('[data-seat="E10"]').click();page.$('#hold').click();
+  await until(()=>page.$('#reservation-status').textContent.includes('synthetic-reference'));
+  assert.equal(JSON.parse(page.requests.find(r=>r.path==='/api/booking/holds').options.body).seat_id,'E10');
+});
+
+test('missing numbered seats leave gaps and do not shift the remaining seats',async t=>{
+  const seats=[{seat_id:'A3',section:'Stalls',label:'A3'},{seat_id:'A1',section:'Stalls',label:'A1'}];
+  const page=await setup(t,{detail:()=>({seats,availability:null})});
+  page.$('#event-list .event-card').click();
+  await until(()=>Boolean(page.$('.seat')));
+  const row=page.$('.seat-row[data-row="A"]');
+  assert.deepEqual([...row.children].map(node=>node.textContent),['A','A1','','A3']);
+  assert.equal(row.querySelectorAll('.seat-gap').length,1);
+  assert.equal(page.$('[data-seat="A2"]'),null);
+});
+
+test('sections with identical seat labels retain independent seat IDs',async t=>{
+  const seats=[{seat_id:'stalls-A1',section:'Stalls',label:'A1'},{seat_id:'balcony-A1',section:'Balcony',label:'A1'}];
+  const page=await setup(t,{detail:()=>({seats,availability:null})});
+  page.$('#event-list .event-card').click();
+  await until(()=>Boolean(page.$('.seat')));
+  assert.equal(page.window.document.querySelectorAll('.seat-section').length,2);
+  page.$('[data-seat="balcony-A1"]').click();page.$('#hold').click();
+  await until(()=>page.requests.some(r=>r.path==='/api/booking/holds'));
+  assert.equal(JSON.parse(page.requests.find(r=>r.path==='/api/booking/holds').options.body).seat_id,'balcony-A1');
+});
+
+test('custom labels and duplicate positions preserve every seat without building a huge sparse map',async t=>{
+  for(const labels of [['Accessible','A999999999999'],['A1','a1']]) {
+    const seats=labels.map((label,i)=>({seat_id:`seat-${i}`,section:'Stalls',label}));
+    const page=await setup(t,{detail:()=>({seats,availability:null})});
+    page.$('#event-list .event-card').click();
+    await until(()=>Boolean(page.$('.seat')));
+    assert.equal(page.window.document.querySelectorAll('.seat').length,2);
+    assert.equal(page.window.document.querySelectorAll('.seat-gap').length,0);
+    assert.equal(page.window.document.querySelectorAll('.seat-row').length,0);
+  }
+});
+
+test('projected unavailable seats stay disabled in the larger row layout',async t=>{
+  const seats=theatreSeats();
+  const page=await setup(t,{detail:()=>({seats,availability:{seats_remaining:49,available_seat_ids:seats.filter(s=>s.seat_id!=='A1').map(s=>s.seat_id),occurred_at:'2026-11-21T12:00:00Z'}})});
+  page.$('#event-list .event-card').click();
+  await until(()=>Boolean(page.$('.seat')));
+  assert.equal(page.$('[data-seat="A1"]').disabled,true);
+  assert.match(page.$('[data-seat="A1"]').getAttribute('aria-label'),/unavailable/);
+  assert.equal(page.$('[data-seat="A10"]').disabled,false);
 });
 
 test('a Booking cancellation disables reservations even when Catalogue has not caught up',async t=>{

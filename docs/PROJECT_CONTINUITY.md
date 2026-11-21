@@ -1,6 +1,6 @@
 # Project continuity
 
-Last reviewed: 2026-11-19. Evidence dates are stated by batch below. Working branch: `feature/catalogue-integration`.
+Last reviewed: 2026-11-21. Evidence dates are stated by batch below. Working branch: `feature/catalogue-integration`.
 
 ## Objective and source of truth
 
@@ -367,3 +367,14 @@ Booking 143, gateway 15, DOM 20 and helper 6 tests passed. Details and limitatio
 are in [the integration runbook](integration-development.md#booking-integration-verification-2026-11-19).
 No new commit, staging, push or PR merge was performed. All generated test
 projects were removed; earlier dated sections retain historical scope.
+
+## Seating demo preparation (2026-11-21)
+
+On request, switched to the integration branch and fast-forwarded it to current
+master `c83faf1`, preserving the merged Booking/dashboard history and local drafts.
+New uncommitted changes provide labelled row/column rendering and a public-API
+venue/event generator. A real 50-seat event and E10 purchase passed the isolated
+startup/restart checks. Desktop Safari purchase/ticket display and second-customer
+unavailability passed; mobile QA, learned-model and full gateway workload checks
+remain separate. See [the seating run notes](integration-development.md#larger-seating-demo-2026-11-21).
+No files were staged, committed or pushed. Generated test projects were removed.

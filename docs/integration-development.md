@@ -192,3 +192,38 @@ had one winner and 499 conflicts, but 252 of 500 responses exceeded the gateway'
 three-second limit. That is peer-provided evidence, not a locally repeated result.
 Keep full gateway workload performance open; do not change the timeout silently
 or treat the direct-service test as browser-level acceptance.
+
+## Larger seating demo (2026-11-21)
+
+The integration branch was fast-forwarded to master `c83faf1`, including both
+Booking evidence and checkout integration. New local work adds labelled seat rows
+and columns without changing the shared seat schema or existing seeds. Within
+one section, labels A1/A10/B1 define placement. Numeric columns are ordered
+naturally; missing numbers leave gaps. Different sections keep independent row
+maps. Custom/ambiguous labels fall back to selectable seat lists without dropping
+seats. Large sparse labels cannot allocate unbounded placeholder grids.
+
+`tools/create_demo_event.py` generates a new fictional venue/event, defaulting to
+five rows and ten columns. It prints JSON unless `--publish` is supplied. Publish
+uses Catalogue's public API and refuses to overwrite an existing event. Its
+limits are 52 rows, 40 columns and 500 seats. They are helper limits, not service
+capacity guarantees. Wider maps scroll inside the panel; a separate browser
+refreshes Catalogue's projection to see another customer's latest hold.
+
+```sh
+python3 tools/create_demo_event.py --rows 5 --columns 10 --publish
+python3 tools/verify_development_startup.py --working-tree --demo-seating --output /tmp/seating-startup.json
+```
+
+Verification passed: 25 DOM checks and 10 tool checks, plus an isolated working-tree
+startup/restart run that created a real 50-seat event, bought E10, rejected a
+competing hold, observed 49 available seats and issued a valid E10 ticket. Existing
+purchase/email, owner, seed and application/database restart checks also passed.
+Raw results are in `/tmp/seating-startup-20261121.json`, outside Git.
+
+A separate disposable Safari preview verified aligned rows A-E and all ten columns
+on the desktop, seat selection, checkout, confirmation and ticket-code display.
+A second tab showed E10 disabled with 49 seats remaining. This is desktop Safari
+verification, not a mobile-device or 500-buyer test. Both generated test projects
+were removed. The original seed maps, existing databases and teammate branches
+were not changed. No staging, commit or push was performed.
