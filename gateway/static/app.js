@@ -2,7 +2,7 @@ const $ = (selector) => document.querySelector(selector);
 const list = $('#event-list');
 const panel = $('#detail');
 const status = $('#list-status');
-let capabilities = {holds: false, search: false};
+let capabilities = {holds: false, search: false, checkout: false};
 let listing = false;
 let listGeneration = 0;
 let activeQuery = "";
@@ -12,6 +12,18 @@ let busy = false;
 let generation = 0;
 let rejected = new Set();
 let reserved = new Set();
+const reservations = new Map();
+const BOOKING_SESSION_KEY = 'stagedoor-booking-v1';
+const POLL_INTERVAL_MS = 2000;
+const MAX_STATUS_READS = 45;
+const BOOKING_STATUSES = new Set(['held', 'payment_pending', 'confirmed', 'released', 'refund_required', 'refund_pending', 'refunded']);
+const TERMINAL_STATUSES = new Set(['confirmed', 'released', 'refund_required', 'refund_pending', 'refunded']);
+let booking = null;
+let pollTimer;
+let pollGeneration = 0;
+let postingCheckout = false;
+let readingStatus = false;
+let readingTicket = false;
 let customerId;
 try {
   customerId = sessionStorage.getItem('stagedoor-customer') || `demo-${crypto.randomUUID()}`;
@@ -54,7 +66,14 @@ function updateControls() {
     node.disabled = busy || listing || node.dataset.unavailable === 'true';
   });
   const hold = $('#hold');
-  if (hold) hold.disabled = busy || listing || !selectedSeat || !capabilities.holds || current.status === 'cancelled';
+  const unfinished = capabilities.checkout && booking && !TERMINAL_STATUSES.has(booking.status);
+  if (hold) hold.disabled = busy || listing || !selectedSeat || !capabilities.holds || current.status === 'cancelled' || Boolean(unfinished);
+  const checkout = $('#checkout');
+  if (checkout) checkout.disabled = busy || postingCheckout || readingStatus || booking.phase !== 'ready' || booking.status !== 'held' || !hasPrice(booking);
+  const check = $('#check-booking');
+  if (check) check.disabled = busy || postingCheckout || readingStatus;
+  const ticket = $('#check-ticket');
+  if (ticket) ticket.disabled = readingTicket;
 }
 
 function renderCards(events) {
@@ -138,7 +157,11 @@ async function selectEvent(id) {
   try {
     const event = await api(`/api/catalogue/events/${encodeURIComponent(id)}`);
     if (request !== generation) return;
-    if (current?.event_id !== id) { rejected = new Set(); reserved = new Set(); }
+    if (current?.event_id !== id) {
+      rejected = new Set();
+      reserved = reservations.get(id) || new Set();
+      reservations.set(id, reserved);
+    }
     current = event; selectedSeat = null;
     renderDetail();
     document.querySelectorAll('.event-card').forEach(card => card.setAttribute('aria-pressed', String(card.dataset.event === id)));
@@ -189,13 +212,13 @@ function renderDetail(message = '', messageClass = '') {
   const result = element('p', message || (!capabilities.holds ? 'Seat reservations are unavailable in this stack.' : 'Choose a seat to request a reservation.'), `message ${messageClass}`);
   result.id = 'reservation-status'; result.setAttribute('role', 'status'); result.setAttribute('aria-live', 'polite');
   body.append(result);
-  body.append(element('p', 'Checkout is not available yet. A reservation does not issue a ticket.', 'muted'));
+  body.append(element('p', capabilities.checkout ? 'A seat hold is not a purchase. Continue in Your booking to check out.' : 'Checkout is not available yet. A reservation does not issue a ticket.', 'muted'));
   panel.replaceChildren(heading, body);
   setBusy(busy);
 }
 
 async function reserve() {
-  if (busy || !selectedSeat || !capabilities.holds) return;
+  if (busy || listing || !selectedSeat || !capabilities.holds || (capabilities.checkout && booking && !TERMINAL_STATUSES.has(booking.status))) return;
   const seat = selectedSeat;
   const eventId = current.event_id;
   // Ignore any older detail fetch that was in flight when the request started.
@@ -204,16 +227,23 @@ async function reserve() {
   $('#reservation-status').textContent = 'Checking your seat with Booking…';
   try {
     const result = await api('/api/booking/holds', {method: 'POST', headers: {'Content-Type': 'application/json'}, body: JSON.stringify({event_id: eventId, seat_id: seat, customer_id: customerId})});
-    if (result.status !== 'held' || !result.booking_ref) throw {status: 502};
+    if (result.status !== 'held' || !validId(result.booking_ref)) throw {status: 502};
+    if (capabilities.checkout && (!validId(result.booking_id || result.booking_ref) || (result.booking_id && result.booking_id !== result.booking_ref))) throw {status: 502};
     reserved.add(seat); selectedSeat = null;
-    renderDetail(`Seat ${seat} is reserved. Reference: ${result.booking_ref}. Checkout is unavailable.`, 'success');
+    renderDetail(`Seat ${seat} is reserved. Reference: ${result.booking_ref}.${capabilities.checkout ? ' Continue below to check out.' : ' Checkout is unavailable.'}`, 'success');
+    if (capabilities.checkout) {
+      booking = {id: result.booking_id || result.booking_ref, reference: result.booking_ref, eventId, seatId: seat, title: current.title, status: 'held', phase: 'checking'};
+      rememberBooking();
+      beginStatusCheck();
+    }
   } catch (error) {
     selectedSeat = null;
     if (error.status === 409) {
       rejected.add(seat);
       let refreshed = false;
       try { current = await api(`/api/catalogue/events/${encodeURIComponent(eventId)}`); refreshed = true; } catch {}
-      renderDetail(refreshed ? 'That seat was taken. We requested the latest projection; your refused choice is marked. Choose another seat.' : 'That seat was taken. The map could not be refreshed. Please try Refresh.', 'error');
+      if (error.data?.error === 'event_cancelled') current = {...current, status: 'cancelled'};
+      renderDetail(error.data?.error === 'event_cancelled' ? 'This event has been cancelled. Reservations are closed.' : refreshed ? 'That seat was taken. We requested the latest projection; your refused choice is marked. Choose another seat.' : 'That seat was taken. The map could not be refreshed. Please try Refresh.', 'error');
     } else if (error.status === 404) {
       renderDetail('Booking has not loaded this event or seat yet. Try another event or check again later.', 'error');
     } else {
@@ -221,6 +251,197 @@ async function reserve() {
     }
   } finally { setBusy(false); }
 }
+
+function validId(value) {
+  return typeof value === 'string' && value.length > 0 && value.length <= 64 && value.trim() === value;
+}
+
+function hasPrice(value) {
+  return Number.isSafeInteger(value.amount) && value.amount > 0 && value.currency === 'EUR';
+}
+
+function bookingPath(suffix = '') {
+  const path = `/api/booking/bookings/${encodeURIComponent(booking.id)}${suffix}`;
+  return suffix ? path : `${path}?customer_id=${encodeURIComponent(customerId)}`;
+}
+
+function rememberBooking() {
+  // Restore only identity. Price and outcome must be read from Booking again.
+  try {
+    sessionStorage.setItem(BOOKING_SESSION_KEY, JSON.stringify({id: booking.id, reference: booking.reference, eventId: booking.eventId, seatId: booking.seatId, title: booking.title}));
+  } catch {}
+}
+
+function restoreBooking() {
+  try {
+    const saved = JSON.parse(sessionStorage.getItem(BOOKING_SESSION_KEY));
+    if (!saved || !['id', 'reference', 'eventId', 'seatId'].every(key => validId(saved[key]))) return;
+    booking = {id: saved.id, reference: saved.reference, eventId: saved.eventId, seatId: saved.seatId, title: typeof saved.title === 'string' ? saved.title.slice(0, 500) : 'Your reservation', status: 'unknown', phase: 'checking'};
+    reservations.set(saved.eventId, new Set([saved.seatId]));
+    beginStatusCheck();
+  } catch {}
+}
+
+function renderCheckout() {
+  const section = $('#checkout-panel');
+  section.hidden = !capabilities.checkout || !booking;
+  if (section.hidden) return;
+  section.replaceChildren(element('p', 'YOUR BOOKING', 'eyebrow'), element('h2', booking.title));
+  section.append(element('p', `Seat ${booking.seatId} · Reference: ${booking.reference}`, 'booking-reference'));
+  const price = hasPrice(booking) ? new Intl.NumberFormat('en-IE', {style: 'currency', currency: booking.currency}).format(booking.amount / 100) : 'Total unavailable until the reservation is checked';
+  section.append(element('p', price, 'booking-total'));
+  const message = element('p', booking.message || 'Checking your reservation…', `message${booking.status === 'confirmed' ? ' success' : ''}`);
+  message.id = 'checkout-status'; message.setAttribute('role', 'status'); message.setAttribute('aria-live', 'polite');
+  section.append(message);
+  if (booking.status === 'held') {
+    const checkout = element('button', 'Pay and complete booking →', 'primary');
+    checkout.id = 'checkout'; checkout.type = 'button'; checkout.onclick = checkoutBooking;
+    section.append(checkout);
+  }
+  const check = element('button', 'Check booking status', 'text-button');
+  check.id = 'check-booking'; check.type = 'button'; check.onclick = () => beginStatusCheck();
+  section.append(check);
+  if (booking.status === 'confirmed') {
+    const ticket = element('button', 'Check ticket', 'text-button');
+    ticket.id = 'check-ticket'; ticket.type = 'button'; ticket.onclick = checkTicket;
+    section.append(ticket);
+  }
+  if (booking.ticketMessage) {
+    const ticketStatus = element('p', booking.ticketMessage, 'message');
+    ticketStatus.id = 'ticket-status'; ticketStatus.setAttribute('role', 'status');
+    section.append(ticketStatus);
+  }
+  updateControls();
+}
+
+function beginStatusCheck(message = 'Checking your reservation…') {
+  if (!booking || postingCheckout) return;
+  clearTimeout(pollTimer);
+  const token = ++pollGeneration;
+  booking.phase = 'checking'; booking.message = message;
+  readingStatus = true;
+  renderCheckout();
+  pollBooking(token, 0, 0);
+}
+
+function stopPolling(message) {
+  clearTimeout(pollTimer);
+  booking.phase = 'stopped'; booking.message = message;
+  readingStatus = false;
+  renderCheckout();
+}
+
+async function pollBooking(token, reads, errors) {
+  const id = booking.id;
+  let keepPolling = false;
+  let nextErrors = 0;
+  try {
+    const result = await api(bookingPath());
+    if (token !== pollGeneration || booking.id !== id) return;
+    if (result.booking_id !== id || result.event_id !== booking.eventId || result.seat_id !== booking.seatId || !BOOKING_STATUSES.has(result.booking_status)) {
+      stopPolling('The booking response could not be understood. Check booking status again before taking further action.');
+      return;
+    }
+    booking.status = result.booking_status;
+    if (booking.status !== 'confirmed') delete booking.ticketMessage;
+    booking.amount = result.price_minor; booking.currency = result.currency;
+    if (booking.status === 'payment_pending') {
+      booking.phase = 'waiting'; booking.message = 'Payment is processing. Please wait while we check your booking.';
+      keepPolling = true;
+    } else if (booking.status === 'held') {
+      booking.phase = 'ready'; booking.message = hasPrice(booking) ? 'Your seat is held. You can now complete your booking.' : 'Your seat is held, but its total could not be read. Check booking status before paying.';
+    } else if (booking.status === 'confirmed') {
+      booking.phase = 'complete'; booking.message = 'Booking confirmed. You can check below whether your ticket is ready.';
+    } else {
+      booking.phase = 'complete';
+      const messages = {
+        released: 'Your seat was released and this booking was not confirmed. If a late payment succeeds, it will be refunded. Check booking status for updates.',
+        refund_required: 'Your booking was not confirmed. A refund has been requested. You can check its progress here.',
+        refund_pending: 'Your refund has not completed yet. Please check again later.',
+        refunded: 'Your payment has been refunded.',
+      };
+      booking.message = messages[booking.status];
+      // A released booking can still receive a late charge and move to refund.
+      keepPolling = booking.status !== 'refunded';
+      reservations.get(booking.eventId)?.delete(booking.seatId);
+      if (current?.event_id === booking.eventId) renderDetail();
+    }
+  } catch (error) {
+    if (token !== pollGeneration || booking.id !== id) return;
+    nextErrors = errors + 1;
+    if (error.status === 404 || nextErrors >= 3) {
+      stopPolling(error.status === 404 ? 'Booking could not find this reservation. Check again before starting another checkout.' : 'Booking status is temporarily unavailable. The payment outcome may be unknown. Use Check booking status to continue.');
+      return;
+    }
+    booking.phase = 'checking'; booking.message = 'Booking status is temporarily unavailable. Checking again; no new payment request has been sent.';
+    keepPolling = true;
+  }
+  if (token !== pollGeneration) return;
+  readingStatus = false;
+  renderCheckout();
+  if (keepPolling) {
+    if (reads + 1 >= MAX_STATUS_READS) {
+      stopPolling('We are still waiting for a final booking result. Use Check booking status to continue. Stopping these checks does not cancel your payment.');
+    } else {
+      pollTimer = setTimeout(() => {
+        readingStatus = true;
+        updateControls();
+        pollBooking(token, reads + 1, nextErrors);
+      }, POLL_INTERVAL_MS);
+    }
+  }
+}
+
+function paymentUnavailable(error) {
+  const detail = error.data?.detail;
+  return error.status === 503 && [error.data?.error, error.data?.code, detail, detail?.error, detail?.code].includes('payment_service_unavailable');
+}
+
+async function checkoutBooking() {
+  if (!capabilities.checkout || !booking || busy || postingCheckout || readingStatus || booking.phase !== 'ready' || booking.status !== 'held' || !hasPrice(booking)) return;
+  clearTimeout(pollTimer);
+  ++pollGeneration;
+  postingCheckout = true;
+  booking.phase = 'submitting'; booking.message = 'Starting checkout…';
+  renderCheckout();
+  let statusMessage = 'Checkout accepted. Checking your booking…';
+  try {
+    // Booking owns the saved price and Payment call. Never charge from the browser.
+    await api(bookingPath('/checkout'), {method: 'POST', headers: {'Content-Type': 'application/json'}, body: JSON.stringify({customer_id: customerId})});
+  } catch (error) {
+    if (paymentUnavailable(error)) {
+      booking.phase = 'ready'; booking.message = 'Payments are unavailable, try again. Your seat is still held.';
+      postingCheckout = false;
+      renderCheckout();
+      return;
+    }
+    statusMessage = 'The checkout result was not received. Checking booking status before another payment attempt.';
+  }
+  postingCheckout = false;
+  // A 202, timeout or generic 503 is not proof of payment or a failed charge.
+  beginStatusCheck(statusMessage);
+}
+
+async function checkTicket() {
+  if (!booking || booking.status !== 'confirmed' || readingTicket) return;
+  const id = booking.id;
+  readingTicket = true;
+  updateControls();
+  try {
+    const ticket = await api(`/api/ticketing/tickets/${encodeURIComponent(id)}`);
+    if (booking.id !== id || booking.status !== 'confirmed') return;
+    if (ticket.booking_id !== id || ticket.valid !== true || ticket.status !== 'valid' || typeof ticket.ticket_code !== 'string' || !ticket.ticket_code.trim()) throw {status: 502};
+    booking.ticketMessage = `Your ticket code: ${ticket.ticket_code}`;
+  } catch (error) {
+    if (booking.id !== id || booking.status !== 'confirmed') return;
+    booking.ticketMessage = error.status === 404 ? 'Your ticket is not ready yet. Check again shortly.' : 'A valid ticket could not be confirmed. Check again shortly.';
+  } finally {
+    readingTicket = false;
+    renderCheckout();
+  }
+}
+
+window.addEventListener('pagehide', () => { clearTimeout(pollTimer); ++pollGeneration; });
 
 $('#refresh').onclick = () => loadEvents(activeQuery);
 $('#search-form').onsubmit = (event) => {
@@ -236,5 +457,6 @@ $('#browse-all').onclick = () => {
 (async () => {
   try { capabilities = await api('/api/capabilities'); } catch {}
   $('#search-form').hidden = !capabilities.search;
+  if (capabilities.checkout) restoreBooking();
   await loadEvents();
 })();

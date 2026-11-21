@@ -1,12 +1,14 @@
 # Catalogue development runbook
 
-This branch implements the candidate Catalogue API, transactional outbox,
-availability projection, cache, metrics and synthetic seeds. The proposed
-[contracts](contracts/catalogue.md) still need Booking/Discovery agreement.
-Messaging is disabled by default; HTTP writes still save durable outbox rows.
-The development overlay now runs the real Booking hold API; Payment is integrated
-in the base stack. Discovery remains a health-only shell. Booking does not yet
-publish availability or consume event metadata.
+Catalogue implements versioned event APIs, the transactional outbox, availability
+projection, cache, metrics and repeatable seeds. Booking accepts the event and
+availability contracts and now consumes metadata and publishes full snapshots.
+Discovery is a real pgvector-backed service with a simulated embedding endpoint
+by default. All five services run from the main Compose file.
+
+`CATALOGUE_MESSAGING_ENABLED` defaults to true. Disabling it still saves outbox
+rows but prevents new events reaching Booking/Discovery and stops availability
+updates reaching Catalogue. Keep `BOOKING_DEMO_SEED=false` with the consumer.
 
 ## Startup and synthetic data
 
@@ -58,7 +60,7 @@ Errors use FastAPI's `detail`: missing records 404, conflicts 409, invalid reque
 These local development APIs have no authentication; access control belongs to
 the deployment/gateway design.
 
-## Candidate messaging adapter
+## Messaging adapter
 
 Only enable the candidate adapter against an isolated broker or after contracts
 are accepted. Starting with the flag enabled can publish all accumulated rows.
@@ -76,7 +78,7 @@ ID, so downstream consumers must be idempotent. Reconnect attempts use backoff.
 Concurrent dispatchers can publish different rows out of order; consumers must
 apply increasing event versions. This provides at-least-once delivery.
 
-The availability handler accepts the proposed full free-seat snapshot from
+The availability handler accepts the agreed full free-seat snapshot from
 Booking. It validates the envelope, count, unique IDs and known seat-map subset.
 The processed message ID and newer projection are committed together under an
 event lock. Duplicate IDs and older/equal sequences cannot replace newer state;

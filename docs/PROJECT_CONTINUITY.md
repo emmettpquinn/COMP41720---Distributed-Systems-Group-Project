@@ -1,6 +1,6 @@
 # Project continuity
 
-Last reviewed: 2026-11-17. Implementation/test evidence below is from 2026-11-14. Working branch: `feature/catalogue-integration`.
+Last reviewed: 2026-11-19. Evidence dates are stated by batch below. Working branch: `feature/catalogue-integration`.
 
 ## Objective and source of truth
 
@@ -27,14 +27,14 @@ critical evaluation; this document records implementation evidence, not ADR argu
 - Discovery owns its versioned search index in PostgreSQL/pgvector and calls Ollama.
   Payment owns its ledger, refunds, idempotency and outbox. Ticketing owns tickets,
   processed-message records and email delivery state. Each service owns its database.
-- Browser traffic goes through a planned gateway to Catalogue, Discovery and
+- Browser traffic goes through the gateway to Catalogue, Discovery and
   Booking. Booking calls Payment. Catalogue does not synchronously call Booking.
 - The team plan uses asynchronous availability to avoid coupling busy browse pages
   to Booking. Target event-to-projection lag is at most 2 seconds at p95, warning
   above 10 seconds. Booking still rejects unavailable seats. Discovery may lag 30 seconds.
-- The planned saga has 10-minute holds, a 5-second expiry sweeper and handling of
-  late payment success through re-hold or refund. These are planned behaviours,
-  not claims that the current Booking skeleton implements them.
+- Booking implements 10-minute holds and a 5-second expiry sweeper. Holds do not
+  expire during payment. A configurable safety net reconciles/releases uncertain
+  payments; late success is refunded without re-holding the seat.
 - RabbitMQ delivery is at least once. Producers that save state then publish need
   transactional outboxes; consumers record message IDs atomically and ignore stale
   aggregate versions/sequences. Retry/DLQ handling is shared.
@@ -56,84 +56,61 @@ status neutrally. Keep transcripts, temporary logs, secrets and generated eviden
 out of commits. Commit only reviewed checkpoint files with explicit authorization;
 never push automatically or rewrite shared history.
 
-## Branch review and integration state
+## Branch review and integration state (2026-11-19)
 
-| Branch/ref | Evidence at last fetch | Result and integration action |
-|---|---|---|
-| `origin/master` | `be6954d` merges Ticketing; tree equals `bb17236` | Safely merged into this branch as `352e117`; no source changes from that merge. Local `master` was not switched or updated. |
-| `origin/feature/ticketing-notification` | `bb17236` | Already inherited. Ticket API, SQLAlchemy/PostgreSQL state, shared topology/consumer/replay, Docker and runbook. Fourteen SQLite/fake-mail tests passed again. |
-| `origin/booking/skeleton` | `7996674` | Hold source imported into this branch with Docker, bounded DB requests/readiness and explicit non-resetting demo seed. Six added isolated-schema tests pass. No expiry/saga/outbox/consumer or checkout/status API. |
-| `origin/feature/payment-service` | `63b8b0e` | Payment source/Docker/tests/dashboard imported with reconciled root Compose. All 25 tests pass including real-broker refunds. No Git merge or upstream branch modification. Booking acceptance remains pending. |
-| `origin/feature/catalogue-integration` | `7b9524c` | Local/remote matched at batch start. The second batch is included in the newly authorized local commit; no push is authorized. |
+The working branch was fast-forwarded from `7fc6f67` to `origin/master` `cb90d30`,
+preserving all original Booking commits and existing local changes. No new commit
+was created, and no remote PR was merged by this integration work. Local edits
+remain unstaged. PR #8 (checkout) and PR #9 (expiry) are already merged upstream.
+The only open PR at review was #10, `booking/evidence`, with last-seat evidence,
+a load harness and expanded Booking dashboard panels; it is not imported here.
 
-Payment exposes `POST /payments`, `GET /payments/{payment_id}` and
-`POST /payments/{payment_id}/refunds`, plus health/readiness/metrics. HTTP amounts
-are integer minor units; event amounts are decimal strings. HTTP states are
-`paid`, `failed`, `refunded`; duplicate booking IDs reuse the stored result and
-changed amount/currency returns 409. Tables: `payments`, `processed_messages`,
-`outbox`; startup also migrates the prior five-table layout.
+The base stack now starts all five services, each with its own database. Booking
+consumes Catalogue metadata and Payment/refund messages and publishes availability.
+Catalogue messaging defaults on and Booking's legacy demo seed defaults off.
+The gateway enables holds and checkout in Compose; standalone Python configuration
+remains opt-in. Seven scrape targets and four service dashboards are provisioned.
+Discovery's default HTTP embedding endpoint is explicitly simulated.
 
-Payment consumes `refund.requested`; publishes `payment.result`, `refund.completed`
-and `refund.failed` through its outbox, using the existing shared topology.
-Its README labels payloads proposed. The current HTTP call returns the completed
-simulated result rather than the team's planned immediate accepted response;
-the simulator is in-process, and planned unknown-outcome reconciliation, separate
-provider container and late-success timing remain integration/requirements work.
-Do not interpret passing local tests as a complete Booking saga demonstration.
-
-The latest fetch found no new teammate commits. The current batch imports the
-smallest useful Payment service/dashboard paths and Booking hold source into this
-branch, preserving Catalogue/Ticketing definitions and shared messaging. Root
-Compose and dashboard scan paths are reconciled explicitly. Upstream broker-volume
-changes are deferred. There is no pending merge or history rewrite.
-See [Payment review](contracts/payment-integration.md) and the
-[development runbook](integration-development.md) for exact source/edit boundaries.
-
-The base now runs Catalogue, Payment and Ticketing plus gateway/UI. Development
-adds the real Booking hold API/private DB and retains only Discovery as a shell.
-Booking's explicit demo seed uses the same synthetic fixture file through its own
-DB code; no cross-service DB writes occur. It does not replace message ingestion.
-Five exporters and separate Catalogue/Payment dashboards are live; Booking/AI
-metrics and full-system monitoring remain open.
+Booking checkout returns 202 and calls Payment in the background. Status reads
+require the same customer ID and return `booking_status`. The UI reads price and
+currency from the saved booking; these are additive fields on the status reply.
+Payment HTTP amounts are integer minor units and event amounts are decimal
+strings. A declined payment can return HTTP 200 with status `failed`; Booking
+checks that status. Browser timeouts are unknown outcomes and never trigger an
+automatic payment POST retry.
 
 ## Important contracts and unresolved questions
 
-Shared exchange `events` is durable/topic; routing key equals message type. `dlx`
-is durable/direct. Each consumer queue has three retry queues (1/2/4-second TTLs)
-and a DLQ. Envelope: `message_id`, `type`, `occurred_at`, `version`, `producer`,
-`payload`. See [messaging](messaging.md) and `shared/messaging/` for current code.
+Catalogue's event and full availability contracts are now agreed with Booking.
+Event versions and per-event availability sequences are separate from envelope
+schema version. Booking keeps its sequence durable and never resets it against
+retained Catalogue state. A full synthetic reset uses the whole isolated project;
+partial reset/epoch recovery is outside the current agreement.
 
-- Catalogue publishes `event.changed` to Booking/Discovery; consumes
-  `seat.availability-changed` on `catalogue.seat-availability`.
-- Catalogue event payloads, availability payloads, bootstrap/replay rules, unknown
-  events, cancellation and seat-map mutation rules remain unagreed in fetched code.
-  A draft is now prepared in [Catalogue contracts](contracts/catalogue.md), with
-  synthetic JSON examples under `catalogue/examples/contracts/`; it is not accepted
-  and still requires consumer agreement.
-- Agree snapshot versus delta and sequence reset/scope before shared integration.
-  The local candidate implements full snapshots and monotonic per-event sequences. Skipping old deltas can lose changes; full snapshots
-  have different semantics. A snapshot design remains a proposal, not a recovered agreement.
-- Distinguish envelope/schema version, Catalogue event version and Booking's
-  per-event availability sequence. The shared envelope alone does not define these.
-- Booking's response uses `booking_ref`; downstream messages expect `booking_id`.
-  Agree mapping and customer/event metadata flow. Current hold refusal lacks the
-  free-seat list expected by the planned UI.
-- Shared consumer code makes one attempt plus three retries; the team plan's
-  wording about three failures needs reconciliation.
-- Full-group architecture still needs zero-cost AI/index versioning/fallback,
-  outbox crash proofs, 500-buyer tests, failure evidence and the final dashboard.
+Booking keeps `booking_ref` equal to `booking_id`. It stores the flat price and
+customer details at hold time, with synthetic recipient defaults. Confirmed
+bookings on subsequently cancelled events retain valid tickets. Late charges on
+released bookings are refunded and never re-hold the seat. Refund rejection can
+require manual recovery. Published Booking outbox rows are retained; recovery of
+set-aside rows remains open. RabbitMQ container-recreation persistence remains
+unproven because there is no broker data volume.
+
+The shared consumer uses one initial attempt plus three retries at 1/2/4 seconds.
+The full purchase/last-seat workload through the three-second gateway, learned
+model relevance, visual browser QA and final report/ADR/signature work retain
+their own acceptance requirements. Do not extrapolate unit tests or a direct
+Booking load test to full-system performance.
 
 ## Checkpoint tracker
 
 Statuses apply to this branch unless otherwise stated. Estimates are implementation
 sessions, usually 30-90 minutes; split a task further if it grows beyond one session.
 
-Progress: all 32 original checkpoints are retained. 25 have delivered local
-code, reviews or evidence (including eight delivered scopes in the current
-batch); C01 awaits contract acceptance, and six remain open: I06, I07, V03, V04,
-D02 and D03. Several delivered local scopes still need peer acceptance, as shown
-below. This is not a group completion percentage. The current batch is included
-in the newly authorized local commit. I07 and D02 remain partial/draft.
+All 32 original checkpoints are retained. Earlier batches delivered 25 local
+scopes; contract acceptance and checkout have since advanced as recorded below.
+Implementation, working-tree verification and final group acceptance are distinct.
+No new integration commit or percentage claim follows from the updated table.
 
 | Checkpoint | Original objective | Current status | Evidence | Next action |
 |---|---|---|---|---|
@@ -142,7 +119,7 @@ in the newly authorized local commit. I07 and D02 remain partial/draft.
 | INF03 | Five-container development startup | Complete, development scope only | `ed6b9f9`; labelled shells under `infra/bootstrap/` | Replace shells with reviewed owner implementations. |
 | INF04 | Wire monitoring containers/datasource | Complete, wiring scope only | `852ce2d`; Catalogue target/panels added in current batch | Full group monitoring remains I07. |
 | INF05 | Verify/document development baseline | Complete, development scope only | `852ce2d` source archive starts successfully; initially empty isolated volumes and later container recreation checked | Full business startup remains V04. |
-| C01 | Propose Catalogue API/event contracts | Draft complete; consumer agreement pending | Candidate contracts, examples and gated implementation | Obtain consumer acceptance before enabling on shared broker. |
+| C01 | Catalogue API/event contracts | Event/availability agreement recorded | Booking accepts sections 7/11; actual consumers and matching fixtures | Preserve agreed payloads and coordinate additive changes. |
 | C03 | Persist venues/events/seat maps | Complete | `1c109a1`; immutable migration 001; live persistence/repeat checks | Preserve migration history. |
 | C04 | Event list/detail APIs | Implemented | PostgreSQL reads, consistent detail snapshot, 404 and unknown-availability checks | Review candidate response shapes. |
 | C05 | Event creation plus atomic outbox | Implemented | Venue/event APIs, seat map and immutable message in one transaction; rollback tests | Review candidate create fields. |
@@ -150,22 +127,22 @@ in the newly authorized local commit. I07 and D02 remain partial/draft.
 | C07 | Event cancellation intent | Implemented | Cancelled snapshot, no reactivation, repeat/no-op tests | Booking lifecycle propagation awaits integration. |
 | C08 | Reliable Catalogue outbox dispatcher | Implemented; gated | Confirmed mandatory publishing, SKIP LOCKED, stable-ID retries, live marker-failure/outage probes | Accept contract; process-kill crash proof remains V01. |
 | C09 | Ordered/idempotent availability projection | Implemented; candidate | Atomic inbox/projection, full snapshots, duplicate/reordering/concurrency tests | Agree durable sequence/reset and backfill rules. |
-| C10 | Availability consumer wiring | Implemented; disabled by default | Shared retries/DLQ, isolated broker duplicate/invalid-message checks | Test actual Booking producer after agreement. |
+| C10 | Availability consumer wiring | Implemented; enabled by default in Compose | Real Booking producer and Catalogue projection are wired | Retain duplicate/ordering and reset safety checks. |
 | C11 | Busy-page cache and freshness | Implemented | Bounded TTL/deep-copy cache, commit invalidation and in-flight generation guard | Evaluate measured lag with real workload. |
-| C12 | Catalogue metrics and panel | Implemented | HTTP/lag/outbox/cache/health metrics, four UP scrape targets, eight-panel dashboard | Alert notifications and group/AI panels remain open. |
-| I02 | Repeatable synthetic seeds | Implemented; peer bootstrap pending | One venue/two events/four seats, own write/outbox path, atomic repeat-safe seed job | Verify real Booking/Discovery consume seeds. |
+| C12 | Catalogue metrics and panel | Implemented | Seven scrape targets and four service dashboards | Final group monitoring and alert review. |
+| I02 | Repeatable synthetic seeds | Implemented; message-driven Booking inventory | Catalogue-owned seeds/outbox; Booking demo seed off | Preserve edits and published history on reruns. |
 | I03 | Gateway routes and timeouts | Implemented | Fixed same-origin proxy, bounded calls/body, no hold auto-retry; seven tests | Extend only when agreed APIs exist. |
-| I04 | Browsing UI and freshness labels | Implemented | Event/detail/seat map, explicit unknown projection, venue-local dates; Safari smoke check | Connect accepted live availability and Discovery later. |
+| I04 | Browsing UI and freshness labels | Implemented with search and live availability | Discovery ranking/current Catalogue metadata and Booking snapshots | Visual browser/device verification remains separate. |
 | I05 | Refused-hold refresh UI | Local flow implemented | Real competing-buyer 409 refetches projection and marks refused choice; safe retry reference | Authoritative refreshed free-seat payload still needs Booking agreement. |
-| I06 | Checkout/status UI | Pending; unavailable in UI | Current Booking source has no checkout/status API or saga | Agree API, pricing ownership and ID mapping before implementation. |
-| I07 | Complete real-service startup | Partial | Four real business implementations/private DBs plus Discovery shell; demo holds work | Integrate Discovery, Booking saga/consumers/provider; replace fixture bootstrap. |
+| I06 | Checkout/status UI | Implemented and verified with real peer APIs | Owner-aware routes, 202 polling, 20 DOM checks, real checkout/ticket/email and late refund | Visual browser/device QA remains separate. |
+| I07 | Complete real-service startup | Five-service base startup and purchase implemented | Private DBs, seven monitoring targets, HTTP embedding simulator | Retain learned-model and full-workload acceptance work. |
 | V01 | Prove event-outbox crash recovery | Verified Catalogue scope (harness included) | Real SIGKILL before publish and after confirmation; stable-ID recovery to both queues | Real downstream idempotency acceptance remains open. |
 | V02 | Prove 60-second outage/reordering recovery | Verified Catalogue scope (harness included) | 60.001 s outage, 29 successful browse probes; DB restart and sequence 101 recovery | Repeat with actual Booking producer and end-to-end workload. |
-| V03 | Measure lag under 500 buyers | Pending, 60-90 min | No complete inventory/projection workload | Measure <=2 s p95; capture workload/hardware. |
-| V04 | Verify full-system clean startup/runbook | Pending, 60-90 min | Development startup is not full booking flow | Clean clone, real seeds and end-to-end purchase/failure demo. |
+| V03 | Measure lag under 500 buyers | Partial; standalone Catalogue benchmark passed | 500 browse clients, 29,598 HTTP 200s, 300/300 synthetic updates, 22.455 ms p95 write lag | Repeat accepted workload with real Booking producer, gateway and full purchase flow. |
+| V04 | Verify full-system clean startup/runbook | Working-tree five-service purchase/persistence/failure run passed | Fresh volumes, seven targets, ticket/email, DB restarts and late refund | Verify clean committed archive after approved commit. |
 | D01 | ADR-002 evidence | Evidence prepared | Reproducible fault harness, measured observations and limits in docs/evidence/ | Students write/defend final ADR and complete load evidence. |
-| D02 | Requirements/contribution/AI disclosure | Draft preparation, open | Name-free submission checklist and factual assistance/source-credit record | Students verify contributions, finalize disclosure and sign outside repository. |
-| D03 | Final report consistency and viva rehearsal | Pending, 90-120 min split | Group sections/evidence still needed | Check page limit, code/diagram alignment and demo timing. |
+| D02 | Requirements/contribution/AI disclosure | Drafts prepared; student/group completion pending | Role-based contribution draft and significant AI assist/prompt/adoption records | Complete exact module citations, personal evaluation, verified ownership and signatures. |
+| D03 | Final report consistency and viva rehearsal | Preparation implemented; final review pending | Demo/code-location/question checklist, accurate read/hold diagram and evidence limitations | Check actual group report/ADR files, page limits, final diagrams and rehearse individual answers. |
 | INT01 | Align with accepted master history | Complete | `352e117` merges `be6954d`; no source changes | Retain normal merge ancestry; do not rebase published work. |
 | INT02 | Review Payment contract fit | Review documented; acceptance pending | Proposed fields/units/final-result timing and missing Booking saga recorded | Obtain Booking agreement before checkout. |
 | INT03 | Integrate real Payment and its dashboard | Implemented | Source 63b8b0e, private DB, dashboard/scoping, five UP targets; 25 tests including broker | Future upstream merge must reconcile imported paths. |
@@ -283,25 +260,110 @@ is authorized. Its parent is `7b9524c`; source imports add no Git merge ancestry
 - Five Prometheus targets are UP. Both service dashboards load from separate
   directories, avoiding duplicate provider scans.
 
-Current preview project: `catalogue-next-check`. UI 38080; APIs 38201-38205;
+Historical preview project from 2026-11-14: `catalogue-next-check`. UI 38080; APIs 38201-38205;
 Prometheus 39090; Grafana 33000; broker 45672/45673/45692; MailHog 38025. It owns
 fresh databases/volumes and synthetic fixtures. Catalogue messaging is enabled
 only in this isolated test stack; the default remains OFF. Older verification
 stacks/unrelated containers were not stopped. First-event seats are held by the
 browser probes; the second event remains available for a fresh hold demo.
 
+## Independent verification and documentation (2026-11-17, uncommitted)
+
+No production service source or runtime Compose configuration changed. Docker
+Desktop was started for the checks; all newly generated test projects/volumes
+were removed afterwards. Older preview port notes are historical, not a claim of
+a currently running deployment. No teammate branch or database was modified.
+
+- Added a reusable private-project helper, separate load image/runner and host
+  wrapper. Defaults: 500 client tasks, 30 seconds, 20 events/100 seats each, 0.2 s
+  think time, 10 synthetic full snapshots/second. Lag uses a test-only audit
+  trigger and the shared test-DB clock; it excludes real Booking source work,
+  gateway/UI, distributed clocks and cache-visible freshness.
+- Passing standalone result: 29,598 HTTP 200s, no errors, 972.9 requests/s;
+  HTTP p95 889.8 ms. All 300 updates observed; projection-write lag p95 22.455 ms.
+  Docker Desktop reported 10 vCPUs/7.75 GiB/aarch64. See the evidence note for exact
+  dependency versions, raw-data scope, closed-loop limitations and timing basis.
+- Clean archive of committed `970258f` passed startup on fresh owned volumes:
+  four real services plus explicit Discovery shell, jobs, five scrape targets and
+  two dashboards. Gateway browse/hold/refusal, seed preservation, app recreation,
+  Payment idempotency and all four DB liveness/readiness/recovery checks passed.
+- Three new measurement/output-boundary unit checks passed. Existing runtime code
+  was unchanged; the previously passing service suites were not rerun without a
+  new runtime-code concern.
+- Added name-free AI-disclosure and contribution drafts plus a demo/viva checklist.
+  Checked the brief's exact required disclosure fields and nondelegable student
+  judgment boundaries. Module citation format/model metadata, student evaluation,
+  verified final ownership, final report/ADRs and signatures remain outstanding.
+
+Evidence: [standalone load and startup](evidence/catalogue-load-startup.md).
+Commands: root README. Raw JSON/logs are outside Git; test stacks were cleaned up.
+No commits or pushes are authorized for this independent batch. HEAD is `970258f`.
+
 ## Exact next step and remaining effort
 
-Review this batch and discuss imported service edits with their owners. Get
-Booking/Discovery acceptance for metadata, full availability snapshots, durable
-sequence/reset/backfill, cancellation and Payment timing/amounts. Integrate their
-next real implementations, then implement I06 checkout/status using accepted
-Booking APIs. Complete I07, V03/V04 and D02/D03 with actual end-to-end/AI evidence.
-Never replace missing owner functionality with a misleading success path.
+Review the new evidence/drafts, then obtain accepted Booking/Discovery contracts
+and real implementations. Complete I06 checkout/status against agreed APIs and
+finish I07/V03/V04 with the real saga, producer, gateway and AI path. Students
+complete module-format disclosure citations, personal architectural reasoning,
+contribution verification/signatures and the actual group report review in D02/D03.
+No missing service is replaced with a misleading success path.
 
 Estimated remaining personal effort: contract hardening 1-3 focused hours;
-real-service integration 3-5; checkout/status UI 2-3; load/end-to-end verification
-3-6; submission/ADR/report work 3-5. Total 12-22 hours, excluding teammate response
-and implementation time. No actual focused hours were supplied. Re-estimate when
-Booking's saga and Discovery's implementation are available. Commit only after
-explicit instruction; never push automatically or put personal names in files.
+real-service integration 3-5; checkout/status UI 2-3; full workload/end-to-end
+verification 2-4; submission/ADR/report work 2-4. Total 10-19 hours, excluding
+teammate response and implementation time. No actual focused hours were supplied.
+Commit only after explicit instruction; never push automatically or put personal
+names in authored repository files.
+
+## Approved Discovery integration (2026-11-17, uncommitted)
+
+The latest fetch found a new `feature/discovery-date-filter` branch (`eccabe5`);
+Booking, Payment, Ticketing and master were unchanged. The user authorized this
+integration after review. No source branch, master, index or commit history was
+modified. The original local uncommitted/untracked preparation files were
+snapshotted outside Git before work and remain local; no files were staged.
+
+- Discovery code/tests/standalone assets imported from `eccabe5`, with name-free
+  wording, process liveness and bounded DB/broker readiness integration edits.
+- Base Compose adds actual Discovery, its own pgvector database and a private HTTP
+  embedding simulator; development removes the obsolete shell and retains Booking
+  holds. Real Ollama is an optional configuration-validated overlay, not executed.
+- Gateway read routes and UI search display the effective date window, keyword/
+  semantic label and explicit simulated-provider label. Current Catalogue metadata
+  supplies cards; Discovery supplies ranking. Checkout remains unavailable.
+- Catalogue limits align with Discovery (500 title, 8000 description, 50 tags,
+  200 per tag), including rollback of partial patches that leave legacy text
+  oversized. Existing data and historical outbox envelopes are not rewritten.
+- All 49 Discovery tests pass against a separate disposable pgvector test DB,
+  with no skips. Catalogue 60, gateway 10, six DOM tests and three measurement
+  helper tests pass. Node/jsdom is development-only and excluded from Docker/Git.
+- The isolated live harness passed separate database ownership, seed indexing,
+  create/update/cancel, duplicate/stale replay after cancellation, similar-route
+  self exclusion, model fallback/recovery, Discovery restart persistence and
+  shared monitoring. Six targets are UP; the Discovery dashboard uses the existing
+  datasource. Generated harness resources were removed; raw results stay outside Git.
+- Visual QA was blocked by Safari's locked private window and refusal to interact
+  with its authentication screen. Automated DOM tests cover behaviour but do not
+  establish visual/mobile rendering.
+
+The dedicated local preview `discovery-integration-check` uses UI 48080, APIs
+48201-48205, Prometheus 49090, Grafana 43000 and MailHog 48025. Its databases and
+fixtures are synthetic. Catalogue publication is explicitly enabled only for
+these integration checks. No final full-purchase or learned-model/500-buyer
+performance claim is made. See [integration review](contracts/discovery-integration.md).
+
+Current HEAD remains `da0cc24`; this batch is uncommitted and unpushed. All 32
+original checkpoint IDs remain. The seven open scopes still require remaining
+Booking contracts/checkout/saga, real workload/end-to-end verification and final
+student/group submission review. Discovery is no longer an absent implementation.
+Next: review this integration, coordinate remaining Booking contracts, then I06.
+
+## Current Booking handoff results (2026-11-19)
+
+The real-service working-tree checks passed purchase/ticket/email, live
+availability, owner checks, application/database restarts, payment decline,
+event cancellation and late-success refund while preserving a replacement hold.
+Booking 143, gateway 15, DOM 20 and helper 6 tests passed. Details and limitations
+are in [the integration runbook](integration-development.md#booking-integration-verification-2026-11-19).
+No new commit, staging, push or PR merge was performed. All generated test
+projects were removed; earlier dated sections retain historical scope.

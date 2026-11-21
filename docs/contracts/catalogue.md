@@ -1,12 +1,12 @@
-# Catalogue contracts - proposal
+# Catalogue contracts
 
-Status: proposed for Booking and Discovery review; not an agreed shared contract.
-Checkpoint: C01. Last updated: 2026-11-14.
+Status: event.changed and full availability snapshots agreed with Booking;
+Discovery compatibility verified. Checkpoint: C01. Updated: 2026-11-19.
 
-Catalogue now implements the candidate HTTP surface and an opt-in RabbitMQ
-adapter described below. Messaging is disabled by default while consumer
-agreement is pending. The shared envelope, routing keys and peer service code
-are unchanged. See the [runbook](../catalogue-operations.md) for operational limits.
+Catalogue implements the HTTP surface and RabbitMQ adapter below. Compose enables
+messaging by default. Booking acceptance is recorded in its contract sections 7
+and 11. HTTP details remain Catalogue-owned; the shared envelope and routing keys
+are unchanged. See the [runbook](../catalogue-operations.md).
 
 ## Confirmed integration boundaries
 
@@ -25,11 +25,11 @@ Evidence: `shared/messaging/{envelope,topology}.py`, [messaging notes](../messag
 Booking commit `7996674` and Ticketing commit `bb17236`. Payment commit `63b8b0e`
 adds proposed payment/refund contracts; this draft does not redefine them.
 
-## Proposed HTTP surface
+## Implemented HTTP surface
 
 Paths are relative to Catalogue; gateway prefixes are a separate integration choice.
 
-| Method and path | Proposed behaviour | Success |
+| Method and path | Behaviour | Success |
 |---|---|---|
 | `POST /venues` | Create synthetic/demo venue metadata with a stable ID | 201 and saved venue |
 | `GET /venues/{venue_id}` | Read venue metadata | 200 and saved venue |
@@ -44,7 +44,7 @@ identifies a seat, matching Booking's composite key. IDs are immutable and are n
 reused for a different event. Creation with an existing ID returns 409; seeds must
 skip existing IDs and preserve edits rather than reset records or live inventory.
 
-Proposed venue creation body:
+Venue creation body:
 
 ```json
 {"venue_id":"venue-demo-001","name":"Demo Venue","city":"Dublin"}
@@ -66,13 +66,13 @@ array of summaries with `event_id`, `event_version`, `title`, `starts_at`, `time
 `status` and `venue`. Full descriptions, tags, seat maps and projected availability
 are read through detail. Both scheduled and cancelled events remain listable.
 
-Proposed metadata update: `{"expected_version":1,"title":"Evening Performance - revised"}`.
+Metadata update: `{"expected_version":1,"title":"Evening Performance - revised"}`.
 The version check, metadata change and outbox insert share one transaction.
 A stale expected version returns 409. A successful change increments the event
 version once. The first patch supports descriptive metadata; IDs, venue and
 seat-map changes after publication are excluded until Booking's rules are agreed.
 
-Proposed cancellation: `{"expected_version":2,"status":"cancelled"}`.
+Cancellation: `{"expected_version":2,"status":"cancelled"}`.
 It emits a cancelled event snapshot and keeps the event readable with that status.
 Booking owns stopping holds, cancelling bookings and any refund decisions.
 Reactivation is outside this initial draft. Repeating cancellation with the current
@@ -84,10 +84,10 @@ disallowed lifecycle changes return 409; invalid fields return 422; unavailable
 database access returns 503. Follow the existing FastAPI `detail` error convention.
 Validation is implemented locally; shared limits and error semantics still need agreement.
 
-## Proposed event.changed payload
+## Agreed event.changed payload
 
 Use the unchanged envelope with `type: event.changed`, `producer: catalogue` and
-`version: 1` as the proposed message-schema version. Its payload is a full event
+`version: 1` as the agreed message-schema version. Its payload is a full event
 metadata snapshot with:
 
 - `change`: `created`, `updated` or `cancelled`;
@@ -104,16 +104,16 @@ with the event write. Retries reuse that immutable body and ID; dispatch must no
 rebuild an old message from the latest mutable event row. Volatile availability
 is not included in `event.changed`, so seat holds do not trigger metadata re-indexing.
 
-Proposed consumer rules for review: apply only a newer `event_version`. Booking
+Agreed consumer rules: apply only a newer `event_version`. Booking
 initializes missing inventory from a scheduled snapshot, but metadata updates must
 not reset held/booked seats. A cancellation received first must be remembered so an
 older creation cannot reopen inventory. Discovery indexes newer scheduled events
-and removes cancelled ones. These are requirements on the proposed interaction,
-not claims that the current consumers implement it.
+and removes cancelled ones. Booking and Discovery now implement these rules; integration checks exercise
+actual create/update/cancel delivery.
 
-## Proposed availability snapshots
+## Agreed availability snapshots
 
-Candidate shape: a full set of free seat IDs, not a count delta. Envelope:
+Agreed shape: a full set of free seat IDs, not a count delta. Envelope:
 `type: seat.availability-changed`, `producer: booking`, `version: 1`.
 Payload: `event_id`, positive integer `sequence`, `seats_remaining` and the complete
 `available_seat_ids` list. The count equals the number of unique IDs, and all IDs
@@ -124,9 +124,10 @@ and [later release](../../catalogue/examples/contracts/availability-after-releas
 The second increases the free count from one to two. Sequence order is monotonic;
 the free-seat count is allowed to rise or fall.
 
-Proposed sequence rule: Booking stores a durable per-event counter and never resets
-it for the same event ID. If inventory resets must be supported, agree an epoch or
-rebuild protocol before implementation; a local counter reset is unsafe.
+Agreed sequence rule: Booking stores a durable per-event counter and never resets
+it for the same event ID. A full synthetic reset must reset the entire Compose project, including
+Catalogue projections and broker state. Never reset Booking alone against retained
+consumer state. An epoch-based partial rebuild remains outside this agreement.
 
 Catalogue records message IDs and applies only a newer sequence in one database
 transaction, using a condition safe under concurrent deliveries. Duplicate message
@@ -134,8 +135,8 @@ IDs and equal/older sequences cannot replace newer state. This skipping rule rel
 on full snapshots; it must be redesigned if Booking publishes deltas instead.
 
 For an unknown event, fail the handler and follow the shared retry/DLQ path rather
-than inventing metadata or silently acknowledging the update. Agree recovery and
-backfill for database resets with Booking before treating this as final policy.
+than inventing metadata or silently acknowledging the update. Booking backfills events that have never had an availability snapshot; recovery
+after a partial database reset remains outside the supported reset procedure.
 Cancelled event metadata remains cancelled even if an availability message arrives.
 
 `occurred_at` is the source inventory-change time, not a retry/publish time.
@@ -144,26 +145,38 @@ timestamps with comparable clocks. A long time since the last inventory change
 alone does not prove stale data; use consumer/backlog health alongside timestamps.
 Browsing freshness does not guarantee that a subsequent hold will succeed.
 
-## Decisions required before shared integration
+## Accepted boundaries and remaining decisions
 
-1. Booking/Discovery: approve HTTP paths, IDs, event fields, summaries and snapshots.
-2. Booking: approve full availability snapshots versus deltas, durable sequence/reset
-   semantics, initial inventory publication and unknown-event recovery.
-3. Contract maintainer: distinguish schema `version`, `event_version` and `sequence`;
-   centralize accepted field definitions without silently changing the shared envelope.
-4. Catalogue/Booking: agree cancellation timing and venue/seat-map mutation rules.
-5. Booking/Payment/Ticketing: agree pricing/amount ownership, `booking_ref` versus
-   `booking_id`, and how event/customer metadata reaches confirmations. No price
-   field or amount authority is invented in this draft.
-6. Topology/consumer owners: reconcile the plan's retry wording with current code
-   (one attempt plus three retries at 1/2/4 seconds).
+Booking uses the same UUID for `booking_id` and compatibility `booking_ref`.
+It stores optional customer details (with synthetic defaults) and the price at
+hold time; pricing is flat EUR 45.00 by default and is not owned by Catalogue.
+A hold does not expire while payment is pending. Late success after release is
+refunded, never re-held. Confirmed bookings on subsequently cancelled events
+keep their valid tickets under the current team decision.
+
+Venue/seat-map mutation after publication and reactivation remain excluded.
+Partial database-reset recovery, recovery of set-aside Booking outbox rows and
+outbox retention/cleanup remain operational decisions. The shared retry ladder
+remains one initial attempt plus three retries at 1/2/4 seconds.
 
 ## Validation scope
 
-Examples are hand-authored synthetic fixtures for review, not seeds or published
-messages. Validate JSON, IDs/timestamps, envelope round-tripping, event versions,
-seat-map consistency and snapshot counts/sequences. Such checks do not establish
-consumer compatibility: the Catalogue-specific payload consumers are not yet
-implemented in fetched code. Local endpoint and isolated real-broker probes now
-exercise these candidate shapes; accepted cross-service contract tests remain
-pending. Synthetic seed records are maintained separately in `catalogue/seed-data.json`.
+Examples are synthetic contract fixtures, separate from the repeatable seeds in
+`catalogue/seed-data.json`. Booking tests consume the real example envelopes.
+Catalogue validates fields/counts/sequences and applies inbox/projection changes
+atomically. Live integration checks exercise Catalogue-to-Booking/Discovery event
+propagation and Booking-to-Catalogue availability. Dated evidence must distinguish
+working-tree verification from a clean committed archive and retain each test's
+workload/model limitations.
+
+## Discovery compatibility update (2026-11-17)
+
+Discovery source `eccabe5` accepts these create/update/cancel snapshots, and its
+fixtures match all three examples exactly. Local Catalogue validation now limits
+titles to 500 characters, descriptions to 8000, tags to 50 and each tag to 200.
+Create/patch reject oversized input before writes; outgoing snapshot validation
+also rolls back partial patches that leave legacy text oversized. Existing rows
+and immutable historical outbox payloads are not silently changed. See the
+[Discovery integration review](discovery-integration.md) for startup, testing and
+recovery limits. Booking subsequently accepted the metadata and availability contracts; the
+2026-11-19 integration uses its real consumer and availability producer.

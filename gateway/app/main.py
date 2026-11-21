@@ -16,7 +16,8 @@ from fastapi.staticfiles import StaticFiles
 STATIC = Path(__file__).resolve().parents[1] / "static"
 ROUTES = {
     "catalogue": [("GET", r"/events"), ("GET", r"/events/[^/]+")],
-    "booking": [("POST", r"/holds")],
+    "booking": [("POST", r"/holds"), ("POST", r"/bookings/[^/]+/checkout"),
+                ("GET", r"/bookings/[^/]+")],
     "discovery": [("GET", r"/search"), ("GET", r"/events/[^/]+/similar")],
     "ticketing": [("GET", r"/tickets/[^/]+")],
 }
@@ -31,10 +32,13 @@ class Settings:
     holds_enabled: bool = False
     discovery_url: str = "http://discovery:8000"
     search_enabled: bool = False
+    checkout_enabled: bool = False
 
     def __post_init__(self):
         if not math.isfinite(self.timeout_seconds) or not 0 < self.timeout_seconds <= 30:
             raise ValueError("Upstream timeout must be finite, positive and at most 30 seconds")
+        if self.checkout_enabled and not self.holds_enabled:
+            raise ValueError("Checkout requires Booking holds to be enabled")
         for url in (self.catalogue_url, self.booking_url, self.ticketing_url, self.discovery_url):
             parts = urlsplit(url)
             if parts.scheme not in {"http", "https"} or not parts.hostname or parts.path not in {"", "/"} or parts.query or parts.fragment or parts.username:
@@ -48,6 +52,9 @@ class Settings:
         search = os.getenv("DISCOVERY_SEARCH_ENABLED", "false").lower()
         if search not in {"true", "false"}:
             raise ValueError("DISCOVERY_SEARCH_ENABLED must be true or false")
+        checkout = os.getenv("BOOKING_CHECKOUT_ENABLED", "false").lower()
+        if checkout not in {"true", "false"}:
+            raise ValueError("BOOKING_CHECKOUT_ENABLED must be true or false")
         return cls(
             catalogue_url=os.getenv("CATALOGUE_URL", "http://catalogue:8000"),
             booking_url=os.getenv("BOOKING_URL", "http://booking:8000"),
@@ -56,6 +63,7 @@ class Settings:
             holds_enabled=enabled == "true",
             discovery_url=os.getenv("DISCOVERY_URL", "http://discovery:8000"),
             search_enabled=search == "true",
+            checkout_enabled=checkout == "true",
         )
 
 
@@ -89,7 +97,7 @@ def create_app(settings=None, transport=None):
 
     @app.get("/api/capabilities")
     async def capabilities():
-        return {"holds": settings.holds_enabled, "checkout": False, "search": settings.search_enabled}
+        return {"holds": settings.holds_enabled, "checkout": settings.checkout_enabled, "search": settings.search_enabled}
 
     @app.api_route("/api/{service}/{path:path}", methods=["GET", "POST", "PUT", "PATCH", "DELETE"])
     async def proxy(service: str, path: str, request: Request):
@@ -103,6 +111,8 @@ def create_app(settings=None, transport=None):
             raise HTTPException(405, "Method is unavailable")
         if service == "booking" and not settings.holds_enabled:
             raise HTTPException(503, "Seat reservations are unavailable in this stack")
+        if service == "booking" and upstream_path != "/holds" and not settings.checkout_enabled:
+            raise HTTPException(503, "Checkout is unavailable in this stack")
         if service == "discovery" and not settings.search_enabled:
             raise HTTPException(503, "Search is unavailable in this stack")
         body = bytearray()
@@ -124,6 +134,8 @@ def create_app(settings=None, transport=None):
             )
         except httpx.TimeoutException as error:
             detail = "Service timed out; reservation outcome may be unknown" if service == "booking" and request.method == "POST" else "Service timed out; try again later"
+            if service == "booking" and upstream_path.endswith("/checkout"):
+                detail = "Checkout outcome may be unknown; check booking status before retrying"
             raise HTTPException(504, detail) from error
         except httpx.RequestError as error:
             raise HTTPException(503, "Service is temporarily unavailable") from error

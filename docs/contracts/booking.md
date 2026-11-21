@@ -315,6 +315,10 @@ the background.
 GET /bookings/{booking_id}?customer_id=… — IMPLEMENTED
 - 200 `{ booking_id, event_id, seat_id, booking_status, held_until, payment_id }`
   (`held_until` is offset-aware; `payment_id` is `null` until set).
+- Integration addition (2026-11-19): also returns `price_minor` (integer minor
+  units) and `currency` from the saved booking row, so the UI displays the
+  original price rather than recomputing the current configuration. Existing
+  fields and owner checks are unchanged.
 - 404 Unknown booking, or `customer_id` does not match. Both get the same
   reply, so a guessed `booking_id` reveals nothing:
   `{ error: "booking_not_found", message: "No such booking." }`

@@ -202,7 +202,8 @@ services:
       DISCOVERY_URL: http://discovery:8000
       DISCOVERY_SEARCH_ENABLED: "true"
       UPSTREAM_TIMEOUT_SECONDS: "3"
-      BOOKING_HOLDS_ENABLED: "false"
+      BOOKING_HOLDS_ENABLED: ${BOOKING_HOLDS_ENABLED:-true}
+      BOOKING_CHECKOUT_ENABLED: ${BOOKING_CHECKOUT_ENABLED:-true}
     ports:
       - "127.0.0.1:${GATEWAY_PORT:-8080}:8000"
     depends_on:

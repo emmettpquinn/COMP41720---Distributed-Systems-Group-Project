@@ -53,9 +53,11 @@ def http(origin, path, body=None, expected=200, basic=None, method=None):
         response = error
     with response:
         content = response.read().decode()
-        if response.code != expected:
+        statuses = (expected,) if isinstance(expected, int) else expected
+        if response.code not in statuses:
             raise AssertionError(f"{path}: expected {expected}, received {response.code}: {content[:200]}")
-        return json.loads(content) if "application/json" in response.headers.get("Content-Type", "") else content
+        media_type = response.headers.get("Content-Type", "").split(";")[0].strip().lower()
+        return json.loads(content) if media_type in {"application/json", "text/json"} or media_type.endswith("+json") else content
 
 
 def source_info():
@@ -77,7 +79,7 @@ def source_info():
 class Project:
     """Never attach to an existing project; cleanup deletes only generated data."""
 
-    def __init__(self, label, output, source=ROOT, full=False, messaging=False, extra=""):
+    def __init__(self, label, output, source=ROOT, full=False, messaging=None, extra=""):
         self.name = "catalogue-" + label + "-" + uuid.uuid4().hex[:10]
         self.source = Path(source)
         self.output = external_output(output)
@@ -89,10 +91,12 @@ class Project:
     def __enter__(self):
         self.temp = tempfile.TemporaryDirectory(prefix=self.name + "-")
         override = Path(self.temp.name) / "ports.yml"
-        ports = {"catalogue": [8000], "rabbitmq": [15672]}
+        # All five applications now exist in the base file. Never publish their
+        # default host ports, even when a check starts only a subset of services.
+        ports = {name: [8000] for name in ("catalogue", "booking", "discovery", "payment", "ticketing", "gateway")}
+        ports.update({"rabbitmq": [15672], "mailhog": [8025]})
         if self.full:
-            ports.update({name: [8000] for name in ("booking", "discovery", "payment", "ticketing", "gateway")})
-            ports.update({"prometheus": [9090], "grafana": [3000], "mailhog": [8025]})
+            ports.update({"prometheus": [9090], "grafana": [3000]})
         lines = ["services:"]
         for service, values in ports.items():
             mappings = ", ".join(f'"127.0.0.1::{value}"' for value in values)
@@ -104,10 +108,13 @@ class Project:
                 self.command += ["-f", str(self.source / filename)]
         self.command += ["-f", str(override)]
         self.env = os.environ | {
-            "CATALOGUE_MESSAGING_ENABLED": str(self.messaging).lower(),
-            "BOOKING_DEMO_SEED": "true", "PAYMENT_MODE": "ok", "PAYMENT_DELAY": "0",
+            "BOOKING_DEMO_SEED": "false", "PAYMENT_MODE": "ok", "PAYMENT_DELAY": "0",
             "PAYMENT_ERROR_RATE": "0", "GRAFANA_PASSWORD": "stagedoor-demo",
+            "BOOKING_HOLDS_ENABLED": "true", "BOOKING_CHECKOUT_ENABLED": "true",
+            "HOLD_MINUTES": "10", "BOOKING_SAFETY_NET_SECONDS": "60",
         }
+        if self.messaging is not None:
+            self.env["CATALOGUE_MESSAGING_ENABLED"] = str(self.messaging).lower()
         existing = subprocess.check_output(
             ["docker", "ps", "-aq", "--filter", "label=com.docker.compose.project=" + self.name], text=True,
         ).strip()

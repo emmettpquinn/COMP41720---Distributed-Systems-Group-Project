@@ -219,7 +219,7 @@ def get_booking(booking_id, customer_id):
     try:
         with conn, conn.cursor() as cur:
             cur.execute(
-                """SELECT booking_id, event_id, seat_id, status, held_until, payment_id
+                """SELECT booking_id, event_id, seat_id, status, held_until, payment_id, price_minor, currency
                    FROM bookings WHERE booking_id = %s AND customer_id = %s""",
                 (booking_id, customer_id),
             )
@@ -228,7 +228,7 @@ def get_booking(booking_id, customer_id):
         conn.close()
     if row is None:
         return None
-    booking_id, event_id, seat_id, status, held_until, payment_id = row
+    booking_id, event_id, seat_id, status, held_until, payment_id, price_minor, currency = row
     return {
         "booking_id": booking_id,
         "event_id": event_id,
@@ -236,6 +236,8 @@ def get_booking(booking_id, customer_id):
         "booking_status": status,
         "held_until": held_until.isoformat(),   # TIMESTAMPTZ: offset-aware
         "payment_id": payment_id,
+        "price_minor": price_minor,
+        "currency": currency,
     }
 
 

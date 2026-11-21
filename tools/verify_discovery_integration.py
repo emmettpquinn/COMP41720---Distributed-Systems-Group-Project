@@ -40,7 +40,7 @@ def main():
 
             for service in ('catalogue','booking','payment','ticketing','discovery'):
                 wait_for(lambda service=service:call(service,'/ready')['status']=='ready')
-            assert call('gateway','/api/capabilities')=={'holds':True,'checkout':False,'search':True}
+            assert call('gateway','/api/capabilities')=={'holds':True,'checkout':True,'search':True}
             assert project.sql('catalogue-db',"SELECT to_regclass('public.discovery_events') IS NULL")=='t'
             assert project.sql('discovery-db',"SELECT to_regclass('public.events') IS NULL")=='t'
             wait_for(lambda: search('performance')['mode']=='semantic')
@@ -119,14 +119,15 @@ def main():
 
             def monitoring():
                 targets=http(project.origin('prometheus',9090),'/api/v1/targets?state=active')['data']['activeTargets']
-                assert len(targets)==6 and all(item['health']=='up' for item in targets)
+                assert {item['labels']['job'] for item in targets}=={'catalogue','booking','discovery','payment','ticketing','rabbitmq','prometheus'}
+                assert all(item['health']=='up' for item in targets)
                 dashboard=http(project.origin('grafana',3000),'/api/dashboards/uid/discovery',basic='admin:stagedoor-demo')['dashboard']
                 assert all(panel.get('datasource',{}).get('uid')=='prometheus' for panel in dashboard['panels'])
                 data=http(project.origin('grafana',3000),'/api/datasources/proxy/uid/prometheus/api/v1/query?query=discovery_searches_total',basic='admin:stagedoor-demo')
                 assert data['status']=='success' and data['data']['result']
                 return True
             wait_for(monitoring)
-            emit('shared_monitoring',{'targets_up':6,'discovery_dashboard':True,'actual_discovery_metrics_through_shared_datasource':True})
+            emit('shared_monitoring',{'targets_up':7,'discovery_dashboard':True,'actual_discovery_metrics_through_shared_datasource':True})
             result['passed']=True
     except Exception as error:
         result['passed']=False

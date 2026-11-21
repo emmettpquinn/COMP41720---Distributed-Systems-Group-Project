@@ -604,7 +604,10 @@ class BookingIntegrationTests(unittest.TestCase):
         body=mine.json()
         stored=self.query('SELECT held_until FROM bookings')[0][0]
         self.assertEqual(body,{'booking_id':booking_id,'event_id':'event-demo-001','seat_id':'A1',
-                               'booking_status':'held','held_until':body['held_until'],'payment_id':None})
+                               'booking_status':'held','held_until':body['held_until'],'payment_id':None,
+                               'price_minor':4500,'currency':'EUR'})
+        with patch('config.BOOKING_PRICE_MINOR',9900):
+            self.assertEqual(client.get(f'/bookings/{booking_id}',params={'customer_id':'buyer-test'}).json()['price_minor'],4500)
         self.assertIsNotNone(datetime.fromisoformat(body['held_until']).utcoffset())
         self.assertEqual(datetime.fromisoformat(body['held_until']),stored)
         wrong=client.get(f'/bookings/{booking_id}',params={'customer_id':'buyer-test-2'})
