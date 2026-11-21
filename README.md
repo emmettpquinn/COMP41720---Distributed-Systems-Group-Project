@@ -103,6 +103,34 @@ Use **Browse all events** to clear a query. The seeded events are dated 27 and
 28 November 2026; date queries can correctly exclude them. Ranking uses simulated
 embeddings by default, so it does not establish learned semantic relevance.
 
+## Create a larger demo seating map
+
+With the stack running, create a new fictional venue/event with five rows and
+ten seats per row:
+
+```sh
+python3 tools/create_demo_event.py --rows 5 --columns 10 --publish
+```
+
+The tool prints the new event ID. Open the website, select **Browse all events**
+and **Refresh**, then choose **Demo Theatre Performance**. Allow a short time for
+Booking inventory and availability to arrive. Rows A-E and columns 1-10 stay
+aligned; wider maps scroll horizontally. Unavailable seats are grey and disabled.
+Another browser needs a refresh to receive the latest projected availability.
+
+Without `--publish`, the tool only prints the venue/event JSON. Use `--title`,
+`--venue-name`, `--section`, `--starts-at` (future ISO timestamp with offset),
+`--event-id` and `--venue-id` to customise it. A start a week ahead is chosen by
+default. `--catalogue-url` changes the API address if you use alternate ports.
+The helper permits up to 52 rows, 40 columns and 500 total seats. These are demo
+tool limits, not a claim about tested production capacity.
+
+Seat labels such as A1/A10 define row/column placement within each section using
+the existing event schema. Custom labels still render as selectable seats.
+Existing event IDs are refused rather than changing their seats/bookings. New
+demo events are created through Catalogue and its normal message pipeline; the
+original seed events and saved bookings are not reset.
+
 ## Health and monitoring
 
 ```sh

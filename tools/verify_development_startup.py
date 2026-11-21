@@ -14,6 +14,7 @@ from urllib.parse import urlencode
 import uuid
 
 from _verification import Project, ROOT, external_output, http, source_info, wait_for
+from create_demo_event import create_payload, publish_demo
 
 
 APPLICATIONS = ('catalogue', 'payment', 'booking', 'ticketing', 'discovery')
@@ -126,6 +127,7 @@ def main():
     parser.add_argument('--output', type=Path, required=True)
     parser.add_argument('--working-tree', action='store_true', help='Verify a source snapshot including unstaged changes; creates no commit')
     parser.add_argument('--failure-cases', action='store_true', help='Also exercise declines, event cancellation and late-success refunds')
+    parser.add_argument('--demo-seating', action='store_true', help='Also create a 50-seat row/column event and buy seat E10')
     args = parser.parse_args()
     output = external_output(args.output)
     result = {'started_at': datetime.now(timezone.utc).isoformat(), 'checks': {}, 'passed': False,
@@ -243,6 +245,27 @@ def main():
                 wait_for(assert_persisted)
                 wait_for(assert_monitoring)
                 emit('database_restarts', {'liveness_preserved': 5, 'readiness_503': 5, 'owned_state_recovered': True})
+                if args.demo_seating:
+                    demo = create_payload()
+                    published = publish_demo(project.origin('catalogue'), demo)
+                    event_id = published['event_id']
+                    demo_path = '/api/catalogue/events/' + event_id
+                    wait_for(lambda: (call('gateway', demo_path)['availability'] or {}).get('seats_remaining') == 50)
+                    detail = call('gateway', demo_path)
+                    assert len(detail['seats']) == 50
+                    assert {'A1', 'A10', 'E1', 'E10'} <= {seat['seat_id'] for seat in detail['seats']}
+                    buyer = 'synthetic-large-venue-buyer'
+                    body = {'event_id': event_id, 'seat_id': 'E10', 'customer_id': buyer}
+                    reserved = call('gateway', '/api/booking/holds', body=body, expected=201)
+                    call('gateway', '/api/booking/holds', body=body | {'customer_id':'synthetic-large-venue-competitor'}, expected=409)
+                    wait_for(lambda: (call('gateway', demo_path)['availability'] or {}).get('seats_remaining') == 49)
+                    demo_booking_path = '/api/booking/bookings/' + reserved['booking_id']
+                    call('gateway', demo_booking_path + '/checkout', body={'customer_id':buyer}, expected=202)
+                    wait_for(lambda: call('gateway', demo_booking_path + '?' + urlencode({'customer_id':buyer}))['booking_status'] == 'confirmed')
+                    wait_for(lambda: call('ticketing', '/tickets/' + reserved['booking_id'])['valid'])
+                    assert call('ticketing', '/tickets/' + reserved['booking_id'])['seat_label'] == 'E10'
+                    emit('large_demo_seating', {'rows':5, 'columns':10, 'seats':50,
+                         'live_availability':True, 'seat_E10_confirmed':True, 'competing_hold_409':True, 'valid_ticket':True})
                 if args.failure_cases:
                     verify_failure_cases(project, call, emit)
                 result['passed'] = True

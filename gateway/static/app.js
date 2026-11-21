@@ -172,33 +172,106 @@ async function selectEvent(id) {
   } finally { if (request === generation) panel.removeAttribute('aria-busy'); }
 }
 
+function seatButton(seat, event, available) {
+  const refused = rejected.has(seat.seat_id);
+  const heldHere = reserved.has(seat.seat_id);
+  const unavailable = event.status === 'cancelled' || refused || heldHere || (available && !available.has(seat.seat_id));
+  const button = element('button', seat.label, `seat${refused ? ' refused' : heldHere ? ' reserved' : ''}`);
+  button.type = 'button'; button.dataset.seat = seat.seat_id;
+  button.dataset.unavailable = String(Boolean(unavailable)); button.disabled = Boolean(unavailable);
+  button.setAttribute('aria-label', `Seat ${seat.label}, section ${seat.section}${heldHere ? ', reserved in this session' : refused ? ', last reservation refused' : unavailable ? ', unavailable' : available ? ', projected available' : ', availability unknown'}`);
+  button.setAttribute('aria-pressed', String(selectedSeat === seat.seat_id));
+  button.onclick = () => {
+    selectedSeat = seat.seat_id;
+    document.querySelectorAll('.seat').forEach(node => node.setAttribute('aria-pressed', String(node === button)));
+    setBusy(false);
+  };
+  return button;
+}
+
+function seatPosition(seat) {
+  const match = /^([a-z]{1,3})([1-9]\d{0,2})$/i.exec(seat.label);
+  if (!match || Number(match[2]) > 100) return null;
+  return {row: match[1].toUpperCase(), column: Number(match[2])};
+}
+
+function renderSeatMap(event) {
+  const map = element('div', undefined, 'seat-map');
+  map.tabIndex = 0;
+  map.setAttribute('aria-label', 'Choose a seat. Scroll horizontally for wider rows.');
+  const grid = element('div', undefined, 'seat-grid seat-layout');
+  const available = event.availability && new Set(event.availability.available_seat_ids);
+  const sections = new Map();
+  for (const seat of event.seats) {
+    if (!sections.has(seat.section)) sections.set(seat.section, []);
+    sections.get(seat.section).push(seat);
+  }
+  const natural = new Intl.Collator('en', {numeric: true});
+  for (const [section, seats] of sections) {
+    const group = element('section', undefined, 'seat-section');
+    group.setAttribute('aria-label', `Section ${section} seating`);
+    group.append(element('h3', `Section ${section}`));
+    const rows = new Map();
+    let columns = 0;
+    let positioned = true;
+    for (const seat of seats) {
+      const position = seatPosition(seat);
+      if (!position) { positioned = false; break; }
+      if (!rows.has(position.row)) rows.set(position.row, new Map());
+      const row = rows.get(position.row);
+      if (row.has(position.column)) { positioned = false; break; }
+      row.set(position.column, seat);
+      columns = Math.max(columns, position.column);
+    }
+    // Legacy/custom labels remain selectable. Bound sparse layouts instead of
+    // allocating enormous grids from a label supplied through the event API.
+    if (!positioned || rows.size * columns > 2000) {
+      const fallback = element('div', undefined, 'seat-grid');
+      for (const seat of [...seats].sort((a, b) => natural.compare(a.label, b.label))) fallback.append(seatButton(seat, event, available));
+      group.append(fallback);
+    } else {
+      const header = element('div', undefined, 'seat-row seat-column-headings');
+      header.setAttribute('aria-hidden', 'true');
+      header.append(element('span', '', 'seat-row-label'));
+      for (let column = 1; column <= columns; column++) header.append(element('span', String(column), 'seat-column-number'));
+      group.append(header);
+      const rowNames = [...rows.keys()].sort((a, b) => a.length - b.length || natural.compare(a, b));
+      for (const name of rowNames) {
+        const row = element('div', undefined, 'seat-row');
+        row.dataset.row = name; row.setAttribute('role', 'group'); row.setAttribute('aria-label', `Row ${name}`);
+        row.append(element('span', name, 'seat-row-label'));
+        for (let column = 1; column <= columns; column++) {
+          const seat = rows.get(name).get(column);
+          if (seat) {
+            const button = seatButton(seat, event, available);
+            button.dataset.row = name; button.dataset.column = String(column);
+            row.append(button);
+          } else {
+            const gap = element('span', undefined, 'seat-gap');
+            gap.setAttribute('aria-hidden', 'true'); row.append(gap);
+          }
+        }
+        group.append(row);
+      }
+    }
+    grid.append(group);
+  }
+  map.append(grid);
+  return map;
+}
+
 function renderDetail(message = '', messageClass = '') {
   panel.removeAttribute('aria-busy');
   const event = current;
   const heading = element('div', undefined, 'detail-heading');
   heading.append(element('p', 'TAKE YOUR PLACE', 'eyebrow'), element('h2', event.title), element('p', `${event.venue.name} · ${dateParts(event).full}`));
   const body = element('div', undefined, 'detail-body');
-  body.append(element('p', event.description, 'description'), element('div', 'STAGE', 'stage'));
-  const grid = element('div', undefined, 'seat-grid');
-  grid.setAttribute('aria-label', 'Choose a seat');
-  const available = event.availability && new Set(event.availability.available_seat_ids);
-  for (const seat of event.seats) {
-    const refused = rejected.has(seat.seat_id);
-    const heldHere = reserved.has(seat.seat_id);
-    const unavailable = event.status === 'cancelled' || refused || heldHere || (available && !available.has(seat.seat_id));
-    const button = element('button', seat.label, `seat${refused ? ' refused' : heldHere ? ' reserved' : ''}`);
-    button.type = 'button'; button.dataset.seat = seat.seat_id;
-    button.dataset.unavailable = String(Boolean(unavailable)); button.disabled = Boolean(unavailable);
-    button.setAttribute('aria-label', `Seat ${seat.label}, section ${seat.section}${heldHere ? ', reserved in this session' : refused ? ', last reservation refused' : unavailable ? ', unavailable' : available ? ', projected available' : ', availability unknown'}`);
-    button.setAttribute('aria-pressed', String(selectedSeat === seat.seat_id));
-    button.onclick = () => {
-      selectedSeat = seat.seat_id;
-      document.querySelectorAll('.seat').forEach(node => node.setAttribute('aria-pressed', String(node === button)));
-      setBusy(false);
-    };
-    grid.append(button);
-  }
-  body.append(grid);
+  body.append(element('p', event.description, 'description'), element('div', 'STAGE', 'stage'), renderSeatMap(event));
+  body.append(element('p', 'Scroll sideways for wider rows.', 'seat-scroll-hint'));
+  const legend = element('div', undefined, 'seat-legend');
+  legend.setAttribute('aria-label', 'Seat colours');
+  legend.append(element('span', event.availability ? 'Available' : 'Availability unknown', 'legend-available'), element('span', 'Selected', 'legend-selected'), element('span', 'Unavailable', 'legend-unavailable'));
+  body.append(legend);
   let freshness = 'Availability has not been received. Booking will check your choice.';
   if (event.availability) {
     const time = new Date(event.availability.occurred_at).toLocaleTimeString('en-IE', {timeZone: event.timezone});
