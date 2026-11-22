@@ -1,8 +1,8 @@
 # Ticket Booking Platform
 
 COMP41720 Distributed Systems group project. This branch integrates the five
-service implementations. See the [checkpoint tracker](docs/PROJECT_CONTINUITY.md),
-[Catalogue runbook](docs/catalogue-operations.md), [development integration guide](docs/integration-development.md)
+service implementations. See the [Catalogue runbook](docs/catalogue-operations.md),
+[development integration guide](docs/integration-development.md)
 and [Booking contract](docs/contracts/booking.md).
 
 ## What runs here
