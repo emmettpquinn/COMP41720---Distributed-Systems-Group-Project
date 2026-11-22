@@ -1,44 +1,49 @@
-# ADR-005: At-least-once delivery with idempotent consumers and dead-letter queues, instead of exactly-once
+ARCHITECTURAL DECISION RECORD — ADR-005
 
-**Status:** proposed (draft for the Week 10 check)
-**Owner:** Emmett Quinn
-**Date:** 2026-11-04
+# Deliver at least once, and make the Ticketing service idempotent, with retries and dead-letter queues
+
+**Date:** 22 November 2026
+
+**Status:** Accepted
 
 ## Context
 
-Eight message types cross RabbitMQ between five services. Money and tickets ride on several of them: `booking.confirmed` issues a ticket, and `refund.completed` voids one. The broker, a consumer or a downstream dependency (the mail server) can fail at any moment, and each must be survivable without losing a message or acting on one twice.
+Ticketing turns four messages into e-tickets and emails: `booking.confirmed` and `booking.cancelled` from Booking, and `refund.completed` and `refund.failed` directly from Payment. Each carries a `booking_id` and a `customer_email`. The forces:
 
-RabbitMQ does not offer end-to-end exactly-once delivery. Its guarantees stop at the broker. A consumer that crashes after acting on a message but before acking it will see the message again. Even a broker that could do exactly-once could not make SMTP, which sits outside every transaction, happen exactly once.
-
-**Facts that would reopen this decision:**
-
-- A move to a broker with transactional consume-and-produce (Kafka transactions), *and* every side effect living inside the same transactional store.
-- Duplicate-check lookups showing up as a bottleneck. At on-sale volume (500 buyers) they are one primary-key read per message.
-- Messages parked in the DLQ more than about once a day in normal running. That would mean the retry budget is wrong, not that the design is.
+- **Messages arrive more than once.** The producers' outboxes publish before they mark a row sent, and RabbitMQ redelivers anything a crashed consumer had not acked.
+- **Two producers race.** Since ADR-001, a payment that never answers is released by Booking as `payments_unavailable`. If the charge lands later, Payment's `refund.completed` arrives about 11 s after that, on its own. Ticketing must never issue a ticket for a released booking, whichever message comes first.
+- **Email is outside our control.** SMTP sits outside any transaction, can be down and has no idempotency key.
+- **Failures must not block or vanish.** A message that keeps failing must be visible and recoverable.
 
 ## Decision
 
-Emmett Quinn sets the delivery model for every queue as follows:
+Ticketing accepts at-least-once delivery and removes duplicates itself. It acts only on a message's type and `booking_id`, and never calls Booking or Payment.
 
-1. **At-least-once delivery.** Producers publish persistent messages with publisher confirms through an outbox (Booking, Payment, Catalogue). Consumers ack only after their work is committed.
-2. **Idempotent consumers.** Every message carries a `message_id`. A consumer records it in its own database *in the same transaction as the state change*, and ignores any message whose ID it has already recorded. A unique constraint backs every invariant: one ticket per booking (Ticketing), one payment per booking (Payment).
-3. **Bounded retries, then park.** A failed message is retried after 1 s, 2 s and 4 s through per-delay retry queues. After that it goes to `<queue>.dlq`, shows on the dashboard, and is replayed by hand (`python -m messaging.replay <queue>`) once the cause is fixed.
-4. **External side effects are claimed, then recorded.** Ticketing records each email it owes as a row. A worker claims it (`pending → sending`, with a 60 s lease), sends it, and marks it `sent`. A retry or replay finds the ticket already issued but the email still pending, and sends only the email.
+**Step 1: the ticket change.** One Postgres transaction records the `message_id`, creates or voids the ticket, and writes any email now owed as `pending`. Unique constraints allow one ticket per booking and one email of each kind per booking. Ticket state only moves from valid to void, so a cancellation or refund that arrives first leaves a void tombstone that a later confirmation cannot overturn.
 
-## Trade-off analysis
-
-| Option | Correctness | Complexity | Fit for us |
-|---|---|---|---|
-| At-most-once (ack on receipt) | Loses tickets on any crash | Lowest | Rejected: breaks "no one charged without a ticket" |
-| **At-least-once + idempotent consumers + DLQ (chosen)** | No loss; duplicates absorbed by IDs and constraints | One table and one check per consumer | Works with RabbitMQ, testable, and explainable in the viva |
-| Exactly-once via broker transactions | Only inside the broker; SMTP and the provider are still outside | High; needs a different broker | Rejected: does not cover the side effects that matter |
-| Infinite retry, no DLQ | No loss, but a poison message blocks or loops forever | Low | Rejected: hides failures, so nothing appears on the dashboard |
+**Step 2: the email.** Each pending email is claimed (`pending → sending`, 60 s lease), sent, then marked `sent`. A failed send is retried after 1 s, 2 s and 4 s, then parked in `ticketing.booking-updates.dlq` until `python -m messaging.replay` puts it back. On a retry, step 1 sees a duplicate and step 2 sends only what is still pending. Booking and Payment use the same consumer and DLQs (booking contract §3).
 
 ## Consequences
 
-- **Positive (correctness: one ticket per booking).** Tested: 100 redeliveries of one `booking.confirmed` on the running stack produced 1 ticket, 1 email and 99 recorded duplicates.
-- **Positive (resilience: survive injected failure).** With MailHog stopped, tickets are still issued. Emails park in the DLQ, the dashboard shows the depth, and after replay each customer gets exactly one email.
-- **Positive (ordering).** Because duplicates are safe, consumers don't need in-order delivery. Ticketing makes ticket state monotonic (valid → void, never back), so a cancellation arriving before its confirmation can never produce a valid ticket.
-- **Negative (one email may be sent twice).** If Ticketing dies after SMTP accepts an email but before it records `sent`, the email is sent again. SMTP has no idempotency key, so this window cannot be closed. It is bounded to one email per crash. Every email carries an `X-Notification-Key` header, so a copy is recognisable.
-- **Negative (operations: someone must act).** Parked messages need a person to fix the cause and replay. The dashboard alert and the runbook entry are part of the design, not extras.
-- **Negative (storage).** Processed-message records grow with traffic. That is fine at project scale. In production they would be pruned after the longest possible redelivery window (for example 7 days).
+### Positive
+
+- **Constraints, not timing, enforce correctness.** Duplicates hit a primary key or a unique constraint, and order does not matter. 100 copies of one `booking.confirmed` gave 1 ticket and 1 email.
+- **Ticketing stays off the purchase path.** A Ticketing or mail outage delays the email, never a purchase. Publish to email took **37 / 63 / 155 ms** (min / median / max, 20 bookings). With MailHog stopped, messages were parked, then replayed with one email per customer.
+- **The race needs no special case.** On the full stack (22 Nov), a late payment went `released` (9.3 s) → `refunded` (20.5 s). Ticketing left a void tombstone, issued no ticket, and sent one cancellation and one refund email.
+
+### Negative
+
+- **One email can go out twice** if Ticketing dies between SMTP accepting it and marking it `sent`: at most one per crash.
+- **The cancellation email must hedge.** At `payments_unavailable`, nobody yet knows whether the customer was charged (booking contract §13.7).
+- **Ticketing reflects messages, not the truth across services.** A refund made directly in Payment voids the ticket while Booking still shows the seat booked (§13.6).
+- **Someone has to act.** Parked messages wait for a human, parking took 23.2 s rather than 7 s because of slow DNS failures, and `processed_messages` is never pruned.
+
+## Alternatives considered
+
+**Exactly-once delivery from the broker.** RabbitMQ does not offer it, and SMTP would still sit outside. Rejected.
+
+**Ask Booking for the state before acting.** This would settle the races directly, but it couples Ticketing to Booking's availability during an on-sale. Rejected; revisit if the mismatches above become normal paths.
+
+**Send the email inside the ticket transaction.** A mail outage would then stop tickets or lose emails. Rejected.
+
+**An email outbox with no DLQ.** It works, but adds a second retry mechanism outside the DLQ that the dashboard and runbook already watch. Revisit if a real email provider imposes rate limits.
