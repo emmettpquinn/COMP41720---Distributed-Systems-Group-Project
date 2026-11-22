@@ -268,6 +268,54 @@ test('a lost checkout response recovers through GET without automatically postin
   assert.equal(checkoutPosts(page).length,1);
 });
 
+const staleFreeSeat = () => ({seats:[{seat_id:'A1',section:'A',label:'A1'}],
+  availability:{seats_remaining:1,available_seat_ids:['A1'],occurred_at:'2026-11-22T12:00:00Z'}});
+
+function assertBookedSeat(page) {
+  const seat=page.$('[data-seat="A1"]');
+  assert.equal(seat.disabled,true);
+  assert.equal(seat.classList.contains('booked'),true);
+  assert.equal(seat.classList.contains('reserved'),false);
+  assert.equal(seat.getAttribute('aria-pressed'),'false');
+  assert.match(seat.getAttribute('aria-label'),/booked/);
+}
+
+test('confirmation changes the held highlight to a taken seat and Refresh preserves it with a stale projection',async t=>{
+  let submitted=false;
+  const page=await setup(t,{checkout:true,detail:staleFreeSeat,
+    pay:async()=>{submitted=true;return {status:202,body:{booking_id:bookingId,booking_status:'payment_pending'}};},
+    status:async()=>({status:200,body:bookingResult(submitted ? 'confirmed' : 'held')})});
+  await holdForCheckout(page);
+  assert.equal(page.$('.seat').classList.contains('reserved'),true);
+  page.$('#checkout').click();
+  await until(()=>page.$('#checkout-status').textContent.includes('Booking confirmed'));
+  assertBookedSeat(page);
+  page.$('#refresh').click();
+  await until(()=>!page.$('#refresh').disabled);
+  assertBookedSeat(page);
+  page.$('[data-event="second"]').click();
+  await until(()=>page.$('#detail h2').textContent==='Current second');
+  page.$('[data-event="first"]').click();
+  await until(()=>page.$('#detail h2').textContent==='Current first');
+  assertBookedSeat(page);
+});
+
+test('a reloaded confirmed booking is taken whether status arrives before or after the seat map',async t=>{
+  for(const late of [false,true]) {
+    let complete;
+    const pending=new Promise(resolve=>{complete=resolve;});
+    const page=await setup(t,{checkout:true,detail:staleFreeSeat,
+      savedBooking:{id:bookingId,reference:bookingId,eventId:'first',seatId:'A1',title:'Saved event'},
+      status:()=>late ? pending : Promise.resolve({status:200,body:bookingResult('confirmed')})});
+    page.$('#event-list .event-card').click();
+    await until(()=>Boolean(page.$('.seat')));
+    if(late) complete({status:200,body:bookingResult('confirmed')});
+    await until(()=>page.$('#checkout-status').textContent.includes('Booking confirmed'));
+    assertBookedSeat(page);
+    assert.equal(checkoutPosts(page).length,0);
+  }
+});
+
 test('explicit payment-service unavailability retains the hold and permits only a manual same-ID retry',async t=>{
   let submitted=false;
   const page=await setup(t,{checkout:true,

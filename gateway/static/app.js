@@ -13,6 +13,7 @@ let generation = 0;
 let rejected = new Set();
 let reserved = new Set();
 const reservations = new Map();
+const bookedSeats = new Map();
 const BOOKING_SESSION_KEY = 'stagedoor-booking-v1';
 const POLL_INTERVAL_MS = 2000;
 const MAX_STATUS_READS = 45;
@@ -174,13 +175,15 @@ async function selectEvent(id) {
 
 function seatButton(seat, event, available) {
   const refused = rejected.has(seat.seat_id);
-  const heldHere = reserved.has(seat.seat_id);
-  const unavailable = event.status === 'cancelled' || refused || heldHere || (available && !available.has(seat.seat_id));
-  const button = element('button', seat.label, `seat${refused ? ' refused' : heldHere ? ' reserved' : ''}`);
+  const bookedHere = bookedSeats.get(event.event_id)?.has(seat.seat_id);
+  const heldHere = !bookedHere && reserved.has(seat.seat_id);
+  const unavailable = event.status === 'cancelled' || refused || heldHere || bookedHere || (available && !available.has(seat.seat_id));
+  const button = element('button', seat.label, `seat${bookedHere ? ' booked' : refused ? ' refused' : heldHere ? ' reserved' : ''}`);
   button.type = 'button'; button.dataset.seat = seat.seat_id;
   button.dataset.unavailable = String(Boolean(unavailable)); button.disabled = Boolean(unavailable);
-  button.setAttribute('aria-label', `Seat ${seat.label}, section ${seat.section}${heldHere ? ', reserved in this session' : refused ? ', last reservation refused' : unavailable ? ', unavailable' : available ? ', projected available' : ', availability unknown'}`);
-  button.setAttribute('aria-pressed', String(selectedSeat === seat.seat_id));
+  button.setAttribute('aria-label', `Seat ${seat.label}, section ${seat.section}${bookedHere ? ', booked' : heldHere ? ', reserved in this session' : refused ? ', last reservation refused' : unavailable ? ', unavailable' : available ? ', projected available' : ', availability unknown'}`);
+  button.setAttribute('aria-pressed', String(!unavailable && selectedSeat === seat.seat_id));
+  if (bookedHere) button.title = 'Booked';
   button.onclick = () => {
     selectedSeat = seat.seat_id;
     document.querySelectorAll('.seat').forEach(node => node.setAttribute('aria-pressed', String(node === button)));
@@ -424,6 +427,15 @@ async function pollBooking(token, reads, errors) {
     } else if (booking.status === 'held') {
       booking.phase = 'ready'; booking.message = hasPrice(booking) ? 'Your seat is held. You can now complete your booking.' : 'Your seat is held, but its total could not be read. Check booking status before paying.';
     } else if (booking.status === 'confirmed') {
+      // A confirmed seat must remain taken even if Catalogue's free-seat
+      // projection still contains it or the tab restores an earlier hold.
+      reservations.get(booking.eventId)?.delete(booking.seatId);
+      if (!bookedSeats.has(booking.eventId)) bookedSeats.set(booking.eventId, new Set());
+      bookedSeats.get(booking.eventId).add(booking.seatId);
+      if (current?.event_id === booking.eventId) {
+        if (selectedSeat === booking.seatId) selectedSeat = null;
+        renderDetail();
+      }
       booking.phase = 'complete'; booking.message = 'Booking confirmed. You can check below whether your ticket is ready.';
     } else {
       booking.phase = 'complete';
@@ -437,6 +449,7 @@ async function pollBooking(token, reads, errors) {
       // A released booking can still receive a late charge and move to refund.
       keepPolling = booking.status !== 'refunded';
       reservations.get(booking.eventId)?.delete(booking.seatId);
+      bookedSeats.get(booking.eventId)?.delete(booking.seatId);
       if (current?.event_id === booking.eventId) renderDetail();
     }
   } catch (error) {
