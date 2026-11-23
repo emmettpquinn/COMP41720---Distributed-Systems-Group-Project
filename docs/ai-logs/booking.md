@@ -1,4 +1,4 @@
-# AI interaction log — Booking audit, report and ADR preparation (19–22 Nov)
+# AI interaction log — Booking Service
 
 Reconstructed from the available conversation, code, Git history and recorded
 test results. Prompts are summaries, not quotations.
